@@ -7075,6 +7075,12 @@ dispatch_guest_fault:
                                     ? "  <== PROT CHANGED MID-HANDLER (race)" : "",
                                 first_seen ? " [first]" : "");
                         }
+                        /* fh6-aux-probe: name the slot the caller branched through */
+                        if (entry_prot < 0 || !fault_pc_check)
+                        {
+                            extern void ios_aux_probe_blr( uintptr_t lr );
+                            ios_aux_probe_blr( (uintptr_t)__darwin_arm_thread_state64_get_lr(state) );
+                        }
                     }
                     /* TEMP [rip-leak] task#34 ml64-class: guest RIP inside a
                      * JIT-POOL mapping means a pool-translated pointer leaked

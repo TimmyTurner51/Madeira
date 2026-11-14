@@ -6525,7 +6525,7 @@ static int ios_aux_ec_target( uintptr_t v, uintptr_t *out )
 static void ios_arm64ec_bind_aux_iat( char *base, size_t size )
 {
     static uintptr_t scan_pe[256], scan_jit[256];
-    static int scan_tries[256], scan_n, said;
+    static int scan_tries[256], scan_n, said, entered;
     uintptr_t rs = (uintptr_t)base, re = rs + size, pe, jb, sec_base;
     extern void *ios_jit_rw_base_global;
     extern void *ios_jit_rx_base_global;
@@ -6543,6 +6543,12 @@ static void ios_arm64ec_bind_aux_iat( char *base, size_t size )
         uintptr_t b = (uintptr_t)ios_jit_mappings[i].pe_base;
         if (b && rs >= b && re <= b + ios_jit_mappings[i].size) { imp = i; break; }
     }
+    /* Say something on the first few calls no matter what: silence here was
+     * indistinguishable from the pass never being called at all. */
+    if (entered++ < 12)
+        dprintf( 2, "[aux-iat-bind] call %d base=%p size=0x%lx -> image %d rw=%p rx=%p\n",
+                 entered, (void *)base, (unsigned long)size, imp,
+                 ios_jit_rw_base_global, ios_jit_rx_base_global );
     if (imp < 0 || !ios_jit_rw_base_global || !ios_jit_rx_base_global) return;
     /* a pure x64 importer has no auxiliary IAT */
     if (!ios_jit_mapping_is_hybrid( imp )) return;
@@ -6641,6 +6647,75 @@ static void ios_arm64ec_bind_aux_iat( char *base, size_t size )
         dprintf( 2, "[aux-iat-bind] fh6-aux-bind image pe=%p (copy %p) try %d: %d continuation(s), "
                  "%d bound to an ARM64EC entry point\n",
                  (void *)pe, (void *)jb, (int)scan_tries[slot_i], scanned, bound );
+}
+
+/* fh6-aux-probe: the fault report knows `lr` but not WHAT the caller branched
+ * through. For a `blr xN` whose xN came from a .data/.rdata slot, the question a
+ * crash like `pc=0` cannot answer on its own is whether the slot was never
+ * initialised, or was torn between the PE copy and the JIT copy. Decode the two
+ * instructions before the call (adrp xM,page / ldr xN,[xM,#imm] / blr xN) to
+ * recover the slot, then read it in BOTH copies and print them side by side. */
+void ios_aux_probe_blr( uintptr_t lr )
+{
+    extern void *ios_jit_rw_base_global;
+    extern void *ios_jit_rx_base_global;
+    uint32_t blr, w;
+    uint32_t n, k, k2, imm12, rm, rt;
+    uintptr_t ldr_pc = 0, slot = 0, page = 0;
+    uint64_t pool_val = 0, pe_val = 0;
+    int found_ldr = 0, found_adrp = 0, mi = -1, i;
+
+    if (!lr || ios_aux_safe_read( lr - 4, &blr, 4 )) return;
+    if ((blr & 0xFFFFFC1Fu) != 0xD63F0000u) return;   /* blr xN */
+    n = (blr >> 5) & 0x1Fu;
+
+    for (k = 1; k <= 4 && !found_ldr; k++)
+    {
+        if (ios_aux_safe_read( lr - 4 - 4 * k, &w, 4 )) break;
+        if ((w & 0xFFC00000u) != 0xF9400000u) continue;     /* ldr xT, [xM, #imm] */
+        if ((w & 0x1Fu) != n) continue;
+        rt = w & 0x1Fu;
+        (void)rt;
+        rm = (w >> 5) & 0x1Fu;
+        imm12 = (w >> 10) & 0xFFFu;
+        ldr_pc = lr - 4 - 4 * k;
+        found_ldr = 1;
+        for (k2 = k + 1; k2 <= k + 3 && !found_adrp; k2++)
+        {
+            if (ios_aux_safe_read( lr - 4 - 4 * k2, &w, 4 )) break;
+            if ((w & 0x9F000000u) != 0x90000000u) continue;     /* adrp xD, page */
+            if ((w & 0x1Fu) != rm) continue;
+            page = ios_aux_adrp_page( lr - 4 - 4 * k2, w );
+            found_adrp = 1;
+        }
+        if (found_adrp) slot = page + (uintptr_t)imm12 * 8;
+    }
+    if (!found_ldr || !found_adrp || !slot) return;
+
+    for (i = 0; i < ios_jit_mapping_count; i++)
+    {
+        uintptr_t b = (uintptr_t)ios_jit_mappings[i].pe_base;
+        if (b && slot >= b && slot < b + ios_jit_mappings[i].size) { mi = i; break; }
+    }
+    if (mi < 0 || !ios_jit_rw_base_global || !ios_jit_rx_base_global) return;
+
+    {
+        uintptr_t off = slot - (uintptr_t)ios_jit_mappings[mi].pe_base;
+        uintptr_t rx = (uintptr_t)ios_jit_mappings[mi].jit_base;
+        uintptr_t pool_slot = rx + off;
+        uintptr_t pool_off = rx - (uintptr_t)ios_jit_rx_base_global;
+        uintptr_t rw_slot = (uintptr_t)ios_jit_rw_base_global + pool_off + off;
+
+        ios_aux_safe_read( slot, &pe_val, 8 );
+        ios_aux_safe_read( rw_slot, &pool_val, 8 );
+
+        dprintf( 2, "[aux-slot-probe] lr=0x%lx (blr x%u at 0x%lx, ldr at 0x%lx): slot 0x%lx pe=0x%llx "
+                 "pool=0x%llx (rva 0x%lx of image %p %s)\n",
+                 (unsigned long)lr, n, (unsigned long)(lr - 4), (unsigned long)ldr_pc,
+                 (unsigned long)slot, (unsigned long long)pe_val, (unsigned long long)pool_val,
+                 (unsigned long)off, (void *)ios_jit_mappings[mi].pe_base,
+                 pe_val != pool_val ? "DIVERGED" : "same" );
+    }
 }
 
 void ios_jit_sync_write(void *addr, size_t size)
