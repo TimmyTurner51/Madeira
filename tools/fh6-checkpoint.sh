@@ -70,6 +70,9 @@ fi
 say "staged     v${staged}"
 say "installed  v${installed}"
 say "last run   ${last:-no forzahorizon6 session log yet}"
+# The IPAS folder under On My iPhone is the Files app's local file provider, which
+# neither devicectl nor AFC can read, so its contents can only be checked on screen.
+say "ipas       not host-readable (local file provider) -- verify on the device"
 
 if [ "$staged" = "$installed" ]; then
     [ "$QUIET" = 1 ] && echo "installed v$installed: launch Forza" || say "verdict    INSTALLED -- launch Forza Horizon 6"
