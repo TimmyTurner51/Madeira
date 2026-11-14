@@ -1,0 +1,178 @@
+diff --git a/Source/Windows/ARM64EC/Module.S b/Source/Windows/ARM64EC/Module.S
+--- a/Source/Windows/ARM64EC/Module.S
++++ b/Source/Windows/ARM64EC/Module.S
+@@ -36,6 +36,47 @@
+   ldr \reg, [\reg, #0x898]
+ .endm
+ 
++// ml1136: rewrite \reg from a PE VA to the JIT-pool alias of the same byte when
++// IosAliasEntries knows the image, because PEB->EcCodeBitMap is indexed by
++// ADDRESS BITS (virtual_ios.c set_arm64ec_range: word = addr >> 18, bit =
++// (addr >> 12) & 63) and only 0x40000 words are committed -- good to 16 GB.
++// A pool address (the pool sits near 0x15xxxxxxxx) is in range; a PE VA such as
++// ucrtbase's 0x71fe780000 is not, so testing one can never report ARM64EC and
++// every such import falls through to emulation instead. Leaves \reg alone when
++// it is already pool space; branches to \fail when it is neither.
++// Entry layout (as ExitFunctionEC and ios_ffs_xlate read it): 0 = PeBase,
++// 8 = JitBase, 16 = Size, 32 bytes per entry, walked newest-first.
++// Only \a \b \c \d may be used: on ARM64EC x13/x14/x23/x24/x28 are disallowed
++// outright, x19-x22/x25-x27 hold x64 nonvolatile state, and x0-x4 carry the
++// x64 argument registers RCX/RDX/R8/R9/R10 that must reach the callee intact.
++// So callers pass x10/x11/x12/x16, which are dead at this point.
++// Nothing is spilled: the walk needs exactly five live values (target, base,
++// cursor, offset, size) and \reg is only written on a hit, so a miss returns
++// the target unchanged and \fail can branch straight out.
++.macro IOS_PE_TO_POOL_TO reg, a, b, c, d, fail
++  lsr \a, \reg, #15
++  cmp \a, #0x40000
++  b.lo 99f                        // already pool space: nothing to do
++  adrp \a, IosAliasEntries
++  add \a, \a, #:lo12:IosAliasEntries   // table base -- \a stays the base
++  adrp \b, IosAliasCount
++  ldr \b, [\b, #:lo12:IosAliasCount]
++  and \b, \b, #0xffffffff         // volatile int: count is in the low word
++  add \b, \a, \b, lsl #5          // cursor, one past the last entry
++97:
++  cmp \b, \a
++  b.eq \fail                      // walked everything: not a known image
++  sub \b, \b, #32                 // entry
++  ldr \c, [\b]                    // Entry.PeBase
++  sub \c, \reg, \c                // offset (wraps when \reg < PeBase)
++  ldr \d, [\b, #16]               // Entry.Size
++  cmp \c, \d
++  b.hs 97b
++  ldr \d, [\b, #8]                // Entry.JitBase
++  add \reg, \d, \c                // pool alias of the same byte
++99:
++.endm
++
+ // Read by RetToEntryThunk below; ARM64EC/Module.cpp sets it at process init.
+ .data
+ .balign 8
+@@ -158,6 +199,55 @@
+   add x17, x17, #6
+ ios_thunk_slot:
+   ldr x17, [x17]                   // the pointer the jmp loads
++  // ml1136: the slot rarely holds the native body. loader.c's
++  // arm64ec_iat_is_exported_x64 keeps the x64-VISIBLE 14-byte fast-forward stub
++  // of a hybrid export (in the importer's .hexpthk) so x64 callers and hook
++  // resolvers see an x64-shaped export, and Wine installs pool aliases into IATs.
++  // Either way the value below is x64 bytes, so the EC-bitmap test that follows
++  // could never pass it and the call was rejected into emulation -- which is the
++  // pc=0, because no thread owns a CpuStateFrame during the DllMain walk.
++  // Canonicalise into pool space and follow the fast-forward stub to the native
++  // body, exactly as ios_ffs_check does for x9, and only then ask the bitmap.
++  //
++  // The ORIGINAL slot value is spilled and restored on every miss. That is not
++  // tidiness: an x64 thunk's bytes can live inside a page the CodeMap marks
++  // ARM64EC (kernel32's .text holds both its ARM64 code and the embedded
++  // hotpatched thunks), so testing a canonicalised thunk address against the
++  // bitmap can report EC and branch into x86 bytes executed as ARM64. Falling
++  // back to the untouched slot value keeps the old test exactly as it was.
++  // x9 is deliberately untouched too: if all of this fails, emulation must
++  // still run the ORIGINAL thunk.
++  stp x17, xzr, [sp, #-16]!        // keep sp 16-aligned; save the slot value
++  IOS_PE_TO_POOL_TO x17, x10, x11, x12, x16, ios_thunk_slot_orig
++  ldr x16, [x17]
++  movz x5, #0x8b48
++  movk x5, #0x48c4, lsl #16        // 48 8b c4 48 = mov rax,rsp / mov [rax+0x20],rbx
++  movk x5, #0x5889, lsl #32
++  movk x5, #0x5520, lsl #48
++  cmp x16, x5
++  b.ne ios_thunk_slot_orig
++  ldrh w16, [x17, #8]
++  movz w5, #0xe95d                 // 5d e9 = pop rbp / jmp rel32
++  cmp w16, w5
++  b.ne ios_thunk_slot_orig
++  ldursw x16, [x17, #10]
++  add x17, x17, x16
++  add x17, x17, #14                // raw target = stub base + 14 + rel32
++  IOS_PE_TO_POOL_TO x17, x10, x11, x12, x16, ios_thunk_slot_orig
++  add sp, sp, #16                  // resolved: drop the saved slot value
++  b ios_thunk_slot_bitmap
++ios_thunk_slot_orig:
++  ldr x17, [sp], #16               // miss: restore the slot value untouched
++  // [6]/[7]: the fix was reached and did not apply, plus the value it gave up on.
++  // x5 and x16 are scratch here (x5 is x64 R11, volatile at a call boundary);
++  // x17 must survive into the bitmap test below as the target.
++  adrp x16, IosFfsBypassLog
++  add x16, x16, #:lo12:IosFfsBypassLog
++  ldr x5, [x16, #48]
++  add x5, x5, #1
++  str x5, [x16, #48]               // [6] = unresolved import-slot count
++  str x17, [x16, #56]              // [7] = last unresolved slot value
++ios_thunk_slot_bitmap:
+   // iOS-Madeira: classify the resolved target BEFORE falling back to emulation.
+   //
+   // This path can run inside process_attach's DllMain walk, i.e. BEFORE
+@@ -170,13 +260,10 @@
+   // correct outcome is a native branch and the emulator is never needed.
+   //
+   // Index space (this is the trap that made an earlier attempt miss): the bitmap is
+-  // indexed by JIT-POOL address, not by PE VA. virtual_ios.c commits it with
+-  // bm_start = (jit_base >> 12) / 8, i.e. addr >> 15, and set_arm64ec_range logs
+-  // start_pos=0x54d3 for jit 0x1534fd000 -- 0x1534fd000 >> 15 == 0x54d3 exactly.
+-  // So test the target AS THE IAT HOLDS IT (Wine installs pool aliases into IATs and
+-  // dispatch slots) and NEVER index the bitmap with a PE VA: the pool is
+-  // [0x148000000, 0x168000000), whose indices stop at 0x2d000, while a PE VA such as
+-  // 0x71fe3d0000 gives 0xe3f000 -- far outside the committed bitmap pages.
++  // indexed by ADDRESS BITS -- word = addr >> 18, bit = (addr >> 12) & 63 -- and
++  // only 0x40000 words are committed, so it is good to 16 GB and the pool (near
++  // 0x15xxxxxxxx) fits while a PE VA (0x71fe...) does not. Everything above is
++  // canonicalised into pool space before this test for exactly that reason.
+   lsr x4, x17, #15                 // (addr >> 12) / 8 == addr >> 15
+   cmp x4, #0x40000                 // 256 KB of bitmap covers 8 GB of pool
+   b.hs ios_thunk_reject            // not pool space: cannot be EC code
+@@ -222,11 +309,13 @@
+ // `mov x0,x8` after the blr.
+ //
+ // So if the EC bitmap says the raw target is ARM64EC code, branch to it
+-// natively. This is the same test and the same 0x40000 pool bound that
+-// ios_thunk_slot applies to a resolved target -- the test that already makes the
+-// TlsAlloc exit thunk work -- and it is only reached once the thunk shapes have
+-// been ruled out, so it cannot mistake an x64 thunk for EC code. x4 (x64 R10)
+-// and x23 are callee-saved, so both are spilled across it.
++// natively. The target is canonicalised into pool space first (the same
++// IOS_PE_TO_POOL_TO the import-slot path uses), because Wine also hands this
++// dispatcher PE VAs and the 0x40000 bound below -- correct for the pool, wrong
++// for a PE module near 0x71fe... -- would otherwise reject every one of them.
++// It is only reached once the thunk shapes have been ruled out, so it cannot
++// mistake an x64 thunk for EC code. x4 (x64 R10) and x23 are callee-saved, so
++// both are spilled across it.
+ //
+ // PLACEMENT: this must stay off every fall-through path. ios_ffs_reject runs
+ // straight into ios_ffs_no_bypass on purpose, and it has just restored x9 to the
+@@ -237,16 +326,18 @@
+ // branch to ios_ffs_reject, so nothing falls in here.
+ ios_ec_entry:
+   stp x4, x23, [sp, #-16]!       // keep sp 16-aligned; x4=x64 R10
+-  lsr x4, x9, #15                // (addr >> 12) / 8 == addr >> 15
++  mov x17, x9                    // candidate target, canonicalised below
++  IOS_PE_TO_POOL_TO x17, x10, x11, x12, x16, ios_ec_entry_miss
++  lsr x4, x17, #15               // (addr >> 12) / 8 == addr >> 15
+   cmp x4, #0x40000               // 256 KB of bitmap covers 8 GB of pool
+   b.hs ios_ec_entry_miss         // not pool space: cannot be EC code
+   IOS_LOAD_TEB x16
+   ldr x16, [x16, #0x60]          // TEB->PEB
+   ldr x16, [x16, #0x368]         // PEB->EcCodeBitMap
+   cbz x16, ios_ec_entry_miss
+-  lsr x4, x9, #18                // word index
++  lsr x4, x17, #18               // word index
+   ldr x16, [x16, x4, lsl #3]
+-  lsr x4, x9, #12                // LSRV uses bits[5:0] == the page's bit index
++  lsr x4, x17, #12               // LSRV uses bits[5:0] == the page's bit index
+   lsr x16, x16, x4
+   tbz x16, #0, ios_ec_entry_miss
+   adrp x16, IosFfsBypassLog
+@@ -254,9 +345,9 @@
+   ldr x23, [x16, #32]
+   add x23, x23, #1
+   str x23, [x16, #32]            // [4] = raw-target EC entries taken natively
+-  str x9, [x16, #40]             // [5] = last such target
++  str x17, [x16, #40]            // [5] = last such target
+   ldp x4, x23, [sp], #16
+-  br x9                          // native ARM64EC: x0-x8 and lr untouched
++  br x17                         // native ARM64EC: x0-x8 and lr untouched
+ ios_ec_entry_miss:
+   ldp x4, x23, [sp], #16
+   b ios_ffs_no_bypass            // not EC: emulate, exactly as before

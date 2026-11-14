@@ -7967,6 +7967,86 @@ dispatch_guest_fault:
                                     : "AArch64 code (not an x64 thunk)");
                             else
                                 dprintf(STDERR_FILENO, "[x9-probe] bytes at x9 UNREADABLE\n");
+                            /* Follow the x64 import thunk exactly as ExitToX64 does
+                             * (bare: jmp rel32 at +2, rip +6; hotpatched: jmp rel32
+                             * at +10, rip +14) and report the IAT slot, its value,
+                             * and that value's EC classification. This is the datum
+                             * that decides the fix: a slot holding an x64-side stub
+                             * must be recognised and unwrapped, while a slot holding
+                             * EC code only needs the native branch I already added. */
+                            {
+                                int32_t rel = 0;
+                                uint64_t slot_addr = 0;
+                                mach_vm_size_t got_r = 0;
+                                if (got_b >= 12 && bytes[0] == 0xff && bytes[1] == 0x25)
+                                {
+                                    if (mach_vm_read_overwrite(mach_task_self(),
+                                            (mach_vm_address_t)(x9 + 2), 4,
+                                            (mach_vm_address_t)&rel, &got_r) == KERN_SUCCESS && got_r == 4)
+                                        slot_addr = x9 + 6 + (int64_t)rel;
+                                }
+                                else if (got_b == 8 && bytes[0] == 0x48 && bytes[1] == 0x8d
+                                         && bytes[2] == 0xa4 && bytes[3] == 0x24)
+                                {
+                                    if (mach_vm_read_overwrite(mach_task_self(),
+                                            (mach_vm_address_t)(x9 + 10), 4,
+                                            (mach_vm_address_t)&rel, &got_r) == KERN_SUCCESS && got_r == 4)
+                                        slot_addr = x9 + 14 + (int64_t)rel;
+                                    else
+                                    {
+                                        /* 8 bytes read is not enough for the hotpatched
+                                         * shape: re-read the whole 14-byte thunk. */
+                                        unsigned char wide[14];
+                                        mach_vm_size_t got_w = 0;
+                                        if (mach_vm_read_overwrite(mach_task_self(),
+                                                (mach_vm_address_t)x9, sizeof(wide),
+                                                (mach_vm_address_t)wide, &got_w) == KERN_SUCCESS
+                                            && got_w == 14)
+                                        {
+                                            memcpy(&rel, wide + 10, 4);
+                                            slot_addr = x9 + 14 + (int64_t)rel;
+                                        }
+                                    }
+                                }
+                                if (slot_addr)
+                                {
+                                    uint64_t slot_val = 0;
+                                    mach_vm_size_t got_s = 0;
+                                    uint64_t sv_mod = 0, sv_pe = 0;
+                                    int sv_ec = -1, slot_ec = -1;
+                                    if (mach_vm_read_overwrite(mach_task_self(),
+                                            (mach_vm_address_t)slot_addr, 8,
+                                            (mach_vm_address_t)&slot_val, &got_s) == KERN_SUCCESS && got_s == 8)
+                                    {
+                                        if (ec_map && (slot_val >> 15) < 0x40000)
+                                        {
+                                            uint64_t w = ec_map[slot_val >> 18];
+                                            sv_ec = (int)((w >> ((slot_val >> 12) & 63)) & 1);
+                                        }
+                                        if (ec_map && (slot_addr >> 15) < 0x40000)
+                                        {
+                                            uint64_t w = ec_map[slot_addr >> 18];
+                                            slot_ec = (int)((w >> ((slot_addr >> 12) & 63)) & 1);
+                                        }
+                                        sv_pe = ios_jit_reverse_translate( slot_val, &sv_mod );
+                                        dprintf(STDERR_FILENO,
+                                            "[x9-probe] thunk -> slot 0x%llx (EC-page=%d) = 0x%llx"
+                                            " [EC=%d] pe=0x%llx %s+0x%llx\n",
+                                            (unsigned long long)slot_addr, slot_ec,
+                                            (unsigned long long)slot_val, sv_ec,
+                                            (unsigned long long)sv_pe,
+                                            sv_mod ? ios_pe_module_name(sv_mod) : "no-module",
+                                            (unsigned long long)(sv_pe && sv_mod ? sv_pe - sv_mod : 0));
+                                    }
+                                    else
+                                        dprintf(STDERR_FILENO,
+                                            "[x9-probe] thunk -> slot 0x%llx UNREADABLE\n",
+                                            (unsigned long long)slot_addr);
+                                }
+                                else
+                                    dprintf(STDERR_FILENO,
+                                        "[x9-probe] x9 is not a thunk shape ExitToX64 knows\n");
+                            }
                             /* Report where x9 sits inside its image rather than
                              * guessing an extent: read SizeOfImage from the PE
                              * headers so a marking gap is distinguishable from a

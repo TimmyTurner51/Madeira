@@ -1,0 +1,161 @@
+diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -87,8 +87,16 @@
+ /* ml316: FFS-bypass diagnostics, written by ExitToX64's bypass path in Module.S:
+  * [0] = native short-circuits taken, [1] = last EC target,
+  * [2] = FFS matched but target not EC (fell through to emulation), [3] = last such
+- * target. Read by the [ffs-bypass] reporter in Core.cpp's CompileBlock. */
+-extern "C" uint64_t IosFfsBypassLog[6];
++ * target.
++ * [4] = raw (non-thunk) callees taken natively by ios_ec_entry, [5] = last such.
++ * [6] = import slots whose value could not be resolved to a native fast-forward
++ *       body, [7] = last such slot value. [6] is the counter that says the
++ *       fast-forward fix was reached and did NOT apply, and [7] names what the
++ *       slot actually held -- without it a repeat of the pc=0 would be
++ *       unexplained, since the register probe lives in the app binary and does
++ *       not ship with a FEX component.
++ * Read by the [ffs-bypass] reporter in Core.cpp's CompileBlock. */
++extern "C" uint64_t IosFfsBypassLog[8];
+ /* Defined in FEXCore Arm64Emitter.cpp; read when the dispatcher and blocks are emitted. */
+ extern "C" uint32_t IosEcReturnWithRet;
+ 
+@@ -101,7 +109,7 @@
+ /* uint32_t, not bool: a 1-byte global here misaligned the adrp/ldr pair
+  * lld generates for the neighbouring word ("misaligned ldr/str offset"). */
+ static uint32_t IosTebTsdImportFound = 0;
+-uint64_t IosFfsBypassLog[6] {};
++uint64_t IosFfsBypassLog[8] {};
+ /* ml1131: transition probe, written by Module.S and read by wine's ntdll-unix
+  * sampler through this DATA export (libarm64ecfex_ios.def). Layout in bytes:
+  *   0     magic 'MADXPFEX' (set in ProcessInit)
+@@ -782,6 +790,17 @@
+ 
+   void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override {
+     InvalidationTracker->InvalidateAlignedInterval(Start, Length, false);
++  }
++
++  // MADEIRA fh6-fex 0001: with full SMC the block already validated its own bytes, so only it has
++  // to go. Anything else keeps the page-wide invalidation above.
++  void InvalidateGuestBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t Entry) override {
++    FEX_CONFIG_OPT(SMCChecks, SMCCHECKS);
++    if (SMCChecks != FEXCore::Config::CONFIG_SMC_FULL) {
++      InvalidateGuestCodeRange(Thread, Entry, 1);
++      return;
++    }
++    InvalidationTracker->InvalidateGuestBlock(Entry);
+   }
+ 
+   void MarkOvercommitRange(uint64_t Start, uint64_t Length) override {
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -1353,7 +1353,7 @@
+ extern "C" uint64_t IosJitReverseTranslate(uint64_t Addr);
+ /* iOS-Madeira ml316: ExitToX64's FFS-bypass counters, defined in Module.cpp and written by
+  * the bypass asm in Module.S. Reported below the same way as [cb-entry]. */
+-extern "C" uint64_t IosFfsBypassLog[4];
++extern "C" uint64_t IosFfsBypassLog[8];
+ #else
+ /* The WOW64 module (libwow64fex.dll) is a plain aarch64 PE with no Module.S, no EC entry thunks
+  * and no FFS bypass, so the last two symbols above do not exist in its link. Zeroed storage and an
+@@ -1540,7 +1540,26 @@
+     }
+   }
+ 
++  /* [ffs-slot] is the counterpart for the import-slot path: a slot value that
++   * could not be resolved to a native fast-forward body, so the call fell
++   * through to emulation with the thunk untouched. If Forza dies at pc=0 again
++   * and this line shows a count with no [ffs-bypass] growth above, the slot does
++   * not hold an x64 fast-forward stub and the value printed here is what it does
++   * hold -- which is the one datum the register probe cannot supply, because it
++   * lives in the app binary and a FEX component ships alone. */
+   {
++    static uint64_t SlotLastCount = 0;
++    static uint32_t SlotReports = 0;
++    if (IosFfsBypassLog[6] != SlotLastCount && SlotReports < 12) {
++      SlotLastCount = IosFfsBypassLog[6];
++      SlotReports++;
++      LogMan::Msg::EFmt("[ffs-slot] unresolved={} (last slot value {:#x} -- not a native "
++                        "fast-forward body; emulated untouched)",
++                        IosFfsBypassLog[6], IosFfsBypassLog[7]);
++    }
++  }
++
++  {
+     static uint64_t CBLastCount = 0;
+     static uint32_t CBReports = 0;
+     const uint64_t CBCount = IosCbEntryLog[6];
+@@ -2354,22 +2373,50 @@
+   return (uintptr_t)CodePtr;
+ }
+ 
+-void ContextImpl::InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length) {
++bool ContextImpl::InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length) {
+   FEXCORE_PROFILE_SCOPED("InvalidateCodeBuffersCodeRange");
+ 
+   LOGMAN_THROW_A_FMT(CodeInvalidationMutex.try_lock() == false, "CodeInvalidationMutex needs to be unique_locked here");
++  bool HadCode = false;
+   std::scoped_lock lk {CodeBufferListLock};
+   auto it = CodeBufferList.begin();
+   while (it != CodeBufferList.end()) {
+     if (auto Strong = it->lock()) {
+-      Strong->LookupCache->InvalidateRange(Start, Length);
++      HadCode |= Strong->LookupCache->InvalidateRange(Start, Length);
+       it++;
+     } else {
+       it = CodeBufferList.erase(it);
++    }
++  }
++  return HadCode;
++}
++
++// MADEIRA fh6-fex 0001: single-block invalidation. Under SMCChecks=full every block compiled from
++// writable code validates its own bytes on entry, so a change only has to drop the affected block
++// instead of every block sharing its page.
++void ContextImpl::InvalidateCodeBuffersBlock(uint64_t Entry) {
++  std::scoped_lock lk {CodeBufferListLock};
++  for (const auto& Weak : CodeBufferList) {
++    if (auto Strong = Weak.lock()) {
++      auto MapLock = Strong->LookupCache->AcquireWriteLock();
++      Strong->LookupCache->Erase(Entry, MapLock);
+     }
+   }
+ }
+ 
++void ContextImpl::InvalidateThreadCachedBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t Entry) {
++  LOGMAN_THROW_A_FMT(CodeInvalidationMutex.try_lock() == false, "CodeInvalidationMutex needs to be unique_locked here");
++  Thread->LookupCache->InvalidateCachedBlock(Entry);
++}
++
++// MADEIRA fh6-fex 0001: a range that the page tracker could not attribute a write to. The shared
++// map may hold entries with no reverse page bookkeeping, so sweep the concrete lookup layers too.
++void ContextImpl::InvalidateThreadUntrackedCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) {
++  std::scoped_lock Lock {CodeInvalidationMutex};
++  Thread->FrontendDecoder->ResetExecutableRangeCache();
++  Thread->LookupCache->InvalidateUntrackedRange(Start, Length);
++}
++
+ #if defined(FEX_IOS_HOST) && defined(_WIN32)
+ /* MADEIRA: rate-limit the call-ret reset that follows a code invalidation.
+  *
+@@ -2437,7 +2484,18 @@
+ }
+ 
+ void ContextImpl::ThreadRemoveCodeEntryFromJit(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP) {
+-  static_cast<ContextImpl*>(Frame->Thread->CTX)->SyscallHandler->InvalidateGuestCodeRange(Frame->Thread, GuestRIP, 1);
++  auto Thread = Frame->Thread;
++  auto Ctx = static_cast<ContextImpl*>(Thread->CTX);
++
++  // MADEIRA fh6-fex 0001: with full SMC every block compiled from writable code validates its own
++  // bytes on entry, so a thread that reaches a stale copy through its own cache, an older buffer's
++  // links, or a racing link detects the mismatch itself and re-enters here. Drop only this block,
++  // from this thread and from every buffer, instead of invalidating its whole page.
++  Thread->LookupCache->InvalidateBlock(GuestRIP);
++  if (Ctx->Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL) {
++    return;
++  }
++  Ctx->SyscallHandler->InvalidateGuestBlock(Thread, GuestRIP);
+ }
+ 
+ std::optional<CustomIRResult>
