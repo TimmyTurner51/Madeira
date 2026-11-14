@@ -3367,8 +3367,17 @@ struct ContentView: View {
             //
             // ORDERING MATTERS: our task-port claim installs at wine's first thread
             // setup, which is AFTER this point, so this BRK still reaches StikDebug.
-            // Flip to false to A/B against the old attached-for-the-whole-run behaviour.
-            let earlyDetach = true
+            // Flip to false to A/B against the old attached-for-the-whole-run behaviour,
+            // or set env.MADEIRA_KEEP_DEBUGGER_ATTACHED = 1 to keep the debugger for the
+            // whole app run without a rebuild. Keeping it attached is what lets a SECOND
+            // session in this app run get its pool: the pool request is a BRK only a
+            // debugger answers, so once madeira detaches, a relaunch is held at "Enable
+            // JIT" even though CS_DEBUGGED is still set (seen 2026-11-14: session 1
+            // attached=1 at the pool request, session 2 attached=0, request unanswered).
+            // The cost is the documented one: attached runs are ~2x slower and on iOS 27
+            // presented frames only reliably reach glass after the detach.
+            let keepAttached = MadeiraConfig.flag("MADEIRA_KEEP_DEBUGGER_ATTACHED", fallback: false)
+            let earlyDetach = !keepAttached
             if earlyDetach, pool != nil {
                 let dt0 = CFAbsoluteTimeGetCurrent()
                 StikJITHelper.detachDebugger()
@@ -3483,9 +3492,15 @@ struct ContentView: View {
             }
             Thread.sleep(forTimeInterval: 2.0)
 
-            // Step 6: Detach debugger — main thread should have zero accumulated hang time
-            logStore.log("Detaching debugger...")
-            StikJITHelper.detachDebugger()
+            // Step 6: Detach debugger — main thread should have zero accumulated hang time.
+            // MADEIRA_KEEP_DEBUGGER_ATTACHED skips this so the next session in this app run
+            // still has an answerer for its pool request (see the earlyDetach note above).
+            if keepAttached {
+                logStore.log("[keep-attached] debugger left attached for another session this run")
+            } else {
+                logStore.log("Detaching debugger...")
+                StikJITHelper.detachDebugger()
+            }
 
             DispatchQueue.main.async {
                 heartbeat.invalidate()
