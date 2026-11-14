@@ -1,17 +1,25 @@
 diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
-index 170719ce2..83ccbef82 100644
+index 170719c..73ee54e 100644
 --- a/FEXCore/Source/Interface/Core/Core.cpp
 +++ b/FEXCore/Source/Interface/Core/Core.cpp
-@@ -1353,7 +1353,7 @@ extern "C" uint64_t IosCbEntryLog[8];
+@@ -1353,14 +1353,14 @@ extern "C" uint64_t IosCbEntryLog[8];
  extern "C" uint64_t IosJitReverseTranslate(uint64_t Addr);
  /* iOS-Madeira ml316: ExitToX64's FFS-bypass counters, defined in Module.cpp and written by
   * the bypass asm in Module.S. Reported below the same way as [cb-entry]. */
 -extern "C" uint64_t IosFfsBypassLog[4];
-+extern "C" uint64_t IosFfsBypassLog[8];
++extern "C" uint64_t IosFfsBypassLog[12];
  #else
  /* The WOW64 module (libwow64fex.dll) is a plain aarch64 PE with no Module.S, no EC entry thunks
   * and no FFS bypass, so the last two symbols above do not exist in its link. Zeroed storage and an
-@@ -1540,6 +1540,25 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
+  * identity translation: the FFS reporter below compares against counters nothing increments, and
+  * the module has no PE-image-to-pool alias table (its guest images are mapped normally). */
+ extern "C" uint64_t IosCbEntryLog[8];
+-static uint64_t IosFfsBypassLog[4] {};
++static uint64_t IosFfsBypassLog[12] {};
+ static inline uint64_t IosJitReverseTranslate(uint64_t Addr) {
+   return Addr;
+ }
+@@ -1540,6 +1540,41 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
      }
    }
  
@@ -34,11 +42,27 @@ index 170719ce2..83ccbef82 100644
 +    }
 +  }
 +
++  /* [ffs-follow] proves the 0005 chain actually ran: how many x64 fast-forward
++   * prologues ExitToX64 unwrapped, and the last native target reached. A run
++   * that reaches a hybrid export now shows a non-zero count here, so a repeat of
++   * the pc=0 with follow=0 means the slot did not hold an FFS at all (look at
++   * [ffs-slot]'s value instead) rather than the unwrap being broken. */
++  {
++    static uint64_t FollowLastCount = 0;
++    static uint32_t FollowReports = 0;
++    if (IosFfsBypassLog[8] != FollowLastCount && FollowReports < 12) {
++      FollowLastCount = IosFfsBypassLog[8];
++      FollowReports++;
++      LogMan::Msg::EFmt("[ffs-follow] followed={} (last native target {:#x})",
++                        IosFfsBypassLog[8], IosFfsBypassLog[9]);
++    }
++  }
++
    {
      static uint64_t CBLastCount = 0;
      static uint32_t CBReports = 0;
 diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
-index 4d0772e99..7b9d03c68 100644
+index 4d0772e..a5840d4 100644
 --- a/Source/Windows/ARM64EC/Module.cpp
 +++ b/Source/Windows/ARM64EC/Module.cpp
 @@ -87,8 +87,16 @@ static uint64_t IosEcCodeBitMapValue = 0;
@@ -56,7 +80,7 @@ index 4d0772e99..7b9d03c68 100644
 + *       unexplained, since the register probe lives in the app binary and does
 + *       not ship with a FEX component.
 + * Read by the [ffs-bypass] reporter in Core.cpp's CompileBlock. */
-+extern "C" uint64_t IosFfsBypassLog[8];
++extern "C" uint64_t IosFfsBypassLog[12];
  /* Defined in FEXCore Arm64Emitter.cpp; read when the dispatcher and blocks are emitted. */
  extern "C" uint32_t IosEcReturnWithRet;
  
@@ -65,7 +89,7 @@ index 4d0772e99..7b9d03c68 100644
   * lld generates for the neighbouring word ("misaligned ldr/str offset"). */
  static uint32_t IosTebTsdImportFound = 0;
 -uint64_t IosFfsBypassLog[6] {};
-+uint64_t IosFfsBypassLog[8] {};
++uint64_t IosFfsBypassLog[12] {};
  /* ml1131: transition probe, written by Module.S and read by wine's ntdll-unix
   * sampler through this DATA export (libarm64ecfex_ios.def). Layout in bytes:
   *   0     magic 'MADXPFEX' (set in ProcessInit)
