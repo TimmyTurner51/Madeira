@@ -1,4 +1,5 @@
 diff --git a/Source/Windows/ARM64EC/Module.S b/Source/Windows/ARM64EC/Module.S
+index 1cebac0c7..89226f767 100644
 --- a/Source/Windows/ARM64EC/Module.S
 +++ b/Source/Windows/ARM64EC/Module.S
 @@ -36,6 +36,47 @@
@@ -49,7 +50,7 @@ diff --git a/Source/Windows/ARM64EC/Module.S b/Source/Windows/ARM64EC/Module.S
  // Read by RetToEntryThunk below; ARM64EC/Module.cpp sets it at process init.
  .data
  .balign 8
-@@ -158,6 +199,55 @@
+@@ -158,6 +199,76 @@ ios_thunk_bare:
    add x17, x17, #6
  ios_thunk_slot:
    ldr x17, [x17]                   // the pointer the jmp loads
@@ -71,41 +72,62 @@ diff --git a/Source/Windows/ARM64EC/Module.S b/Source/Windows/ARM64EC/Module.S
 +  // back to the untouched slot value keeps the old test exactly as it was.
 +  // x9 is deliberately untouched too: if all of this fails, emulation must
 +  // still run the ORIGINAL thunk.
-+  stp x17, xzr, [sp, #-16]!        // keep sp 16-aligned; save the slot value
++  //
++  // x23 and x4 are the only extra scratch used, and both are spilled in the
++  // frame below. x4 == x64 R10 and the bitmap test uses it as a scratch, while
++  // the bypass path promises R10 reaches the callee intact -- so it has to be
++  // saved and restored, which the original code did not do. x4/x5 are NOT free
++  // as scratch generally: they carry the ARM64EC variadic descriptor (stack-args
++  // pointer and size) and the ml315 note at the top of this file records what
++  // clobbering them cost -- an RPC livelock where a pointer became
++  // dwDesiredAccess and the size became the context handle. x0-x3 are
++  // RCX/RDX/R8/R9 and must reach the callee untouched.
++  //
++  // The frame also repairs a PRE-EXISTING sp imbalance. ios_thunk_slot used to
++  // push nothing, yet ios_thunk_reject branched into ios_ffs_reject, whose
++  // `ldp x4, x9, [sp], #16` pairs with the push in ios_ffs_check -- so every
++  // thunk that was correctly rejected into emulation popped 16 bytes that were
++  // never pushed, moving sp by +16 and loading garbage into x4/x9. The reject
++  // path now unwinds its own frame and joins the shared counter at
++  // ios_ffs_reject_count, which does not pop.
++  //
++  // Frame: [sp+0]=slot value, [sp+8]=x4 (x64 R10), [sp+16]=x23, [sp+24]=pad.
++  stp x17, x4, [sp, #-32]!         // keep sp 16-aligned; save slot value + R10
++  stp x23, xzr, [sp, #16]
 +  IOS_PE_TO_POOL_TO x17, x10, x11, x12, x16, ios_thunk_slot_orig
 +  ldr x16, [x17]
-+  movz x5, #0x8b48
-+  movk x5, #0x48c4, lsl #16        // 48 8b c4 48 = mov rax,rsp / mov [rax+0x20],rbx
-+  movk x5, #0x5889, lsl #32
-+  movk x5, #0x5520, lsl #48
-+  cmp x16, x5
++  movz x23, #0x8b48
++  movk x23, #0x48c4, lsl #16       // 48 8b c4 48 = mov rax,rsp / mov [rax+0x20],rbx
++  movk x23, #0x5889, lsl #32
++  movk x23, #0x5520, lsl #48
++  cmp x16, x23
 +  b.ne ios_thunk_slot_orig
 +  ldrh w16, [x17, #8]
-+  movz w5, #0xe95d                 // 5d e9 = pop rbp / jmp rel32
-+  cmp w16, w5
++  movz w23, #0xe95d                // 5d e9 = pop rbp / jmp rel32
++  cmp w16, w23
 +  b.ne ios_thunk_slot_orig
 +  ldursw x16, [x17, #10]
 +  add x17, x17, x16
 +  add x17, x17, #14                // raw target = stub base + 14 + rel32
 +  IOS_PE_TO_POOL_TO x17, x10, x11, x12, x16, ios_thunk_slot_orig
-+  add sp, sp, #16                  // resolved: drop the saved slot value
 +  b ios_thunk_slot_bitmap
 +ios_thunk_slot_orig:
-+  ldr x17, [sp], #16               // miss: restore the slot value untouched
-+  // [6]/[7]: the fix was reached and did not apply, plus the value it gave up on.
-+  // x5 and x16 are scratch here (x5 is x64 R11, volatile at a call boundary);
-+  // x17 must survive into the bitmap test below as the target.
++  // [6]/[7]: the fix was reached and did not apply, plus the value it gave up
++  // on. Only x16/x17/x23 are touched here; x4 was saved at entry and is
++  // restored on both exits.
 +  adrp x16, IosFfsBypassLog
 +  add x16, x16, #:lo12:IosFfsBypassLog
-+  ldr x5, [x16, #48]
-+  add x5, x5, #1
-+  str x5, [x16, #48]               // [6] = unresolved import-slot count
-+  str x17, [x16, #56]              // [7] = last unresolved slot value
++  ldr x23, [x16, #48]
++  add x23, x23, #1
++  str x23, [x16, #48]              // [6] = unresolved import-slot count
++  ldr x23, [sp]                    // the slot value as it actually was
++  str x23, [x16, #56]              // [7] = last unresolved slot value
++  ldr x17, [sp]                    // target for the bitmap test below
 +ios_thunk_slot_bitmap:
    // iOS-Madeira: classify the resolved target BEFORE falling back to emulation.
    //
    // This path can run inside process_attach's DllMain walk, i.e. BEFORE
-@@ -170,13 +260,10 @@
+@@ -170,13 +281,10 @@ ios_thunk_slot:
    // correct outcome is a native branch and the emulator is never needed.
    //
    // Index space (this is the trap that made an earlier attempt miss): the bitmap is
@@ -123,7 +145,36 @@ diff --git a/Source/Windows/ARM64EC/Module.S b/Source/Windows/ARM64EC/Module.S
    lsr x4, x17, #15                 // (addr >> 12) / 8 == addr >> 15
    cmp x4, #0x40000                 // 256 KB of bitmap covers 8 GB of pool
    b.hs ios_thunk_reject            // not pool space: cannot be EC code
-@@ -222,11 +309,13 @@
+@@ -190,16 +298,26 @@ ios_thunk_slot:
+   lsr x16, x16, x4
+   tbz x16, #0, ios_thunk_reject
+   // EC: branch natively. The pool copy is already executable, so this needs no
+-  // exec-fault redirect. x4/x9 are untouched, so R10/RCX reach the callee intact.
++  // exec-fault redirect. R10 (x4) is restored from the frame first so it reaches
++  // the callee intact; x9 was never touched on this path.
+   adrp x16, IosFfsBypassLog
+   add x16, x16, #:lo12:IosFfsBypassLog
+   ldr x23, [x16]
+   add x23, x23, #1
+   str x23, [x16]                   // [0] = bypass count
+   str x17, [x16, #8]               // [1] = last EC target taken natively
++  ldr x4, [sp, #8]                 // restore x64 R10
++  ldr x23, [sp, #16]               // restore x64 nonvolatile x23
++  add sp, sp, #32
+   br x17
+ ios_thunk_reject:
+-  b ios_ffs_reject                 // counts the rejection, then emulates the thunk
++  // Rejected into emulation. Unwind this frame and join the shared counter at
++  // ios_ffs_reject_count -- NOT ios_ffs_reject, whose ldp pairs with the push in
++  // ios_ffs_check and would corrupt sp by 16 bytes here.
++  ldr x4, [sp, #8]
++  ldr x23, [sp, #16]
++  add sp, sp, #32
++  b ios_ffs_reject_count
+ 
+ // ml7xx: x9 matched NO x64 thunk shape, so it is a raw target address.
+ //
+@@ -222,11 +340,13 @@ ios_thunk_reject:
  // `mov x0,x8` after the blr.
  //
  // So if the EC bitmap says the raw target is ARM64EC code, branch to it
@@ -142,7 +193,7 @@ diff --git a/Source/Windows/ARM64EC/Module.S b/Source/Windows/ARM64EC/Module.S
  //
  // PLACEMENT: this must stay off every fall-through path. ios_ffs_reject runs
  // straight into ios_ffs_no_bypass on purpose, and it has just restored x9 to the
-@@ -237,16 +326,18 @@
+@@ -237,16 +357,18 @@ ios_thunk_reject:
  // branch to ios_ffs_reject, so nothing falls in here.
  ios_ec_entry:
    stp x4, x23, [sp, #-16]!       // keep sp 16-aligned; x4=x64 R10
@@ -164,7 +215,7 @@ diff --git a/Source/Windows/ARM64EC/Module.S b/Source/Windows/ARM64EC/Module.S
    lsr x16, x16, x4
    tbz x16, #0, ios_ec_entry_miss
    adrp x16, IosFfsBypassLog
-@@ -254,9 +345,9 @@
+@@ -254,9 +376,9 @@ ios_ec_entry:
    ldr x23, [x16, #32]
    add x23, x23, #1
    str x23, [x16, #32]            // [4] = raw-target EC entries taken natively
@@ -176,3 +227,11 @@ diff --git a/Source/Windows/ARM64EC/Module.S b/Source/Windows/ARM64EC/Module.S
  ios_ec_entry_miss:
    ldp x4, x23, [sp], #16
    b ios_ffs_no_bypass            // not EC: emulate, exactly as before
+@@ -339,6 +461,7 @@ ios_ffs_reject:
+   // COUNT it, so a run with zero bypasses is distinguishable from one where the
+   // probe never fired at all (ml316's silent miss must not repeat).
+   ldp x4, x9, [sp], #16
++ios_ffs_reject_count:
+   adrp x16, IosFfsBypassLog
+   add x16, x16, #:lo12:IosFfsBypassLog
+   ldr x23, [x16, #16]
