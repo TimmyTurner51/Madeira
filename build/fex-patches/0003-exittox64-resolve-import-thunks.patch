@@ -1,8 +1,8 @@
 diff --git a/Source/Windows/ARM64EC/Module.S b/Source/Windows/ARM64EC/Module.S
-index 668b1d20d..0e2b23b71 100644
+index 668b1d20d..d5089fc94 100644
 --- a/Source/Windows/ARM64EC/Module.S
 +++ b/Source/Windows/ARM64EC/Module.S
-@@ -119,6 +119,48 @@ ExitToX64:
+@@ -119,6 +119,89 @@ ExitToX64:
    // from the native sp on every JIT entry. The `br` targets the PE VA; the Mach
    // exec-fault redirect translates it to the pool copy (proven ~33us path, and this
    // is RPC-call frequency, not per-frame).
@@ -18,7 +18,8 @@ index 668b1d20d..0e2b23b71 100644
 +  // Follow the jmp to its IAT slot, then hand the real target to the shared alias/bitmap
 +  // path: EC targets branch natively, genuine x64 ones fall through to emulation with x9
 +  // restored to the thunk (emulating the thunk itself is the correct x64 behaviour).
-+  // Scratch x16/x17 only; x4/x9 stay untouched until the existing spill below.
++  // Scratch x16/x17 only until ios_thunk_slot, which spills x4/x9 before using
++  // x4/x23 as well.
 +  ldrh w16, [x9]
 +  movz w17, #0x25ff
 +  cmp w16, w17
@@ -44,8 +45,48 @@ index 668b1d20d..0e2b23b71 100644
 +  add x17, x17, #6
 +ios_thunk_slot:
 +  ldr x17, [x17]                   // the pointer the jmp loads
-+  stp x4, x9, [sp, #-16]!
-+  b ios_ffs_xlate_walk
++  // iOS-Madeira: classify the resolved target BEFORE falling back to emulation.
++  //
++  // This path can run inside process_attach's DllMain walk, i.e. BEFORE
++  // arm64ec_process_init has run FEX's ProcessInit/ThreadInit. Then no thread has a
++  // CpuStateFrame and the CPU area's EmulatorData is all zero, so enter_jit's
++  // `ldr x16,[x17,#0x40]; br x16` branches to NULL. That was 2026-11-14's
++  // c0000005 at pc=0 with cpu_area[0x40]=0: ucrtbase's call through
++  // __os_arm64x_dispatch_call_no_redirect with x9 = kernel32's bare `ff 25` thunk
++  // for kernelbase!TlsAlloc. TlsAlloc is ARM64EC code in a hybrid image, so the
++  // correct outcome is a native branch and the emulator is never needed.
++  //
++  // Index space (this is the trap that made an earlier attempt miss): the bitmap is
++  // indexed by JIT-POOL address, not by PE VA. virtual_ios.c commits it with
++  // bm_start = (jit_base >> 12) / 8, i.e. addr >> 15, and set_arm64ec_range logs
++  // start_pos=0x54d3 for jit 0x1534fd000 -- 0x1534fd000 >> 15 == 0x54d3 exactly.
++  // So test the target AS THE IAT HOLDS IT (Wine installs pool aliases into IATs and
++  // dispatch slots) and NEVER index the bitmap with a PE VA: the pool is
++  // [0x148000000, 0x168000000), whose indices stop at 0x2d000, while a PE VA such as
++  // 0x71fe3d0000 gives 0xe3f000 -- far outside the committed bitmap pages.
++  lsr x4, x17, #15                 // (addr >> 12) / 8 == addr >> 15
++  cmp x4, #0x40000                 // 256 KB of bitmap covers 8 GB of pool
++  b.hs ios_thunk_reject            // not pool space: cannot be EC code
++  IOS_LOAD_TEB x16
++  ldr x16, [x16, #0x60]            // TEB->PEB
++  ldr x16, [x16, #0x368]           // PEB->EcCodeBitMap
++  cbz x16, ios_thunk_reject
++  lsr x4, x17, #18                 // word index
++  ldr x16, [x16, x4, lsl #3]
++  lsr x4, x17, #12                 // LSRV uses bits[5:0] == the page's bit index
++  lsr x16, x16, x4
++  tbz x16, #0, ios_thunk_reject
++  // EC: branch natively. The pool copy is already executable, so this needs no
++  // exec-fault redirect. x4/x9 are untouched, so R10/RCX reach the callee intact.
++  adrp x16, IosFfsBypassLog
++  add x16, x16, #:lo12:IosFfsBypassLog
++  ldr x23, [x16]
++  add x23, x23, #1
++  str x23, [x16]                   // [0] = bypass count
++  str x17, [x16, #8]               // [1] = last EC target taken natively
++  br x17
++ios_thunk_reject:
++  b ios_ffs_reject                 // counts the rejection, then emulates the thunk
 +
 +ios_ffs_check:
    ldr x16, [x9]
