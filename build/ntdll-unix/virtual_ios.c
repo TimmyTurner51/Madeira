@@ -6025,13 +6025,20 @@ int ios_jit_heal_aux_iat( uintptr_t fault_pc, uintptr_t lr, void *thread_peb, ui
     {
         int t = ios_aux_find_copy( jit_pc );
         size_t lo = 0, hi = 0;
-        if (t < 0) return 0;
-        if (!ios_jit_mapping_is_hybrid( t )) return 0;
-        if (!ios_jit_code_bounds( &ios_jit_mappings[t], jit_pc - (uintptr_t)ios_jit_mappings[t].jit_base,
-                                  &lo, &hi )) return 0;
-        /* the alignment of ARM64 instructions is the cheapest sanity check that the
-         * copy really holds code here and not a data pointer that merely looks like one */
-        if (jit_pc & 3) return 0;
+        static volatile int declined;
+        if (t < 0 || !ios_jit_mapping_is_hybrid( t )
+            || !ios_jit_code_bounds( &ios_jit_mappings[t],
+                                     jit_pc - (uintptr_t)ios_jit_mappings[t].jit_base, &lo, &hi )
+            || (jit_pc & 3))
+        {
+            /* Keep the check_call continuation: FEX routes an x64 callee correctly. */
+            int n = __sync_add_and_fetch( &declined, 1 );
+            if (n <= 32 || !(n % 512))
+                dprintf( STDERR_FILENO, "[aux-iat-heal] fh6-ec-slot #%d image %p +0x%lx DECLINED target %p "
+                         "(copy %d, not native ARM64EC code); slot keeps __os_arm64x_check_call\n",
+                         n, (void *)pe, (unsigned long)(call - jb), (void *)jit_pc, t );
+            return 0;
+        }
     }
 
     __atomic_store_n( (uint64_t *)(rw + (slot - rx)), (uint64_t)jit_pc, __ATOMIC_RELEASE );
