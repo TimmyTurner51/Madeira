@@ -136,5 +136,106 @@ for name in MODULES:
 
 check(seen > 0, 'at least one shipped ARM64EC hybrid image was available to check')
 
+# --- 4. The 2026-11-14 crash chain, reproduced from the shipped bytes ---------
+# The device log named it precisely: ucrtbase's exit thunk called ExitToX64 with
+# x9 = 0x153a85a70, i.e. kernel32's pool copy 0x153a50000 + RVA 0x35a70. Walk
+# that whole chain here so a regression shows up without a device.
+k32_path = root / 'app/Madeira/arm64ec-windows/kernel32.dll'
+kb_path = root / 'app/Madeira/arm64ec-windows/kernelbase.dll'
+
+def sections(d):
+    e = struct.unpack_from('<I', d, 0x3c)[0]
+    nsec = struct.unpack_from('<H', d, e + 6)[0]
+    optsz = struct.unpack_from('<H', d, e + 20)[0]
+    image_base = struct.unpack_from('<Q', d, e + 24 + 0x18)[0]
+    so = e + 24 + optsz
+    out = {}
+    for s in range(nsec):
+        o = so + s * 40
+        nm = d[o:o + 8].rstrip(b'\0').decode('latin1')
+        vs, va, rs, rp = struct.unpack_from('<IIII', d, o + 8)
+        out[nm] = (va, vs, rp, rs)
+    return d, e, image_base, out
+
+def off_of(secs, rva):
+    for _nm, (va, vs, rp, rs) in secs.items():
+        if va <= rva < va + max(vs, rs):
+            return rp + (rva - va)
+    return None
+
+def ec_ranges(d, e, image_base, secs):
+    dd = e + 24 + 0x70
+    lc_rva, _sz = struct.unpack_from('<II', d, dd + 10 * 8)
+    chpe = struct.unpack_from('<Q', d, lc_rva + 0xC8)[0]
+    cm_rva, cm_cnt = struct.unpack_from('<II', d, chpe - image_base + 4)
+    return [(st & ~3, ln) for k in range(cm_cnt)
+            for st, ln in [struct.unpack_from('<II', d, cm_rva + k * 8)] if (st & 3) == 1]
+
+if k32_path.exists() and kb_path.exists():
+    k32, ke, kib, ksecs = sections(k32_path.read_bytes())
+    THUNK_RVA = 0x35a70        # x9 in the crash: pool 0x153a50000 + this
+    tb = k32[off_of(ksecs, THUNK_RVA):off_of(ksecs, THUNK_RVA) + 16]
+    check(tb[:10] == bytes.fromhex('488da42400000000ff25'),
+          'kernel32 RVA 0x35a70 is the hotpatched import thunk from the crash log')
+    check(tb[8:10] == b'\xff\x25', 'that thunk ends in ff 25 jmp [rip+rel32]')
+    slot_rva = THUNK_RVA + 14 + struct.unpack_from('<i', tb, 10)[0]
+    check(slot_rva == 0x50650, 'the thunk resolves to IAT slot RVA 0x50650')
+
+    # Which import is that slot? kernelbase!GetCommandLineA, per the log's claim.
+    d1 = k32
+    dd = ke + 24 + 0x70
+    imp_rva, _isz = struct.unpack_from('<II', d1, dd + 1 * 8)
+    name = None
+    o = imp_rva
+    while True:
+        ilt, ts, _fc, name_rva, iat = struct.unpack_from('<IIIII', d1, o)
+        if ilt == 0 and name_rva == 0 and iat == 0:
+            break
+        if iat <= slot_rva < iat + (ts or 0x1000):
+            ent = struct.unpack_from('<Q', d1, off_of(ksecs, ilt or iat) + ((slot_rva - iat) // 8) * 8)[0]
+            if ent and not (ent >> 63):
+                no = off_of(ksecs, ent) + 2
+                name = d1[no:d1.index(b'\0', no)].decode('latin1')
+            break
+        o += 20
+    check(name == 'GetCommandLineA',
+          'IAT slot 0x50650 is the import of kernelbase!GetCommandLineA (got %r)' % name)
+
+    # kernelbase's export must be an FFS in .hexpthk whose one-hop target is EC.
+    kb, kbe, kbb, kbsecs = sections(kb_path.read_bytes())
+    ec = ec_ranges(kb, kbe, kbb, kbsecs)
+    dd = kbe + 24 + 0x70
+    ed_rva, _esz = struct.unpack_from('<II', kb, dd + 0)
+    eb = off_of(kbsecs, ed_rva)
+    nnames, af, an, ano = [struct.unpack_from('<I', kb, eb + k)[0] for k in (24, 28, 32, 36)]
+    exp = None
+    for i in range(nnames):
+        nr = struct.unpack_from('<I', kb, off_of(kbsecs, an) + i * 4)[0]
+        fn = kb[off_of(kbsecs, nr):kb.index(b'\0', off_of(kbsecs, nr))].decode('latin1')
+        if fn == 'GetCommandLineA':
+            oi = struct.unpack_from('<H', kb, off_of(kbsecs, ano) + i * 2)[0]
+            exp = struct.unpack_from('<I', kb, off_of(kbsecs, af) + oi * 4)[0]
+            break
+    check(exp is not None, 'kernelbase exports GetCommandLineA')
+    if exp is not None:
+        eo = off_of(kbsecs, exp)
+        stub = kb[eo:eo + 14]
+        check(stub[:9] == FFS[:9] and stub[9] == 0xE9,
+              'that export is an FFS (%s)' % stub.hex(' '))
+        hexpthk_rva = kbsecs['.hexpthk'][0]
+        check(hexpthk_rva <= exp, 'the export lives in .hexpthk, above .text')
+        check(not any(a <= exp < a + n for a, n in ec),
+              'the FFS entry itself is NOT EC-marked -- so accepting the slot value '
+              'must fail the bitmap test (this is the pc=0)')
+        tgt = exp + 14 + struct.unpack_from('<i', stub, 10)[0]
+        check(any(a <= tgt < a + n for a, n in ec),
+              'following ONE hop lands on ARM64EC code (RVA 0x%x) -- the fix' % tgt)
+        tbx = off_of(kbsecs, tgt)
+        # adrp x8 / ldr x0,[x8,#imm] / ret -- real ARM64, not x64 bytes.
+        check(kb[tbx + 8:tbx + 12] == b'\xc0\x03\x5f\xd6',
+              'the followed target decodes as ARM64 (ends in ret)')
+else:
+    print('SKIP crash-chain check: kernel32/kernelbase hybrid images not present')
+
 print('\n%d failure(s)' % len(failures) if failures else '\nall checks passed')
 sys.exit(1 if failures else 0)
