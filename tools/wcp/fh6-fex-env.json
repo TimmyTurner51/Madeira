@@ -1,0 +1,20 @@
+{
+  "description": "Madeira's iOS FEX with Forza Horizon 6's environment.",
+  "environment": {
+    "FEX_SMCCHECKS": "full",
+    "FEX_HIDEHYPERVISORBIT": "1",
+    "FEX_MULTIBLOCK": "1",
+    "FEX_X87REDUCEDPRECISION": "1",
+    "FEX_TSOENABLED": "1",
+    "FEX_HALFBARRIERTSOENABLED": "1",
+    "FEX_VECTORTSOENABLED": "0",
+    "FEX_MEMCPYSETTSOENABLED": "0",
+    "FEX_DYNAMICL1CACHE": "0",
+    "FEX_PROFILESTATS": "0",
+    "PROTON_NO_NTSYNC": "1",
+    "PROTON_NO_ESYNC": "1",
+    "WINE_FAST_YIELD": "1",
+    "VKD3D_FEATURE_LEVEL": "12_2",
+    "VKD3D_SHADER_MODEL": "6_9"
+  }
+}
