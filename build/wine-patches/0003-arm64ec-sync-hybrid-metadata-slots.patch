@@ -1,8 +1,8 @@
 diff --git a/dlls/ntdll/signal_arm64ec.c b/dlls/ntdll/signal_arm64ec.c
-index 9ed09f7e..ff6f9c7d 100644
+index 9ed09f7e..430501d8 100644
 --- a/dlls/ntdll/signal_arm64ec.c
 +++ b/dlls/ntdll/signal_arm64ec.c
-@@ -965,7 +965,29 @@ static void update_hybrid_pointer( void *module, const IMAGE_SECTION_HEADER *sec
+@@ -965,7 +965,31 @@ static void update_hybrid_pointer( void *module, const IMAGE_SECTION_HEADER *sec
          ERR( "rva %x outside of section %s (%lx-%lx)\n", rva,
               sec->Name, sec->VirtualAddress, sec->VirtualAddress + sec->Misc.VirtualSize );
      else
@@ -20,8 +20,10 @@ index 9ed09f7e..ff6f9c7d 100644
 +         * for its TLS index. */
 +        {
 +            struct ios_sync_pe_write_params params = { dest, sizeof(void *), 0 };
-+            NTSTATUS sync = WINE_UNIX_CALL( unix_ios_sync_pe_write, &params );
 +            static int said;
++            NTSTATUS sync = __wine_unixlib_handle
++                ? WINE_UNIX_CALL( unix_ios_sync_pe_write, &params )
++                : STATUS_PROCEDURE_NOT_FOUND;   /* too early: no unix side yet */
 +            if (said++ < 32)
 +                ERR( "hybrid-slot rva=%x <- %p sync=%lx copied=%lu\n",
 +                     rva, ptr, sync, params.synced );
@@ -33,7 +35,7 @@ index 9ed09f7e..ff6f9c7d 100644
  }
  
  /*******************************************************************
-@@ -980,6 +1002,15 @@ void arm64ec_update_hybrid_metadata( void *module, IMAGE_NT_HEADERS *nt,
+@@ -980,6 +1004,15 @@ void arm64ec_update_hybrid_metadata( void *module, IMAGE_NT_HEADERS *nt,
      /* assume that all pointers are in the same section */
      ERR( "arm64ec_update_hybrid_metadata: module=%p dispatch_call_rva=%lx check_call=%p\n",
           module, (unsigned long)metadata->__os_arm64x_dispatch_call, arm64x_check_call );
@@ -49,7 +51,7 @@ index 9ed09f7e..ff6f9c7d 100644
  
      for (i = 0; i < nt->FileHeader.NumberOfSections; i++, sec++)
      {
-@@ -4921,12 +4952,38 @@ static void __attribute__((naked)) arm64x_check_call(void)
+@@ -4921,12 +4954,38 @@ static void __attribute__((naked)) arm64x_check_call(void)
           ".Ljmp:\n\t"
           "ldrb w16, [x11]\n\t"
           "cmp w16, #0xff\n\t"
@@ -89,7 +91,7 @@ index 9ed09f7e..ff6f9c7d 100644
           "ldr x11, [x16, w9, sxtw]\n\t"
           "b \"#arm64x_check_call\"\n"       /* restart checks with jump destination */
           /* not a special sequence, call the exit thunk */
-@@ -4945,6 +5002,10 @@ static void __attribute__((naked)) arm64x_check_call(void)
+@@ -4945,6 +5004,10 @@ static void __attribute__((naked)) arm64x_check_call(void)
           ".byte 0xe9\n\t"                   /* jmp  arm_code */
           ".byte 0, 0, 0, 0, 0, 0\n"
  
