@@ -495,6 +495,10 @@ final class WCPComponentsModel: ObservableObject {
     @Published var error: String?
     @Published var status: String?
 
+    /// Packages waiting behind the one being installed, in the order the picker
+    /// handed them over.
+    private var pending: [URL] = []
+
     /// Documents/Components. WineProcessBridge.m reads state.json here.
     static var root: URL {
         FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
@@ -535,6 +539,24 @@ final class WCPComponentsModel: ObservableObject {
         self.error = error.localizedDescription
     }
 
+    /// Queues packages the picker returned. Installing is serial, so a second
+    /// selection waits for the first to finish instead of being dropped by the
+    /// `busy` guard.
+    func install(from sources: [URL]) {
+        guard !sources.isEmpty else { return }
+        pending.append(contentsOf: sources)
+        drainPending()
+    }
+
+    private func drainPending() {
+        guard !busy, !pending.isEmpty else { return }
+        let next = pending.removeFirst()
+        if !pending.isEmpty {
+            status = "Installing \(next.lastPathComponent) — \(pending.count) more queued."
+        }
+        install(from: next)
+    }
+
     func install(from source: URL) {
         guard !busy else { return }
         error = nil
@@ -554,6 +576,7 @@ final class WCPComponentsModel: ObservableObject {
             if accessed { source.stopAccessingSecurityScopedResource() }
             busy = false
             error = "\(source.lastPathComponent) is not a .wcp package (no zstd header). Pick the .wcp itself, or use Import DLL or folder."
+            drainPending()
             return
         }
         // Keep the original file name: the component id is derived from it, so a
@@ -570,6 +593,7 @@ final class WCPComponentsModel: ObservableObject {
             try? FileManager.default.removeItem(at: folder)
             busy = false
             report(WCPError.message("Could not read the .wcp: \(error.localizedDescription)"))
+            drainPending()
             return
         }
         if accessed { source.stopAccessingSecurityScopedResource() }
@@ -838,12 +862,14 @@ final class WCPComponentsModel: ObservableObject {
         error = nil
         status = "Imported \(component.versionLine). It applies the next time a game starts."
         LogStore.shared.log("[wcp] imported \(component.id) type=\(component.type) files=\(component.fileCount) links=\(component.layout.count)")
+        drainPending()
     }
 
     private func failed(_ message: String) {
         busy = false
         error = message
         LogStore.shared.log("[wcp] import failed: \(message)")
+        drainPending()
     }
 
     func setEnabled(_ component: WCPComponent, _ enabled: Bool) {
@@ -973,14 +999,16 @@ struct ComponentsSettingsSection: View {
         } footer: {
             Text("Imports FEX and Wine packages in the DroidDeck and GameNative .wcp format, or individual DLLs and folders from Files. An enabled component replaces the matching runtime files at the start of the next Windows session; the app itself is not modified. FEX must be built with Madeira's iOS host layer; a module built for Android or Linux cannot boot a game.")
         }
-        // Filtering on our own imported UTType (`app.madeira.wcp`) makes the
-        // iOS 26/27 Files sheet highlight a .wcp but never deliver the tap.
-        // Asking for plain `data` goes through the same code path as the
-        // DLL/folder importer below, which does work, and the installer
-        // validates the zstd header afterwards.
-        .fileImporter(isPresented: $importing, allowedContentTypes: [.data]) { result in
+        // Single-selection mode makes the Files sheet open the document on tap,
+        // and on iOS 26/27 that tap is never delivered: the row highlights but
+        // nothing happens and Open stays disabled. Multi-selection routes
+        // through the sheet's selection UI instead — bubbles plus an explicit
+        // Open button — which is exactly the path the working DLL/folder
+        // importer below uses. Packages install one at a time.
+        .fileImporter(isPresented: $importing, allowedContentTypes: [.data],
+                      allowsMultipleSelection: true) { result in
             switch result {
-            case .success(let url): model.install(from: url)
+            case .success(let urls): model.install(from: urls)
             case .failure(let error): model.report(error)
             }
         }
