@@ -7411,7 +7411,13 @@ NTSTATUS unixcall_ios_sync_pe_write(void *args)
     struct ios_sync_pe_write_params *p = args;
     void *copy;
 
-    if (!p || !p->address || p->size != sizeof(ULONG)) return STATUS_INVALID_PARAMETER;
+    /* 4 bytes: the loader's TLS index. 8 bytes: an ARM64EC dispatcher slot
+     * written by arm64ec_update_hybrid_metadata, which the guest reads from
+     * the pool copy (`adrp x8,page; ldr x16,[x8,#0x898]; blr x16`). Anything
+     * else stays refused so a wider request cannot overwrite live neighbours
+     * in the pool copy. */
+    if (!p || !p->address || (p->size != sizeof(ULONG) && p->size != sizeof(void *)))
+        return STATUS_INVALID_PARAMETER;
     p->synced = 0;
     copy = ios_jit_translate_addr(p->address);
     if (copy == p->address) return STATUS_SUCCESS; /* image not copied yet */
