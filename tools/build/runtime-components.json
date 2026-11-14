@@ -29,6 +29,7 @@
       "tools/build/runtime-components.json",
       "build/windows-runtime/**",
       "build/wine-pe/**",
+      "build/wine-patches/**",
       "build/fex-arm64ec/**",
       "build/fex-wow64/**",
       "build/fex-patches/**",
