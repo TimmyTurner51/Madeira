@@ -1,11 +1,12 @@
 diff --git a/tools/winebuild/spec32.c b/tools/winebuild/spec32.c
-index 9d99850f..f45e1ab1 100644
+index 9d99850f..66c79dc4 100644
 --- a/tools/winebuild/spec32.c
 +++ b/tools/winebuild/spec32.c
-@@ -1462,6 +1462,176 @@ void output_def_file( DLLSPEC *spec, struct exports *exports, int import_only )
+@@ -1462,6 +1462,177 @@ void output_def_file( DLLSPEC *spec, struct exports *exports, int import_only )
  }
  
  
++#define IMAGE_DIRECTORY_ENTRY_EXPORT      0
 +#define IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG 10
 +#define IMAGE_DIRECTORY_ENTRY_IAT         12
 +
@@ -179,7 +180,7 @@ index 9d99850f..f45e1ab1 100644
  /*******************************************************************
   *         make_builtin_files
   */
-@@ -1503,6 +1673,24 @@ void make_builtin_files( struct strarray files )
+@@ -1503,6 +1674,24 @@ void make_builtin_files( struct strarray files )
                      write( fd, &dll_charact, sizeof(dll_charact) );
                  }
              }

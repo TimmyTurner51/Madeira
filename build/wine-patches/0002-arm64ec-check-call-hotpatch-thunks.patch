@@ -1,0 +1,55 @@
+diff --git a/dlls/ntdll/signal_arm64ec.c b/dlls/ntdll/signal_arm64ec.c
+index 9ed09f7e..b85ecda5 100644
+--- a/dlls/ntdll/signal_arm64ec.c
++++ b/dlls/ntdll/signal_arm64ec.c
+@@ -4921,12 +4921,38 @@ static void __attribute__((naked)) arm64x_check_call(void)
+          ".Ljmp:\n\t"
+          "ldrb w16, [x11]\n\t"
+          "cmp w16, #0xff\n\t"
+-         "b.ne .Lexit\n\t"
++         "b.ne .Lhotpatch\n\t"
+          "ldrb w16, [x11, #1]\n\t"
+          "cmp w16, #0x25\n\t"               /* ff 25 jmp *xxx(%rip) */
+          "b.ne .Lexit\n\t"
+          "ldr w9, [x11, #2]\n\t"
+          "add x16, x11, #6\n\t"             /* address after jump */
++         "b .Lfollow\n\t"
++         /* iOS-Madeira: Wine's x64 import thunks now carry the 8-byte hotpatch prologue
++          * that native Windows and x86_64 Wine emit (48 8d a4 24 00 00 00 00) ahead of
++          * the same ff 25 (build/wine-patches/0001). Forza Horizon 6's anti-tamper
++          * requires that prologue, so the bare-thunk test above no longer matches them.
++          * Without this, every such call falls to .Lexit -- "not a special sequence" --
++          * and is routed to the x64 exit thunk, which enters the JIT with no
++          * CpuStateFrame (x28 == 0) and faults at pc 0. Accept the hotpatched form and
++          * follow it exactly as the bare one: TlsAlloc from ucrtbase's exit thunk was
++          * the first to hit this. */
++         ".Lhotpatch:\n\t"
++         "ldr w16, [x11]\n\t"               /* 48 8d a4 24 */
++         "ldr w17, .Lhotpatch_seq\n\t"
++         "cmp w16, w17\n\t"
++         "b.ne .Lexit\n\t"
++         "ldr w16, [x11, #4]\n\t"           /* 00 00 00 00 padding */
++         "cbnz w16, .Lexit\n\t"
++         "ldrb w16, [x11, #8]\n\t"
++         "cmp w16, #0xff\n\t"
++         "b.ne .Lexit\n\t"
++         "ldrb w16, [x11, #9]\n\t"
++         "cmp w16, #0x25\n\t"               /* ff 25 jmp *xxx(%rip) */
++         "b.ne .Lexit\n\t"
++         "ldr w9, [x11, #10]\n\t"
++         "add x16, x11, #14\n\t"            /* address after the hotpatched jump */
++         ".Lfollow:\n\t"
+          "ldr x11, [x16, w9, sxtw]\n\t"
+          "b \"#arm64x_check_call\"\n"       /* restart checks with jump destination */
+          /* not a special sequence, call the exit thunk */
+@@ -4945,6 +4971,10 @@ static void __attribute__((naked)) arm64x_check_call(void)
+          ".byte 0xe9\n\t"                   /* jmp  arm_code */
+          ".byte 0, 0, 0, 0, 0, 0\n"
+ 
++         /* First word of the hotpatched import thunk (48 8d a4 24 = lea rsp,[rsp+0]). */
++         ".Lhotpatch_seq:\n\t"
++         ".word 0x24a48d48\n\t"
++
+          ".Lsyscall_seq:\n\t"
+          ".byte 0x4c, 0x8b, 0xd1\n\t"       /* mov  %rcx,%r10 */
+          ".byte 0xb8, 0, 0, 0, 0\n\t"       /* mov  $xxx,%eax */
