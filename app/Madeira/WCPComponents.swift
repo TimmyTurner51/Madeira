@@ -897,8 +897,25 @@ final class WCPComponentsModel: ObservableObject {
 
 struct ComponentsSettingsSection: View {
     @ObservedObject private var model = WCPComponentsModel.shared
-    @State private var importing = false
-    @State private var importingFiles = false
+    /// What the one shared file importer is currently collecting.
+    ///
+    /// SwiftUI drives a single presentation per view node, so two stacked
+    /// `.fileImporter` modifiers on the same view fight over that slot: the
+    /// `isPresented` flag flips but the picker's completion never fires. Both
+    /// buttons below therefore share one importer and switch behavior here.
+    private enum ImportTarget {
+        case package
+        case payload
+
+        var contentTypes: [UTType] {
+            switch self {
+            case .package: return [.data]
+            case .payload: return [.data, .folder]
+            }
+        }
+    }
+
+    @State private var importTarget: ImportTarget?
     @State private var pendingFiles: [URL] = []
     @State private var choosingKind = false
     @State private var removing: WCPComponent?
@@ -942,7 +959,7 @@ struct ComponentsSettingsSection: View {
                 .padding(.vertical, 2)
             }
             Button {
-                importing = true
+                importTarget = .package
             } label: {
                 Label("Import .wcp", systemImage: "square.and.arrow.down")
             }
@@ -977,7 +994,7 @@ struct ComponentsSettingsSection: View {
                     .foregroundStyle(.secondary)
             }
             Button {
-                importingFiles = true
+                importTarget = .payload
             } label: {
                 Label("Import DLL or folder", systemImage: "doc.badge.plus")
             }
@@ -999,25 +1016,31 @@ struct ComponentsSettingsSection: View {
         } footer: {
             Text("Imports FEX and Wine packages in the DroidDeck and GameNative .wcp format, or individual DLLs and folders from Files. An enabled component replaces the matching runtime files at the start of the next Windows session; the app itself is not modified. FEX must be built with Madeira's iOS host layer; a module built for Android or Linux cannot boot a game.")
         }
-        // Single-selection mode makes the Files sheet open the document on tap,
-        // and on iOS 26/27 that tap is never delivered: the row highlights but
-        // nothing happens and Open stays disabled. Multi-selection routes
-        // through the sheet's selection UI instead — bubbles plus an explicit
-        // Open button — which is exactly the path the working DLL/folder
-        // importer below uses. Packages install one at a time.
-        .fileImporter(isPresented: $importing, allowedContentTypes: [.data],
-                      allowsMultipleSelection: true) { result in
-            switch result {
-            case .success(let urls): model.install(from: urls)
-            case .failure(let error): model.report(error)
-            }
-        }
-        .fileImporter(isPresented: $importingFiles, allowedContentTypes: [.data, .folder],
-                      allowsMultipleSelection: true) { result in
+        // Exactly one importer for both buttons. Stacking two `.fileImporter`
+        // modifiers on one view node makes SwiftUI arbitrate a single
+        // presentation slot between them: the flag flips, the sheet appears,
+        // and the completion never fires. That is what made Import .wcp look
+        // dead while Import DLL or folder worked — they were competing.
+        .fileImporter(
+            isPresented: Binding(
+                get: { importTarget != nil },
+                set: { if !$0 { importTarget = nil } }
+            ),
+            allowedContentTypes: (importTarget ?? .package).contentTypes,
+            allowsMultipleSelection: true
+        ) { result in
+            let target = importTarget
+            importTarget = nil
             switch result {
             case .success(let urls):
-                pendingFiles = urls
-                choosingKind = !urls.isEmpty
+                LogStore.shared.log("[wcp] picker returned \(urls.count) item(s) for \(target == .payload ? "payload" : "package")")
+                switch target {
+                case .payload:
+                    pendingFiles = urls
+                    choosingKind = !urls.isEmpty
+                default:
+                    model.install(from: urls)
+                }
             case .failure(let error):
                 model.report(error)
             }
