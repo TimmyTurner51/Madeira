@@ -1,0 +1,53 @@
+diff --git a/Source/Windows/ARM64EC/Module.S b/Source/Windows/ARM64EC/Module.S
+index 668b1d20d..0e2b23b71 100644
+--- a/Source/Windows/ARM64EC/Module.S
++++ b/Source/Windows/ARM64EC/Module.S
+@@ -119,6 +119,48 @@ ExitToX64:
+   // from the native sp on every JIT entry. The `br` targets the PE VA; the Mach
+   // exec-fault redirect translates it to the pool copy (proven ~33us path, and this
+   // is RPC-call frequency, not per-frame).
++  // iOS-Madeira: resolve an x64 import thunk to the function it jumps to before any of the
++  // FFS tests below. Wine's builtins reach this exit thunk with x9 pointing at an import
++  // thunk (TlsAlloc from ucrtbase's exit thunk was the first), and ExitToX64 matches only
++  // the FFS shape, so without this every such call fell to ios_ffs_no_bypass and entered
++  // the JIT with x9 still = the thunk. Two shapes exist:
++  //   bare        ff 25 rel32                    jmp *__imp_x(%rip)
++  //   hotpatched  48 8d a4 24 00 00 00 00 ff 25  build/wine-patches/0001 puts this in
++  //                                              front of the same jmp, because Forza's
++  //                                              anti-tamper requires a hotpatch prologue.
++  // Follow the jmp to its IAT slot, then hand the real target to the shared alias/bitmap
++  // path: EC targets branch natively, genuine x64 ones fall through to emulation with x9
++  // restored to the thunk (emulating the thunk itself is the correct x64 behaviour).
++  // Scratch x16/x17 only; x4/x9 stay untouched until the existing spill below.
++  ldrh w16, [x9]
++  movz w17, #0x25ff
++  cmp w16, w17
++  b.eq ios_thunk_bare
++  ldr w16, [x9]
++  movz w17, #0x8d48
++  movk w17, #0x24a4, lsl #16       // 48 8d a4 24 = lea rsp,[rsp+0]
++  cmp w16, w17
++  b.ne ios_ffs_check
++  ldr w16, [x9, #4]
++  cbnz w16, ios_ffs_check          // the four operand bytes must be zero
++  ldrh w16, [x9, #8]
++  movz w17, #0x25ff
++  cmp w16, w17
++  b.ne ios_ffs_check
++  ldursw x16, [x9, #10]            // jmp rel32, hotpatched
++  add x17, x9, x16
++  add x17, x17, #14
++  b ios_thunk_slot
++ios_thunk_bare:
++  ldursw x16, [x9, #2]             // jmp rel32, bare
++  add x17, x9, x16
++  add x17, x17, #6
++ios_thunk_slot:
++  ldr x17, [x17]                   // the pointer the jmp loads
++  stp x4, x9, [sp, #-16]!
++  b ios_ffs_xlate_walk
++
++ios_ffs_check:
+   ldr x16, [x9]
+   movz x17, #0x8b48
+   movk x17, #0x48c4, lsl #16
