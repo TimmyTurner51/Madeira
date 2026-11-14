@@ -1,0 +1,308 @@
+diff --git a/FEXCore/Source/Interface/Context/Context.h b/FEXCore/Source/Interface/Context/Context.h
+index 3b3c7ac78..3b2095d79 100644
+--- a/FEXCore/Source/Interface/Context/Context.h
++++ b/FEXCore/Source/Interface/Context/Context.h
+@@ -217,8 +217,11 @@ public:
+ 
+   void OnCodeBufferAllocated(const std::shared_ptr<CPU::CodeBuffer>&) override;
+   void ClearCodeCache(FEXCore::Core::InternalThreadState* Thread, bool NewCodeBuffer = true) override;
+-  void InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length) override;
+-  void InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override;
++  bool InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length) override;
++  virtual void InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override;
++  void InvalidateThreadUntrackedCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override;
++  void InvalidateCodeBuffersBlock(uint64_t Entry) override;
++  void InvalidateThreadCachedBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t Entry) override;
+   FEXCore::Utils::WritePriorityMutex::Mutex& GetCodeInvalidationMutex() override {
+     return CodeInvalidationMutex;
+   }
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+index 8884ec062..170719ce2 100644
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -2354,20 +2354,48 @@ uintptr_t ContextImpl::CompileSingleStep(FEXCore::Core::CpuStateFrame* Frame, ui
+   return (uintptr_t)CodePtr;
+ }
+ 
+-void ContextImpl::InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length) {
++bool ContextImpl::InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length) {
+   FEXCORE_PROFILE_SCOPED("InvalidateCodeBuffersCodeRange");
+ 
+   LOGMAN_THROW_A_FMT(CodeInvalidationMutex.try_lock() == false, "CodeInvalidationMutex needs to be unique_locked here");
++  bool HadCode = false;
+   std::scoped_lock lk {CodeBufferListLock};
+   auto it = CodeBufferList.begin();
+   while (it != CodeBufferList.end()) {
+     if (auto Strong = it->lock()) {
+-      Strong->LookupCache->InvalidateRange(Start, Length);
++      HadCode |= Strong->LookupCache->InvalidateRange(Start, Length);
+       it++;
+     } else {
+       it = CodeBufferList.erase(it);
+     }
+   }
++  return HadCode;
++}
++
++// MADEIRA fh6-fex 0001: single-block invalidation. Under SMCChecks=full every block compiled from
++// writable code validates its own bytes on entry, so a change only has to drop the affected block
++// instead of every block sharing its page.
++void ContextImpl::InvalidateCodeBuffersBlock(uint64_t Entry) {
++  std::scoped_lock lk {CodeBufferListLock};
++  for (const auto& Weak : CodeBufferList) {
++    if (auto Strong = Weak.lock()) {
++      auto MapLock = Strong->LookupCache->AcquireWriteLock();
++      Strong->LookupCache->Erase(Entry, MapLock);
++    }
++  }
++}
++
++void ContextImpl::InvalidateThreadCachedBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t Entry) {
++  LOGMAN_THROW_A_FMT(CodeInvalidationMutex.try_lock() == false, "CodeInvalidationMutex needs to be unique_locked here");
++  Thread->LookupCache->InvalidateCachedBlock(Entry);
++}
++
++// MADEIRA fh6-fex 0001: a range that the page tracker could not attribute a write to. The shared
++// map may hold entries with no reverse page bookkeeping, so sweep the concrete lookup layers too.
++void ContextImpl::InvalidateThreadUntrackedCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) {
++  std::scoped_lock Lock {CodeInvalidationMutex};
++  Thread->FrontendDecoder->ResetExecutableRangeCache();
++  Thread->LookupCache->InvalidateUntrackedRange(Start, Length);
+ }
+ 
+ #if defined(FEX_IOS_HOST) && defined(_WIN32)
+@@ -2437,7 +2465,18 @@ void ContextImpl::InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadS
+ }
+ 
+ void ContextImpl::ThreadRemoveCodeEntryFromJit(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP) {
+-  static_cast<ContextImpl*>(Frame->Thread->CTX)->SyscallHandler->InvalidateGuestCodeRange(Frame->Thread, GuestRIP, 1);
++  auto Thread = Frame->Thread;
++  auto Ctx = static_cast<ContextImpl*>(Thread->CTX);
++
++  // MADEIRA fh6-fex 0001: with full SMC every block compiled from writable code validates its own
++  // bytes on entry, so a thread that reaches a stale copy through its own cache, an older buffer's
++  // links, or a racing link detects the mismatch itself and re-enters here. Drop only this block,
++  // from this thread and from every buffer, instead of invalidating its whole page.
++  Thread->LookupCache->InvalidateBlock(GuestRIP);
++  if (Ctx->Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL) {
++    return;
++  }
++  Ctx->SyscallHandler->InvalidateGuestBlock(Thread, GuestRIP);
+ }
+ 
+ std::optional<CustomIRResult>
+diff --git a/FEXCore/Source/Interface/Core/LookupCache.h b/FEXCore/Source/Interface/Core/LookupCache.h
+index 3a437854e..778825dc3 100644
+--- a/FEXCore/Source/Interface/Core/LookupCache.h
++++ b/FEXCore/Source/Interface/Core/LookupCache.h
+@@ -2,6 +2,7 @@
+ #pragma once
+ #include <atomic>
+ #include <chrono>
++#include <cstring>
+ #include "Interface/Context/Context.h"
+ #include <FEXCore/Utils/LogManager.h>
+ #include <FEXCore/Utils/SHMStats.h>
+@@ -146,11 +147,14 @@ struct GuestToHostMap {
+     return BlockList.erase(Address) != 0;
+   }
+ 
+-  void InvalidateRange(uint64_t Start, uint64_t Length) {
++  bool InvalidateRange(uint64_t Start, uint64_t Length) {
+     auto lk = AcquireWriteLock();
+ 
+     auto lower = CodePages.lower_bound(Start >> 12);
+     auto upper = CodePages.upper_bound((Start + Length - 1) >> 12);
++    if (lower == upper) {
++      return false;
++    }
+ 
+     for (auto it = lower; it != upper; it++) {
+       for (const auto& Entry : it->second) {
+@@ -158,6 +162,32 @@ struct GuestToHostMap {
+       }
+     }
+     CodePages.erase(lower, upper);
++    return true;
++  }
++
++  // MADEIRA fh6-fex 0001: erases every block entry whose guest address falls inside
++  // [Start, Start + Length), even when the reverse page bookkeeping (CodePages) is out of sync
++  // with the forward block list. A protection change can announce itself before the write it
++  // covers, leaving a block with no page entry that a page-range sweep therefore never reaches.
++  void EraseEntriesInRange(uint64_t Start, uint64_t Length, const LookupCacheWriteLockToken& lk) {
++    fextl::vector<uint64_t> Entries;
++    if (Length < BlockList.size()) {
++      const uint64_t End = Start + Length;
++      for (uint64_t Address = Start; Address != End; ++Address) {
++        if (BlockList.find(Address) != BlockList.end()) {
++          Entries.push_back(Address);
++        }
++      }
++    } else {
++      for (const auto& [Address, Entry] : BlockList) {
++        if (Address >= Start && Address - Start < Length) {
++          Entries.push_back(Address);
++        }
++      }
++    }
++    for (const auto Address : Entries) {
++      Erase(Address, lk);
++    }
+   }
+ 
+   void AddBlockLink(uint64_t GuestDestination, FEXCore::Context::ExitFunctionLinkData* HostLink,
+@@ -405,6 +435,62 @@ public:
+     return ret;
+   }
+ 
++  // MADEIRA fh6-fex 0001: drops one entry even when it has no executable-page bookkeeping. A
++  // stale boundary entry cannot be reached through the page-based range index.
++  bool InvalidateBlock(uint64_t Address) {
++    auto lk = Shared->AcquireWriteLock();
++    const bool Removed = Shared->Erase(Address, lk);
++    InvalidateCache(Address, lk);
++    return Removed;
++  }
++
++  // Drops this thread's L1/L2 entry for one block; the shared map is the caller's job.
++  void InvalidateCachedBlock(uint64_t Address) {
++    auto lk = Shared->AcquireWriteLock();
++    InvalidateCache(Address, lk);
++  }
++
++  // MADEIRA fh6-fex 0001: sweeps the concrete lookup layers for a range. Used when execution is
++  // about to resume after a write the tracker could not attribute to a page.
++  void InvalidateUntrackedRange(uint64_t Start, uint64_t Length) {
++    auto lk = Shared->AcquireWriteLock();
++    Shared->EraseEntriesInRange(Start, Length, lk);
++
++    const uint64_t End = Start + Length;
++    auto* L1Entries = reinterpret_cast<LookupCacheEntry*>(L1Pointer);
++    if (Length < CurrentL1Entries) {
++      // L1 is direct-mapped by guest address, so only these slots can hold the range.
++      for (uint64_t Address = Start; Address != End; ++Address) {
++        auto& L1Entry = L1Entries[Address & L1PointerMask];
++        if (L1Entry.GuestCode == Address) {
++          L1Entry.GuestCode = 0;
++        }
++      }
++    } else {
++      for (size_t i = 0; i < CurrentL1Entries; ++i) {
++        const uint64_t Address = L1Entries[i].GuestCode;
++        if (Address >= Start && Address < End) {
++          L1Entries[i].GuestCode = 0;
++        }
++      }
++    }
++
++    if (!DisableL2Cache()) {
++      auto* Pointers = reinterpret_cast<uintptr_t*>(PagePointer);
++      const uint64_t FirstPage = Start >> 12;
++      const uint64_t LastPage = (End - 1) >> 12;
++      for (uint64_t Page = FirstPage; Page <= LastPage; ++Page) {
++        const uint64_t PageIndex = (Page << 12 & (VirtualMemSize - 1)) >> 12;
++        if (const uintptr_t LocalPagePointer = Pointers[PageIndex]) {
++          auto* Entries = reinterpret_cast<LookupCacheEntry*>(LocalPagePointer);
++          const size_t FirstOffset = Page == FirstPage ? Start & 0xfff : 0;
++          const size_t LastOffset = Page == LastPage ? ((End - 1) & 0xfff) + 1 : 0x1000;
++          memset(Entries + FirstOffset, 0, (LastOffset - FirstOffset) * sizeof(LookupCacheEntry));
++        }
++      }
++    }
++  }
++
+   void AddBlockLink(uint64_t GuestDestination, FEXCore::Context::ExitFunctionLinkData* HostLink,
+                     const FEXCore::Context::BlockDelinkerFunc& delinker, const LookupCacheWriteLockToken& lk) {
+     Shared->AddBlockLink(GuestDestination, HostLink, delinker, lk);
+diff --git a/FEXCore/include/FEXCore/Core/Context.h b/FEXCore/include/FEXCore/Core/Context.h
+index ec61b90bf..a57a7ecef 100644
+--- a/FEXCore/include/FEXCore/Core/Context.h
++++ b/FEXCore/include/FEXCore/Core/Context.h
+@@ -141,9 +141,14 @@ public:
+   virtual void FlushAndCloseCodeMap() = 0;
+ 
+   FEX_DEFAULT_VISIBILITY virtual void ClearCodeCache(FEXCore::Core::InternalThreadState* Thread, bool NewCodeBuffer = true) = 0;
+-  FEX_DEFAULT_VISIBILITY virtual void InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length) = 0;
++  FEX_DEFAULT_VISIBILITY virtual bool InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length) = 0;
+   FEX_DEFAULT_VISIBILITY virtual void
+   InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) = 0;
++  FEX_DEFAULT_VISIBILITY virtual void
++  InvalidateThreadUntrackedCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) = 0;
++  // Single-block variants of the two range invalidations above. Same locking rules.
++  FEX_DEFAULT_VISIBILITY virtual void InvalidateCodeBuffersBlock(uint64_t Entry) = 0;
++  FEX_DEFAULT_VISIBILITY virtual void InvalidateThreadCachedBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t Entry) = 0;
+   FEX_DEFAULT_VISIBILITY virtual FEXCore::Utils::WritePriorityMutex::Mutex& GetCodeInvalidationMutex() = 0;
+ 
+   FEX_DEFAULT_VISIBILITY virtual void
+diff --git a/FEXCore/include/FEXCore/HLE/SyscallHandler.h b/FEXCore/include/FEXCore/HLE/SyscallHandler.h
+index ae2e9b049..f55c7e0a8 100644
+--- a/FEXCore/include/FEXCore/HLE/SyscallHandler.h
++++ b/FEXCore/include/FEXCore/HLE/SyscallHandler.h
+@@ -60,6 +60,11 @@ public:
+   }
+   virtual void MarkGuestExecutableRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) {}
+   virtual void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) {}
++  // MADEIRA fh6-fex 0001: a block's in-block code check failed. Frontends whose blocks on writable
++  // code all carry that check may drop only this block instead of its whole page.
++  virtual void InvalidateGuestBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t Entry) {
++    InvalidateGuestCodeRange(Thread, Entry, 1);
++  }
+   virtual void MarkOvercommitRange(uint64_t Start, uint64_t Length) {}
+   virtual void UnmarkOvercommitRange(uint64_t Start, uint64_t Length) {}
+   virtual ExecutableRangeInfo QueryGuestExecutableRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Address) = 0;
+diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+index 2a76ec203..cd10a2d7f 100644
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -784,6 +784,17 @@ public:
+     InvalidationTracker->InvalidateAlignedInterval(Start, Length, false);
+   }
+ 
++  // MADEIRA fh6-fex 0001: with full SMC the block already validated its own bytes, so only it has
++  // to go. Anything else keeps the page-wide invalidation above.
++  void InvalidateGuestBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t Entry) override {
++    FEX_CONFIG_OPT(SMCChecks, SMCCHECKS);
++    if (SMCChecks != FEXCore::Config::CONFIG_SMC_FULL) {
++      InvalidateGuestCodeRange(Thread, Entry, 1);
++      return;
++    }
++    InvalidationTracker->InvalidateGuestBlock(Entry);
++  }
++
+   void MarkOvercommitRange(uint64_t Start, uint64_t Length) override {
+     OvercommitTracker->MarkRange(Start, Length);
+   }
+diff --git a/Source/Windows/Common/InvalidationTracker.cpp b/Source/Windows/Common/InvalidationTracker.cpp
+index 073d558bc..8a32a381e 100644
+--- a/Source/Windows/Common/InvalidationTracker.cpp
++++ b/Source/Windows/Common/InvalidationTracker.cpp
+@@ -525,6 +525,14 @@ void InvalidationTracker::ReprotectRWXIntervals(uint64_t Address, uint64_t Size)
+   ProtectRWXIntervalsInternal(Address, Size, false);
+ }
+ 
++void InvalidationTracker::InvalidateGuestBlock(uint64_t Entry) {
++  std::scoped_lock CodeLock(CTX.GetCodeInvalidationMutex());
++  CTX.InvalidateCodeBuffersBlock(Entry);
++  for (auto Thread : Threads) {
++    CTX.InvalidateThreadCachedBlock(Thread.second, Entry);
++  }
++}
++
+ bool InvalidationTracker::HandleRWXAccessViolation(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPc, uint64_t FaultAddress,
+                                                    bool* HotPage) {
+   const auto [NeedsInvalidate, UntrapProt] = [&](uint64_t Address) -> std::pair<bool, ULONG> {
+diff --git a/Source/Windows/Common/InvalidationTracker.h b/Source/Windows/Common/InvalidationTracker.h
+index 7eefac405..f6ba02901 100644
+--- a/Source/Windows/Common/InvalidationTracker.h
++++ b/Source/Windows/Common/InvalidationTracker.h
+@@ -51,6 +51,9 @@ public:
+   };
+   InvalidateContainingSectionResult InvalidateContainingSection(uint64_t Address, bool Free);
+   void InvalidateAlignedInterval(uint64_t Address, uint64_t Size, bool Free);
++  // MADEIRA fh6-fex 0001: drops one block from every code buffer and thread cache. Only valid when
++  // every block compiled from writable code validates its own bytes on entry (SMCChecks=full).
++  void InvalidateGuestBlock(uint64_t Entry);
+   void ReprotectRWXIntervals(uint64_t Address, uint64_t Size);
+   // MADEIRA: if HotPage is given, it is set when the fault hit an already hot page (see EnableHotSMCPages),
+   // which is unprotected again but not invalidated.

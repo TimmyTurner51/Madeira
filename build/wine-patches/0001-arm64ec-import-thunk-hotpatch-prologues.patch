@@ -1,17 +1,8 @@
-From 7bc6ae2d566b2a0ca40cc12c304608160bff626a Mon Sep 17 00:00:00 2001
-From: TimmyTurner51 <timmy@users.noreply.github.com>
-Date: Wed, 4 Nov 2026 21:15:33 -0600
-Subject: [PATCH] winebuild: emit x86_64-style hotpatch prologues for ARM64EC import thunks
-
----
- tools/winebuild/spec32.c | 171 +++++++++++++++++++++++++++++++++++++++
- 1 file changed, 171 insertions(+)
-
 diff --git a/tools/winebuild/spec32.c b/tools/winebuild/spec32.c
-index 062e65c..5c34b40 100644
+index 9d99850f..f45e1ab1 100644
 --- a/tools/winebuild/spec32.c
 +++ b/tools/winebuild/spec32.c
-@@ -1430,6 +1430,159 @@ void output_def_file( DLLSPEC *spec, struct exports *exports, int import_only )
+@@ -1462,6 +1462,176 @@ void output_def_file( DLLSPEC *spec, struct exports *exports, int import_only )
  }
  
  
@@ -43,20 +34,26 @@ index 062e65c..5c34b40 100644
 + * On ARM64EC the linker exports its own x64 import thunk instead, a bare "jmp *__imp_x(%rip)"
 + * in a 16-byte slot, which code inspecting export prologues takes for a hook.  Give those
 + * thunks the same shape as on x86_64.
++ *
++ * A pure x86_64 image (the x64 half of an ARM64EC farm) has no CHPE code map and no ARM64X
++ * dynamic relocations, so every export is x64 code and the export directory is the ordinary
++ * one.  Forza Horizon 6 ships those as the arm64ec-windows DLLs and checks them the same way.
 + */
 +static int fixup_arm64x_import_thunks( unsigned char *data, size_t size )
 +{
 +    static const unsigned char prolog[8] = { 0x48, 0x8d, 0xa4, 0x24, 0x00, 0x00, 0x00, 0x00 };
 +    unsigned int nt, nb_sec, opt, nb_dirs, dirs, lc_rva, lc_size, dvrt_rva, dvrt_size;
 +    unsigned int chpe_rva, map_rva, map_count, exp_rva = 0, exp_size = 0, iat_rva, iat_size;
-+    unsigned int i, j, pos, nb_funcs, funcs_rva, count = 0;
++    unsigned int i, j, pos, nb_funcs, funcs_rva, count = 0, machine, pure_x64;
 +    unsigned long long image_base, chpe_va;
 +    unsigned char *sec, *lc, *dvrt, *chpe, *map, *exp, *funcs;
 +
 +    if (size < 0x40) return 0;
 +    nt = get_le32( data + 0x3c );
 +    if (nt > size - 0x108 || memcmp( data + nt, "PE\0\0", 4 )) return 0;
-+    if (get_le16( data + nt + 4 ) != IMAGE_FILE_MACHINE_ARM64) return 0;
++    machine = get_le16( data + nt + 4 );
++    if (machine != IMAGE_FILE_MACHINE_ARM64 && machine != IMAGE_FILE_MACHINE_AMD64) return 0;
++    pure_x64 = (machine == IMAGE_FILE_MACHINE_AMD64);
 +    nb_sec = get_le16( data + nt + 6 );
 +    opt = nt + 24;
 +    if (get_le16( data + opt ) != IMAGE_NT_OPTIONAL_HDR64_MAGIC) return 0;
@@ -67,28 +64,38 @@ index 062e65c..5c34b40 100644
 +    dirs = opt + 112;
 +    if (nb_dirs <= IMAGE_DIRECTORY_ENTRY_IAT) return 0;
 +
-+    lc_rva = get_le32( data + dirs + 8 * IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG );
-+    if (!(lc = pe_rva_ptr( data, size, sec, nb_sec, lc_rva, 4 ))) return 0;
-+    lc_size = get_le32( lc );
-+    if (lc_size < 232 || !(lc = pe_rva_ptr( data, size, sec, nb_sec, lc_rva, lc_size ))) return 0;
++    if (pure_x64)
++    {
++        /* No CHPE map and no ARM64X relocations: every export body is x64 code. */
++        map = NULL;
++        map_count = 0;
++        exp_rva = get_le32( data + dirs + 8 * IMAGE_DIRECTORY_ENTRY_EXPORT );
++        exp_size = get_le32( data + dirs + 8 * IMAGE_DIRECTORY_ENTRY_EXPORT + 4 );
++    }
++    else
++    {
++        lc_rva = get_le32( data + dirs + 8 * IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG );
++        if (!(lc = pe_rva_ptr( data, size, sec, nb_sec, lc_rva, 4 ))) return 0;
++        lc_size = get_le32( lc );
++        if (lc_size < 232 || !(lc = pe_rva_ptr( data, size, sec, nb_sec, lc_rva, lc_size ))) return 0;
 +
-+    /* CHPE code map, to only touch x64 code */
-+    chpe_va = get_le32( lc + 200 ) | ((unsigned long long)get_le32( lc + 204 ) << 32);
-+    if (!chpe_va) return 0;
-+    chpe_rva = chpe_va - image_base;
-+    if (!(chpe = pe_rva_ptr( data, size, sec, nb_sec, chpe_rva, 12 ))) return 0;
-+    map_rva = get_le32( chpe + 4 );
-+    map_count = get_le32( chpe + 8 );
-+    if (!(map = pe_rva_ptr( data, size, sec, nb_sec, map_rva, map_count * 8 ))) return 0;
++        /* CHPE code map, to only touch x64 code */
++        chpe_va = get_le32( lc + 200 ) | ((unsigned long long)get_le32( lc + 204 ) << 32);
++        if (!chpe_va) return 0;
++        chpe_rva = chpe_va - image_base;
++        if (!(chpe = pe_rva_ptr( data, size, sec, nb_sec, chpe_rva, 12 ))) return 0;
++        map_rva = get_le32( chpe + 4 );
++        map_count = get_le32( chpe + 8 );
++        if (!(map = pe_rva_ptr( data, size, sec, nb_sec, map_rva, map_count * 8 ))) return 0;
 +
-+    /* the x64 view's export directory comes from the ARM64X dynamic relocations */
-+    i = get_le16( lc + 228 );
-+    if (!i || i > nb_sec) return 0;
-+    dvrt_rva = get_le32( sec + (i - 1) * 40 + 12 ) + get_le32( lc + 224 );
-+    if (!(dvrt = pe_rva_ptr( data, size, sec, nb_sec, dvrt_rva, 8 ))) return 0;
-+    if (get_le32( dvrt ) != 1) return 0;
-+    dvrt_size = get_le32( dvrt + 4 );
-+    if (!(dvrt = pe_rva_ptr( data, size, sec, nb_sec, dvrt_rva, 8 + dvrt_size ))) return 0;
++        /* the x64 view's export directory comes from the ARM64X dynamic relocations */
++        i = get_le16( lc + 228 );
++        if (!i || i > nb_sec) return 0;
++        dvrt_rva = get_le32( sec + (i - 1) * 40 + 12 ) + get_le32( lc + 224 );
++        if (!(dvrt = pe_rva_ptr( data, size, sec, nb_sec, dvrt_rva, 8 ))) return 0;
++        if (get_le32( dvrt ) != 1) return 0;
++        dvrt_size = get_le32( dvrt + 4 );
++        if (!(dvrt = pe_rva_ptr( data, size, sec, nb_sec, dvrt_rva, 8 + dvrt_size ))) return 0;
 +    for (pos = 8; pos + 12 <= 8 + dvrt_size; )
 +    {
 +        unsigned int symbol = get_le32( dvrt + pos ), block_size = get_le32( dvrt + pos + 8 );
@@ -125,6 +132,7 @@ index 062e65c..5c34b40 100644
 +        }
 +        pos = end;
 +    }
++    }
 +    if (!exp_rva || !(exp = pe_rva_ptr( data, size, sec, nb_sec, exp_rva, 40 ))) return 0;
 +
 +    iat_rva = get_le32( data + dirs + 8 * IMAGE_DIRECTORY_ENTRY_IAT );
@@ -137,7 +145,7 @@ index 062e65c..5c34b40 100644
 +    {
 +        unsigned int func = get_le32( funcs + 4 * i ), target;
 +        unsigned char *code, pad;
-+        int rel, x64 = 0;
++        int rel, x64 = pure_x64;   /* a pure x86_64 image has no mixed-code map */
 +
 +        if (!func || (func & 15) || (func >= exp_rva && func < exp_rva + exp_size)) continue;
 +        for (j = 0; j < map_count; j++)
@@ -171,7 +179,7 @@ index 062e65c..5c34b40 100644
  /*******************************************************************
   *         make_builtin_files
   */
-@@ -1471,6 +1624,24 @@ void make_builtin_files( struct strarray files )
+@@ -1503,6 +1673,24 @@ void make_builtin_files( struct strarray files )
                      write( fd, &dll_charact, sizeof(dll_charact) );
                  }
              }
@@ -196,6 +204,3 @@ index 062e65c..5c34b40 100644
          }
          else fatal_error( "%s: Unrecognized file format\n", file );
          close( fd );
--- 
-2.53.0
-
