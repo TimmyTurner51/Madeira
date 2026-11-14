@@ -7404,8 +7404,9 @@ int ios_image_section_describe( unsigned long long va, char *buf, size_t len, un
  * reading the image's initial zero index from the pool copy. That selects
  * TLS[0] instead of this DLL's slot, so a thread_local pointer can become
  * arbitrary bytes from the main EXE's TLS template. Keep the Unix call narrow:
- * it copies only the loader's four-byte index, and verifies the executable
- * copy before the newly loaded DLL is allowed to run. */
+ * it copies only the loader's four-byte index (or one eight-byte pointer slot,
+ * translated to its pool alias), and verifies the executable copy before the
+ * newly loaded DLL is allowed to run. */
 NTSTATUS unixcall_ios_sync_pe_write(void *args)
 {
     struct ios_sync_pe_write_params *p = args;
@@ -7421,6 +7422,36 @@ NTSTATUS unixcall_ios_sync_pe_write(void *args)
     p->synced = 0;
     copy = ios_jit_translate_addr(p->address);
     if (copy == p->address) return STATUS_SUCCESS; /* image not copied yet */
+
+    if (p->size == sizeof(void *))
+    {
+        /* A POINTER slot, not an integer: the pool copy must hold the pool
+         * ALIAS of the target, because guest code branches through it
+         * (`ldr x16,[x8,#0x898]; blr x16`). arm64ec_update_hybrid_metadata
+         * stores what Windows stores -- ExitToX64's PE VA -- and on iOS that
+         * VA is non-executable .text, so copying the raw word would swap a
+         * pc=0 fault for a jump into unexecutable memory. Translate for the
+         * pool copy only; the PE copy keeps the Windows value, exactly as the
+         * NtProtect pointer pass leaves it. A target outside every image, or
+         * one that is x86 code for FEX, is stored untranslated. */
+        uint64_t value = 0, want, pool = 0;
+        void *nv;
+
+        memcpy( &value, p->address, sizeof(value) );
+        want = value;
+        if (value && !ios_va_is_x86_code( value ))
+        {
+            nv = ios_jit_translate_addr_for_owner( (void *)(uintptr_t)value,
+                                                   ios_jit_current_peb() );
+            want = (uint64_t)(uintptr_t)nv;
+        }
+        memcpy( copy, &want, sizeof(want) );
+        memcpy( &pool, copy, sizeof(pool) );
+        if (pool != want) return STATUS_UNSUCCESSFUL;
+        p->synced = 1;
+        return STATUS_SUCCESS;
+    }
+
     ios_jit_sync_write(p->address, p->size);
     if (memcmp(copy, p->address, p->size)) return STATUS_UNSUCCESSFUL;
     p->synced = 1;
