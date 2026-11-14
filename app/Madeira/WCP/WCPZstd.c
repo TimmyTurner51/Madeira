@@ -27,12 +27,12 @@ typedef struct {
 
 typedef struct ZSTD_DCtx_s ZSTD_DStream;
 
-extern ZSTD_DStream *ZSTD_createDStream(void);
-extern size_t ZSTD_freeDStream(ZSTD_DStream *zds);
-extern size_t ZSTD_initDStream(ZSTD_DStream *zds);
-extern size_t ZSTD_decompressStream(ZSTD_DStream *zds, ZSTD_outBuffer *output, ZSTD_inBuffer *input);
+extern ZSTD_DStream *WCP_ZSTD_createDStream(void);
+extern size_t WCP_ZSTD_freeDStream(ZSTD_DStream *zds);
+extern size_t WCP_ZSTD_initDStream(ZSTD_DStream *zds);
+extern size_t WCP_ZSTD_decompressStream(ZSTD_DStream *zds, ZSTD_outBuffer *output, ZSTD_inBuffer *input);
 extern unsigned ZSTD_isError(size_t code);
-extern const char *ZSTD_getErrorName(size_t code);
+extern const char *WCP_ZSTD_getErrorName(size_t code);
 
 #define WCP_IO_SIZE (1024u * 1024u)
 
@@ -83,12 +83,12 @@ int wcp_zstd_decompress_path(const char *source, const char *destination,
         wcp_set_error(err, err_len, "cannot create the decompressed file");
         goto done;
     }
-    stream = ZSTD_createDStream();
+    stream = WCP_ZSTD_createDStream();
     if (!stream) {
         wcp_set_error(err, err_len, "cannot create a zstd stream");
         goto done;
     }
-    if (ZSTD_isError(ZSTD_initDStream(stream))) {
+    if (ZSTD_isError(WCP_ZSTD_initDStream(stream))) {
         wcp_set_error(err, err_len, "cannot initialise the zstd stream");
         goto done;
     }
@@ -105,9 +105,9 @@ int wcp_zstd_decompress_path(const char *source, const char *destination,
         ZSTD_inBuffer input = { in_buffer, got, 0 };
         while (input.pos < input.size) {
             ZSTD_outBuffer output = { out_buffer, WCP_IO_SIZE, 0 };
-            size_t status = ZSTD_decompressStream(stream, &output, &input);
+            size_t status = WCP_ZSTD_decompressStream(stream, &output, &input);
             if (ZSTD_isError(status)) {
-                wcp_set_error(err, err_len, ZSTD_getErrorName(status));
+                wcp_set_error(err, err_len, WCP_ZSTD_getErrorName(status));
                 goto done;
             }
             if (status == 0) saw_frame_end = 1;
@@ -137,9 +137,9 @@ int wcp_zstd_decompress_path(const char *source, const char *destination,
         for (;;) {
             ZSTD_inBuffer input = { NULL, 0, 0 };
             ZSTD_outBuffer output = { out_buffer, WCP_IO_SIZE, 0 };
-            size_t status = ZSTD_decompressStream(stream, &output, &input);
+            size_t status = WCP_ZSTD_decompressStream(stream, &output, &input);
             if (ZSTD_isError(status)) {
-                wcp_set_error(err, err_len, ZSTD_getErrorName(status));
+                wcp_set_error(err, err_len, WCP_ZSTD_getErrorName(status));
                 goto done;
             }
             if (status == 0) saw_frame_end = 1;
@@ -172,7 +172,7 @@ int wcp_zstd_decompress_path(const char *source, const char *destination,
 done:
     if (in) fclose(in);
     if (out) fclose(out);
-    if (stream) ZSTD_freeDStream(stream);
+    if (stream) WCP_ZSTD_freeDStream(stream);
     free(in_buffer);
     free(out_buffer);
     if (result != 0 && destination) remove(destination);

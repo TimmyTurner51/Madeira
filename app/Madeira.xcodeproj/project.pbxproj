@@ -54,7 +54,7 @@
 		A1000711 /* WineMono.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000711 /* WineMono.swift */; };
 		A1000C01 /* WCPComponents.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000C01 /* WCPComponents.swift */; };
 		A1000C02 /* WCP/WCPZstd.c in Sources */ = {isa = PBXBuildFile; fileRef = A2000C02 /* WCPZstd.c */; };
-		A1000C03 /* WCP/zstddeclib.c in Sources */ = {isa = PBXBuildFile; fileRef = A2000C04 /* zstddeclib.c */; };
+		A1000C03 /* WCP/zstddeclib.c in Sources */ = {isa = PBXBuildFile; fileRef = A2000C04 /* zstddeclib.c */; settings = {COMPILER_FLAGS = "-DZSTD_decompress=WCP_ZSTD_decompress -DZSTD_createDStream=WCP_ZSTD_createDStream -DZSTD_freeDStream=WCP_ZSTD_freeDStream -DZSTD_initDStream=WCP_ZSTD_initDStream -DZSTD_decompressStream=WCP_ZSTD_decompressStream -DZSTD_getErrorName=WCP_ZSTD_getErrorName"; }; };
 		A1007D03 /* WineGecko.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2007D03 /* WineGecko.swift */; };
 		A1000E01 /* EpicLibrary.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000E01 /* EpicLibrary.swift */; };
 		A1000E02 /* EpicGames.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000E02 /* EpicGames.swift */; };
