@@ -319,13 +319,14 @@ enum WCPInstaller {
         case .wine:
             for file in files {
                 let lower = file.lowercased()
+                let parts = Set(lower.split(separator: "/").map(String.init))
                 let ext = (file as NSString).pathExtension.lowercased()
                 guard ["dll", "drv", "cpl"].contains(ext) else { continue }
                 let base = (file as NSString).lastPathComponent
                 guard !base.isEmpty else { continue }
-                if lower.contains("/i386-windows/") || lower.contains("/i386-unix/") {
+                if parts.contains("i386-windows") || parts.contains("i386-unix") {
                     add(file, "${syswow64}/" + base)
-                } else if lower.contains("/aarch64-windows/") || lower.contains("/arm64-windows/") {
+                } else if parts.contains("aarch64-windows") || parts.contains("arm64-windows") {
                     add(file, "${aarch64}/" + base)
                 } else {
                     add(file, "${system32}/" + base)
@@ -566,6 +567,131 @@ final class WCPComponentsModel: ObservableObject {
         }
     }
 
+    /// Import DLLs or a folder straight from Files, without a `.wcp` wrapper.
+    /// The files go into the same `payload` layout the package importer uses,
+    /// so the bridge does not need a second format.
+    func installManual(from sources: [URL], kind: WCPComponent.Kind) {
+        guard !busy, !sources.isEmpty else { return }
+        error = nil
+        status = nil
+        busy = true
+
+        let root = Self.root
+        Task.detached(priority: .userInitiated) {
+            let fm = FileManager.default
+            let staging = fm.temporaryDirectory
+                .appendingPathComponent("manual-" + UUID().uuidString, isDirectory: true)
+            let payload = staging.appendingPathComponent("payload", isDirectory: true)
+            var scoped: [URL] = []
+            defer {
+                for url in scoped { url.stopAccessingSecurityScopedResource() }
+                try? fm.removeItem(at: staging)
+            }
+            do {
+                try fm.createDirectory(at: payload, withIntermediateDirectories: true)
+                var files: [String] = []
+                var total: UInt64 = 0
+
+                for source in sources {
+                    if source.startAccessingSecurityScopedResource() { scoped.append(source) }
+                    let name = source.lastPathComponent
+                    guard !name.isEmpty else { continue }
+                    let directory = (try? source.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
+                    if directory {
+                        guard let walker = fm.enumerator(at: source,
+                                                         includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey])
+                        else { continue }
+                        for case let file as URL in walker {
+                            let values = try file.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+                            guard values.isRegularFile == true else { continue }
+                            let relative = file.path.replacingOccurrences(of: source.path + "/", with: "")
+                            guard !relative.isEmpty, !relative.hasPrefix("..") else { continue }
+                            let entry = name + "/" + relative
+                            total += UInt64(values.fileSize ?? 0)
+                            guard total <= WCPInstaller.maxExpandedBytes,
+                                  files.count < WCPInstaller.maxFileCount else {
+                                throw WCPError.message("The selected files are larger than Madeira imports for a component.")
+                            }
+                            let destination = payload.appendingPathComponent(entry)
+                            try fm.createDirectory(at: destination.deletingLastPathComponent(),
+                                                   withIntermediateDirectories: true)
+                            try fm.copyItem(at: file, to: destination)
+                            files.append(entry)
+                        }
+                    } else {
+                        let values = try source.resourceValues(forKeys: [.fileSizeKey])
+                        total += UInt64(values.fileSize ?? 0)
+                        guard total <= WCPInstaller.maxExpandedBytes,
+                              files.count < WCPInstaller.maxFileCount else {
+                            throw WCPError.message("The selected files are larger than Madeira imports for a component.")
+                        }
+                        try fm.copyItem(at: source, to: payload.appendingPathComponent(name))
+                        files.append(name)
+                    }
+                }
+                guard !files.isEmpty else { throw WCPError.message("No files were selected.") }
+
+                let layout = try WCPInstaller.layout(kind: kind, files: files)
+                let title = sources.count == 1
+                    ? sources[0].deletingPathExtension().lastPathComponent
+                    : "\(kind.label) component (\(files.count) files)"
+                let version = title.isEmpty ? kind.label : title
+                let type = kind == .fex ? "FEXCore" : "Wine"
+                let profile: [String: Any] = [
+                    "type": type,
+                    "versionName": version,
+                    "versionCode": 0,
+                    "description": "Imported directly from Files.",
+                    "files": []
+                ]
+                let profileData = try JSONSerialization.data(withJSONObject: profile,
+                                                             options: [.prettyPrinted, .sortedKeys])
+                let id = "manual-" + kind.rawValue + "-" + UUID().uuidString.prefix(8).lowercased()
+                let destination = root.appendingPathComponent(id, isDirectory: true)
+                try fm.createDirectory(at: root, withIntermediateDirectories: true)
+                try fm.moveItem(at: payload, to: destination)
+                try profileData.write(to: destination.appendingPathComponent("profile.json"))
+
+                var notes: [String] = []
+                if kind == .fex {
+                    notes.append("Imported directly. This must be a FEX module built for Madeira's iOS host; an Android or Linux DLL will not boot a game.")
+                } else {
+                    notes.append("Libraries outside an architecture folder go to system32. Select a folder such as aarch64-windows or i386-windows to map another architecture.")
+                }
+
+                let component = WCPComponent(
+                    id: id,
+                    name: version,
+                    kind: kind,
+                    type: type,
+                    versionName: version,
+                    versionCode: 0,
+                    detail: "Imported directly from Files.",
+                    enabled: true,
+                    installedAt: Date().timeIntervalSince1970,
+                    sourceFile: sources.map(\.lastPathComponent).joined(separator: ", "),
+                    fileCount: files.count,
+                    layout: layout,
+                    environment: [:],
+                    notes: notes)
+                let finished = component
+                await MainActor.run { WCPComponentsModel.shared.manualInstalled(finished) }
+            } catch {
+                let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                await MainActor.run { WCPComponentsModel.shared.failed(message) }
+            }
+        }
+    }
+
+    private func manualInstalled(_ component: WCPComponent) {
+        components.insert(component, at: 0)
+        save()
+        busy = false
+        error = nil
+        status = "Imported \(component.versionLine). It applies the next time a game starts."
+        LogStore.shared.log("[wcp] imported \(component.id) type=\(component.type) files=\(component.fileCount) links=\(component.layout.count)")
+    }
+
     private func installed(_ component: WCPComponent) {
         // A re-import keeps the previous enabled choice.
         if let old = components.first(where: { $0.id == component.id }) {
@@ -615,6 +741,9 @@ final class WCPComponentsModel: ObservableObject {
 struct ComponentsSettingsSection: View {
     @ObservedObject private var model = WCPComponentsModel.shared
     @State private var importing = false
+    @State private var importingFiles = false
+    @State private var pendingFiles: [URL] = []
+    @State private var choosingKind = false
     @State private var removing: WCPComponent?
 
     var body: some View {
@@ -660,6 +789,12 @@ struct ComponentsSettingsSection: View {
                 Label("Import .wcp", systemImage: "square.and.arrow.down")
             }
             .disabled(model.busy)
+            Button {
+                importingFiles = true
+            } label: {
+                Label("Import DLL or folder", systemImage: "doc.badge.plus")
+            }
+            .disabled(model.busy)
             if model.busy {
                 HStack(spacing: 8) {
                     ProgressView()
@@ -675,13 +810,36 @@ struct ComponentsSettingsSection: View {
         } header: {
             Text("Windows components (.wcp)")
         } footer: {
-            Text("Imports FEX and Wine packages in the DroidDeck and GameNative .wcp format. An enabled package replaces the matching runtime files at the start of the next Windows session; the app itself is not modified. FEX packages built for Android or Linux cannot run on iOS, so a FEX package must be rebuilt with Madeira's iOS host layer.")
+            Text("Imports FEX and Wine packages in the DroidDeck and GameNative .wcp format, or individual DLLs and folders from Files. An enabled component replaces the matching runtime files at the start of the next Windows session; the app itself is not modified. FEX must be built with Madeira's iOS host layer; a module built for Android or Linux cannot boot a game.")
         }
         .fileImporter(isPresented: $importing, allowedContentTypes: [WCPComponentsModel.contentType]) { result in
             switch result {
             case .success(let url): model.install(from: url)
             case .failure(let error): model.report(error)
             }
+        }
+        .fileImporter(isPresented: $importingFiles, allowedContentTypes: [.data, .folder],
+                      allowsMultipleSelection: true) { result in
+            switch result {
+            case .success(let urls):
+                pendingFiles = urls
+                choosingKind = !urls.isEmpty
+            case .failure(let error):
+                model.report(error)
+            }
+        }
+        .confirmationDialog("Import as a component", isPresented: $choosingKind, titleVisibility: .visible) {
+            Button("FEX module") {
+                model.installManual(from: pendingFiles, kind: .fex)
+                pendingFiles = []
+            }
+            Button("Wine libraries") {
+                model.installManual(from: pendingFiles, kind: .wine)
+                pendingFiles = []
+            }
+            Button("Cancel", role: .cancel) { pendingFiles = [] }
+        } message: {
+            Text("FEX takes libarm64ecfex.dll or xtajit64.dll. Wine takes .dll, .drv and .cpl files; a selected folder keeps its architecture names.")
         }
         .confirmationDialog("Remove this component?",
                             isPresented: Binding(get: { removing != nil }, set: { if !$0 { removing = nil } }),

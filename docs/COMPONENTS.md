@@ -17,6 +17,15 @@ Documents/Components/
     payload/...              its files, unpacked
 ```
 
+The same button row also has **Import DLL or folder**, for a FEX module or a
+set of Wine libraries that was not wrapped in a `.wcp`. Pick
+`libarm64ecfex.dll`/`xtajit64.dll` and choose **FEX module**, or pick `.dll`,
+`.drv` and `.cpl` files (or a whole folder) and choose **Wine libraries**.
+A selected folder keeps its name, so a folder called `aarch64-windows` or
+`i386-windows` maps the same way as a package's architecture folder; files
+outside one go to `system32`. A direct import is stored like a package and
+uses the same enable, disable and remove controls.
+
 Nothing in the app bundle or the code signature changes: the package lives in
 the writable Documents folder, and `WineProcessBridge.m` links its files over
 the Wine prefix at the start of each Windows session, after the bundle's own
