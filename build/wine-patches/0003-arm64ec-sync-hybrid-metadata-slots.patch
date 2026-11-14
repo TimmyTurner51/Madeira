@@ -1,8 +1,23 @@
 diff --git a/dlls/ntdll/signal_arm64ec.c b/dlls/ntdll/signal_arm64ec.c
-index 9ed09f7e..1cbbbb8f 100644
+index 9ed09f7e..07d03fbc 100644
 --- a/dlls/ntdll/signal_arm64ec.c
 +++ b/dlls/ntdll/signal_arm64ec.c
-@@ -613,7 +613,35 @@ NTSTATUS arm64ec_process_init_dispatchers( HMODULE module )
+@@ -585,6 +585,14 @@ void *arm64ec_redirect_ptr( HMODULE module, void *ptr, const IMAGE_ARM64EC_METAD
+ }
+ 
+ static void arm64x_check_call(void);
++static void arm64x_dispatch_call_no_redirect(void);
++static ULONG_PTR arm64x_no_redirect_target( ULONG_PTR target );
++
++/* Reached from arm64x_dispatch_call_no_redirect's asm through adrp/ldr rather than
++ * a direct `bl "#..."`: a static C function that no C code calls gets no EC-prefixed
++ * symbol, and lld rejects the external reference. Taking the address here forces the
++ * definition out, and the global itself is a plain data symbol. */
++ULONG_PTR (*p_arm64x_no_redirect_target)( ULONG_PTR ) = arm64x_no_redirect_target;
+ 
+ /*******************************************************************
+  *         arm64ec_process_init
+@@ -613,7 +621,35 @@ NTSTATUS arm64ec_process_init_dispatchers( HMODULE module )
       * crashes inside arm64x_check_call. */
      RtlGetCurrentPeb()->WerRegistrationData = arm64x_check_call;
  
@@ -25,21 +40,21 @@ index 9ed09f7e..1cbbbb8f 100644
 +     * to hold. Keep the ExitToX64 lookup only as a report. */
 +    {
 +        void *exit_to_x64 = RtlFindExportedRoutineByName( module, "ExitToX64" );
-+        __os_arm64x_dispatch_call_no_redirect = arm64x_check_call;
-+        ERR( "arm64ec_process_init_dispatchers: no_redirect slot -> arm64x_check_call %p "
++        __os_arm64x_dispatch_call_no_redirect = arm64x_dispatch_call_no_redirect;
++        ERR( "arm64ec_process_init_dispatchers: no_redirect slot -> %p "
 +             "(ExitToX64 %p is x64 emulation, not a native blr target)\n",
-+             arm64x_check_call, exit_to_x64 );
++             arm64x_dispatch_call_no_redirect, exit_to_x64 );
 +        /* RtlIsEcCode is the ARM64EC classifier itself, so this line settles the
 +         * question the slot turns on: a native blr must land on EC code. If
 +         * ExitToX64 reads 0 here, storing it was never an option. */
-+        ERR( "arm64ec_process_init_dispatchers: IsEcCode arm64x_check_call=%d ExitToX64=%d\n",
-+             RtlIsEcCode( (ULONG_PTR)arm64x_check_call ) ? 1 : 0,
++        ERR( "arm64ec_process_init_dispatchers: IsEcCode no_redirect=%d ExitToX64=%d\n",
++             RtlIsEcCode( (ULONG_PTR)arm64x_dispatch_call_no_redirect ) ? 1 : 0,
 +             exit_to_x64 ? (RtlIsEcCode( (ULONG_PTR)exit_to_x64 ) ? 1 : 0) : -1 );
 +    }
      __os_arm64x_dispatch_fptr = RtlFindExportedRoutineByName( module, "DispatchJump" );
      __os_arm64x_dispatch_ret = RtlFindExportedRoutineByName( module, "RetToEntryThunk" );
  
-@@ -965,7 +993,31 @@ static void update_hybrid_pointer( void *module, const IMAGE_SECTION_HEADER *sec
+@@ -965,7 +1001,31 @@ static void update_hybrid_pointer( void *module, const IMAGE_SECTION_HEADER *sec
          ERR( "rva %x outside of section %s (%lx-%lx)\n", rva,
               sec->Name, sec->VirtualAddress, sec->VirtualAddress + sec->Misc.VirtualSize );
      else
@@ -72,7 +87,7 @@ index 9ed09f7e..1cbbbb8f 100644
  }
  
  /*******************************************************************
-@@ -980,6 +1032,15 @@ void arm64ec_update_hybrid_metadata( void *module, IMAGE_NT_HEADERS *nt,
+@@ -980,6 +1040,15 @@ void arm64ec_update_hybrid_metadata( void *module, IMAGE_NT_HEADERS *nt,
      /* assume that all pointers are in the same section */
      ERR( "arm64ec_update_hybrid_metadata: module=%p dispatch_call_rva=%lx check_call=%p\n",
           module, (unsigned long)metadata->__os_arm64x_dispatch_call, arm64x_check_call );
@@ -88,7 +103,136 @@ index 9ed09f7e..1cbbbb8f 100644
  
      for (i = 0; i < nt->FileHeader.NumberOfSections; i++, sec++)
      {
-@@ -4921,12 +4982,38 @@ static void __attribute__((naked)) arm64x_check_call(void)
+@@ -4155,15 +4224,41 @@ static ULONG_PTR ec_code_map_limit( void )
+     return cached;
+ }
+ 
++static BOOLEAN is_ec_va( const UINT64 *map, ULONG_PTR ptr )
++{
++    ULONG_PTR page;
++
++    if (!ptr || ptr >= ec_code_map_limit()) return FALSE;
++    page = ptr / page_size;
++    return (map[page / 64] >> (page & 63)) & 1;
++}
++
+ BOOLEAN WINAPI RtlIsEcCode( ULONG_PTR ptr )
+ {
+     const UINT64 *map = (const UINT64 *)NtCurrentTeb()->Peb->EcCodeBitMap;
+-    ULONG_PTR page = ptr / page_size;
++    ULONG_PTR pe;
+     /* The EcCodeBitMap covers only what alloc_arm64ec_map actually reserved. Querying
+        any pointer beyond that — a legal Windows address above our VA, or a corrupted
+        one from a damaged unwind context — must not segfault. */
+-    if (!map || ptr >= ec_code_map_limit()) return FALSE;
+-    return (map[page / 64] >> (page & 63)) & 1;
++    if (!map) return FALSE;
++    if (is_ec_va( map, ptr )) return TRUE;
++
++    /* ml704: ARM64EC code runs from the JIT-pool alias of a PE image, and the bitmap
++       is keyed by PE VA, so a pool alias classified as plain x64 code. That is not
++       academic: $iexit_thunk$cdecl$* hands ucrtbase's own pool address to
++       __os_arm64x_dispatch_call_no_redirect in x9 (build 15: 0x153a85a70 =
++       ucrtbase_pool+0xd9a70, just past .rdata -- so the log, not the address,
++       has to say whether that really is a thunk target), and arm64x_check_call
++       would route a native EC builtin
++       into FEX emulation, which branches to null. Resolve registered aliases back to
++       their PE address before giving up. Only the FALSE path pays for this. */
++    {
++        extern void *xlate_ios_jit_rev( void *ptr );
++
++        pe = (ULONG_PTR)xlate_ios_jit_rev( (void *)ptr );
++        if (!pe || pe == ptr) return FALSE;
++        return is_ec_va( map, pe );
++    }
+ }
+ 
+ 
+@@ -4792,6 +4887,83 @@ static void __attribute__((naked)) arm64x_check_icall_early(void)
+     asm( "ret" );
+ }
+ 
++/**************************************************************************
++ *		arm64x_no_redirect_target
++ *
++ * Returns the address to tail-call for __os_arm64x_dispatch_call_no_redirect,
++ * or 0 when the target is not native EC code. See the shim below for why this
++ * does not go through arm64x_check_call.
++ */
++static ULONG_PTR arm64x_no_redirect_target( ULONG_PTR target )
++{
++    static int warned;
++
++    if (RtlIsEcCode( target )) return target;
++
++    /* Not EC code: these are exit thunks, so reaching here means the callee
++     * really is x64 and has to enter FEX emulation. This port has no
++     * EC-callable emulation entry (xtajit64's ExitToX64 is x64 .text and is
++     * exported @extern, so winebuild generates no .hexpthk stub for it), and
++     * inventing one blind would be guesswork. Return without calling and make
++     * the case loud rather than looping through the thunk forever. */
++    if (warned++ < 32)
++        ERR( "arm64x_dispatch_call_no_redirect: target %p is not EC code, "
++             "no native emulation entry available\n", (void *)target );
++    return 0;
++}
++
++
++/**************************************************************************
++ *		arm64x_dispatch_call_no_redirect
++ *
++ * Value for __os_arm64x_dispatch_call_no_redirect, the slot ucrtbase's
++ * $iexit_thunk$cdecl$* blocks branch through:
++ *
++ *     adrp x8, page ; ldr x16,[x8,#0x898] ; blr x16 ; mov x0, x8
++ *
++ * Those thunks set no x10/x11, and the crash registers suggest the callee
++ * arrives in x9 (build 15: x9=0x153a85a70 = ucrtbase's pool copy +0xd9a70,
++ * which lands just past .rdata rather than in .text, so the value still needs
++ * confirming from the log; x10=x11=0x1539acf04 = the thunk's own start).
++ *
++ * Do NOT delegate the classification to arm64x_check_call: that function has
++ * its own inline bitmap reader that reads the PEB through x18, which iOS
++ * clobbers, so it reports every target as non-EC by design (ml246) and would
++ * send us down .Lexit -- for these thunks x10 is the thunk's own address, so
++ * the result is an infinite loop. arm64x_no_redirect_target() instead uses
++ * RtlIsEcCode, which is the C reader and also resolves JIT-pool aliases.
++ *
++ * x0-x8 are saved across the classifier so the call's arguments and the x8 the
++ * thunk relays into x0 both survive. */
++static void __attribute__((naked)) arm64x_dispatch_call_no_redirect(void)
++{
++    asm( ".seh_proc \"#arm64x_dispatch_call_no_redirect\"\n\t"
++         ".seh_endprologue\n\t"
++         "cbz x9, 2f\n\t"                   /* no target: nothing to call */
++         "stp x29, x30, [sp, #-0x60]!\n\t"
++         "stp x0, x1, [sp, #0x10]\n\t"
++         "stp x2, x3, [sp, #0x20]\n\t"
++         "stp x4, x5, [sp, #0x30]\n\t"
++         "stp x6, x7, [sp, #0x40]\n\t"
++         "str x8, [sp, #0x50]\n\t"
++         "mov x0, x9\n\t"
++         "adrp x16, p_arm64x_no_redirect_target\n\t"
++         "ldr x16, [x16, #:lo12:p_arm64x_no_redirect_target]\n\t"
++         "cbz x16, 2f\n\t"
++         "blr x16\n\t"
++         "mov x16, x0\n\t"                  /* resolved target, 0 = not EC code */
++         "ldp x0, x1, [sp, #0x10]\n\t"
++         "ldp x2, x3, [sp, #0x20]\n\t"
++         "ldp x4, x5, [sp, #0x30]\n\t"
++         "ldp x6, x7, [sp, #0x40]\n\t"
++         "ldr x8, [sp, #0x50]\n\t"
++         "ldp x29, x30, [sp], #0x60\n\t"
++         "cbz x16, 2f\n\t"
++         "br x16\n\t"                       /* tail call: x30 is our caller */
++         "2:\tret\n\t"
++         ".seh_endproc" );
++}
++
+ /**************************************************************************
+  *		arm64x_check_call
+  *
+@@ -4921,12 +5093,38 @@ static void __attribute__((naked)) arm64x_check_call(void)
           ".Ljmp:\n\t"
           "ldrb w16, [x11]\n\t"
           "cmp w16, #0xff\n\t"
@@ -128,7 +272,7 @@ index 9ed09f7e..1cbbbb8f 100644
           "ldr x11, [x16, w9, sxtw]\n\t"
           "b \"#arm64x_check_call\"\n"       /* restart checks with jump destination */
           /* not a special sequence, call the exit thunk */
-@@ -4945,6 +5032,10 @@ static void __attribute__((naked)) arm64x_check_call(void)
+@@ -4945,6 +5143,10 @@ static void __attribute__((naked)) arm64x_check_call(void)
           ".byte 0xe9\n\t"                   /* jmp  arm_code */
           ".byte 0, 0, 0, 0, 0, 0\n"
  
