@@ -5854,6 +5854,9 @@ int ios_jit_patch_stale_pointer(unsigned long long stale_va)
  * code, arguments and return address, minus the check_icall pass and the
  * fault. A later re-sync of the page that restores the default is healed again
  * by the next fault. MADEIRA_AUX_IAT_HEAL=0 leaves the slots alone. */
+/* defined below; the aux-IAT heal has to ask whether a target runs natively */
+static int ios_jit_mapping_is_hybrid( int i );
+
 static int ios_aux_heal_enabled( void )
 {
     static int cached = -1;
@@ -6008,6 +6011,27 @@ int ios_jit_heal_aux_iat( uintptr_t fault_pc, uintptr_t lr, void *thread_peb, ui
     {
         int t = ios_aux_find_copy( jit_pc );
         if (t < 0 || ios_jit_mappings[t].owner_peb) return 0;
+    }
+
+    /* fh6-ec-slot: the slot may only take a NATIVE target. A `br x16` through it is
+     * an ARM64 branch, so the callee must be ARM64/ARM64EC machine code in an
+     * executable section of its own copy. Forza Horizon 6, 2026-11-14: ucrtbase's
+     * EC stub at +0x90f18 kept a pool address that belongs to EMULATED x86-64 code,
+     * so the caller entered x64 bytes as ARM64 and branched to pc=0x0
+     * (status 0xc0000005, lr=ucrtbase.dll+0x90f1c). The default continuation --
+     * `b __os_arm64x_check_call` -- is the correct value for such a target: it
+     * consults EcCodeBitMap and routes an x64 callee into FEX. Only an EC callee
+     * may be reached directly. */
+    {
+        int t = ios_aux_find_copy( jit_pc );
+        size_t lo = 0, hi = 0;
+        if (t < 0) return 0;
+        if (!ios_jit_mapping_is_hybrid( t )) return 0;
+        if (!ios_jit_code_bounds( &ios_jit_mappings[t], jit_pc - (uintptr_t)ios_jit_mappings[t].jit_base,
+                                  &lo, &hi )) return 0;
+        /* the alignment of ARM64 instructions is the cheapest sanity check that the
+         * copy really holds code here and not a data pointer that merely looks like one */
+        if (jit_pc & 3) return 0;
     }
 
     __atomic_store_n( (uint64_t *)(rw + (slot - rx)), (uint64_t)jit_pc, __ATOMIC_RELEASE );
