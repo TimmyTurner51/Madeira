@@ -26,8 +26,30 @@ if [ "${1:-}" = --revert ]; then
     done
     exit 0
 fi
+# A patch counts as already applied when every line it adds is present in its
+# target file. `git apply --reverse --check` alone is not enough once a later
+# patch edits the same region: reversing 0003 fails while 0004 sits on top of it,
+# and the second build script's call to this file then reports "does not apply".
+already_applied() {
+    python3 - "$1" "$F" <<'PY'
+import os, sys
+patch, root = sys.argv[1], sys.argv[2]
+target, added = None, []
+for line in open(patch, encoding='utf-8', errors='replace'):
+    if line.startswith('+++ b/'):
+        target = os.path.join(root, line[6:].strip())
+    elif line.startswith('+') and not line.startswith('+++'):
+        added.append(line[1:].rstrip('\n'))
+if not target or not added or not os.path.exists(target):
+    sys.exit(1)
+body = open(target, encoding='utf-8', errors='replace').read()
+missing = [a for a in added if a and a not in body]
+sys.exit(0 if not missing else 1)
+PY
+}
+
 for p in "${patches[@]}"; do
-    if git -C "$F" apply --reverse --check "$p" 2>/dev/null; then
+    if git -C "$F" apply --reverse --check "$p" 2>/dev/null || already_applied "$p"; then
         echo "fex-patches: $(basename "$p") already applied"
     elif git -C "$F" apply --check "$p" 2>/dev/null; then
         git -C "$F" apply "$p"
