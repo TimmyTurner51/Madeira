@@ -67,24 +67,44 @@ fetch "$ZLIB_URL" "$CACHE/zlib-1.3.1.tar.gz" "$ZLIB_SHA256"
 fetch "$ZLIB_PATCH_URL" "$CACHE/zlib_1.3.1-1_patch.zip" "$ZLIB_PATCH_SHA256"
 
 echo "=== Mesa $MESA_VERSION source ==="
-rm -rf "$WORK"
-mkdir -p "$WORK"
-tar -xJf "$CACHE/mesa-$MESA_VERSION.tar.xz" -C "$WORK"
 SRC="$WORK/mesa-$MESA_VERSION"
-for p in "${PATCHES[@]}"; do
-    patch -d "$SRC" -p1 --forward --batch < "$BUILD_DIR/patches/$p" || die "patch $p does not apply"
-done
-# Put the pinned subprojects where Meson looks, so it never downloads.
-mkdir -p "$SRC/subprojects/packagecache"
-cp "$CACHE/zlib-1.3.1.tar.gz" "$CACHE/zlib_1.3.1-1_patch.zip" "$SRC/subprojects/packagecache/"
 DXH="$SRC/subprojects/DirectX-Headers-1.0"
-git init -q "$DXH"
-git -C "$DXH" fetch -q --depth 1 "$DXHEADERS_URL" "$DXHEADERS_COMMIT"
-git -C "$DXH" checkout -q FETCH_HEAD
-[ "$(git -C "$DXH" rev-parse HEAD)" = "$DXHEADERS_COMMIT" ] || die "DirectX-Headers commit mismatch"
+STAMP="$WORK/.source-stamp"
+want_stamp() {
+    { printf '%s\n' "$MESA_VERSION"; shasum -a 256 "$BUILD_DIR"/patches/*.patch; } \
+        | shasum -a 256 | cut -d' ' -f1
+}
+# A full re-extract makes every build byte-identical, but it also throws away
+# every Mesa object: ~1000 compile steps that dominate an IPA build and cannot
+# change between iterations when the source, patches and flags are the same.
+# Keep the tree for local iteration; CI and MADEIRA_MESA_CLEAN=1 keep the clean
+# path so the reproducibility guarantee above still holds where it matters.
+reuse=0
+if [ "${GITHUB_ACTIONS:-}" != true ] && [ "${MADEIRA_MESA_CLEAN:-0}" != 1 ] \
+   && [ -d "$SRC" ] && [ -f "$STAMP" ] && [ "$(cat "$STAMP")" = "$(want_stamp)" ]; then
+    reuse=1
+    echo "=== reusing the existing Mesa tree (MADEIRA_MESA_CLEAN=1 forces a clean build) ==="
+else
+    rm -rf "$WORK"
+    mkdir -p "$WORK"
+    tar -xJf "$CACHE/mesa-$MESA_VERSION.tar.xz" -C "$WORK"
+    for p in "${PATCHES[@]}"; do
+        patch -d "$SRC" -p1 --forward --batch < "$BUILD_DIR/patches/$p" || die "patch $p does not apply"
+    done
+    # Put the pinned subprojects where Meson looks, so it never downloads.
+    mkdir -p "$SRC/subprojects/packagecache"
+    cp "$CACHE/zlib-1.3.1.tar.gz" "$CACHE/zlib_1.3.1-1_patch.zip" "$SRC/subprojects/packagecache/"
+    git init -q "$DXH"
+    git -C "$DXH" fetch -q --depth 1 "$DXHEADERS_URL" "$DXHEADERS_COMMIT"
+    git -C "$DXH" checkout -q FETCH_HEAD
+    [ "$(git -C "$DXH" rev-parse HEAD)" = "$DXHEADERS_COMMIT" ] || die "DirectX-Headers commit mismatch"
+    want_stamp > "$STAMP"
+fi
 
 # Meson records the Python path in build.ninja, so the tools get one fixed venv.
-if command -v uv >/dev/null; then
+if [ "$reuse" = 1 ] && [ -x "$WORK/venv/bin/python" ]; then
+    :
+elif command -v uv >/dev/null; then
     uv venv -q "$WORK/venv"
     uv pip install -q --python "$WORK/venv/bin/python" "${PY_TOOLS[@]}"
 else
@@ -94,7 +114,7 @@ fi
 export PATH="$WORK/venv/bin:$BISON_DIR:$PATH"
 
 CROSS="$WORK/mingw-x64.ini"
-cat > "$CROSS" <<EOF
+cat > "$CROSS.new" <<EOF
 [binaries]
 c = '$MINGW/bin/x86_64-w64-mingw32-clang'
 cpp = '$MINGW/bin/x86_64-w64-mingw32-clang++'
@@ -116,11 +136,23 @@ cpp_link_args = ['-static-libgcc', '-static-libstdc++', '-Wl,--no-insert-timesta
 EOF
 
 echo "=== opengl32.dll, libgallium_wgl.dll (x86_64) ==="
-meson setup "$WORK/build" "$SRC" --cross-file "$CROSS" \
-    --wrap-mode=nodownload --buildtype=release --default-library=static \
-    -Dplatforms=windows -Dgallium-drivers=d3d12 -Dvulkan-drivers= \
-    -Dllvm=disabled -Degl=disabled -Dgles1=disabled -Dgles2=disabled \
-    -Dgallium-d3d12-video=disabled -Dvideo-codecs= -Dbuild-tests=false
+# Reconfigure only when the cross file actually changed: a needless reconfigure
+# dirties Meson's rules and costs a re-link of both targets for nothing.
+if [ ! -f "$WORK/build/build.ninja" ] || ! cmp -s "$CROSS.new" "$CROSS"; then
+    if [ -f "$WORK/build/build.ninja" ]; then
+        mv -f "$CROSS.new" "$CROSS"
+        meson setup --reconfigure "$WORK/build" "$SRC"
+    else
+        mv -f "$CROSS.new" "$CROSS"
+        meson setup "$WORK/build" "$SRC" --cross-file "$CROSS" \
+            --wrap-mode=nodownload --buildtype=release --default-library=static \
+            -Dplatforms=windows -Dgallium-drivers=d3d12 -Dvulkan-drivers= \
+            -Dllvm=disabled -Degl=disabled -Dgles1=disabled -Dgles2=disabled \
+            -Dgallium-d3d12-video=disabled -Dvideo-codecs= -Dbuild-tests=false
+    fi
+else
+    rm -f "$CROSS.new"
+fi
 ninja -C "$WORK/build"
 
 mkdir -p "$OUT"
