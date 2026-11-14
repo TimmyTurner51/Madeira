@@ -820,6 +820,107 @@ static void madeira_overlay_vcruntime32(NSFileManager *fm, NSString *prefix)
     dprintf(STDERR_FILENO, "[WineProc] Symlinked %d MS VC++ x86 runtime DLLs over i386 builtins (Documents/vcruntime32; MADEIRA_VCREDIST_X86=0 leaves them out)\n", linked);
 }
 
+/* Imported .wcp components (WCPComponents.swift). The package's files live in
+ * Documents/Components/<id>/payload; state.json lists the enabled packages and
+ * each package's layout, whose destinations carry one of the folder tokens
+ * below. Runs after every bundle link and the VC++ overlays, so an imported
+ * file wins for this session. Removing or disabling a package brings the
+ * bundled file back at the next launch: the links are recreated from the
+ * bundle every time a session starts.
+ *
+ *   ${system32}  drive_c/windows/system32
+ *   ${syswow64}  drive_c/windows/syswow64
+ *   ${sysx64}    drive_c/windows/sysx64
+ *   ${sysaa64}   drive_c/windows/sysaa64
+ *   ${aarch64}   system32 in an aarch64 session, sysaa64 in an ARM64EC one
+ *
+ * An enabled package's "environment" dictionary is exported too. That is how a
+ * FEX package can carry its own FEX_* switches; it applies to every launch
+ * while the package is enabled. Log tag: [wcp]. */
+static int madeira_env_name_ok(const char *name)
+{
+    const char *p;
+    if (!name || !*name) return 0;
+    if (!((name[0] >= 'A' && name[0] <= 'Z') || (name[0] >= 'a' && name[0] <= 'z') || name[0] == '_')) return 0;
+    for (p = name + 1; *p; p++)
+        if (!((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') || (*p >= '0' && *p <= '9') || *p == '_')) return 0;
+    return 1;
+}
+
+static void madeira_apply_wcp_components(NSFileManager *fm, NSString *prefix, BOOL use_arm64ec)
+{
+    NSString *root = [[NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject]
+                      stringByAppendingPathComponent:@"Components"];
+    NSData *data = [NSData dataWithContentsOfFile:[root stringByAppendingPathComponent:@"state.json"]];
+    if (!data) return;
+    NSDictionary *state = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+    NSArray *components = [state isKindOfClass:[NSDictionary class]] ? state[@"components"] : nil;
+    if (![components isKindOfClass:[NSArray class]]) return;
+
+    NSString *windows = [prefix stringByAppendingPathComponent:@"drive_c/windows"];
+    NSArray *tokens = @[@"system32", @"syswow64", @"sysx64", @"sysaa64"];
+    int linked = 0, failed = 0, envs = 0, active = 0, packages = 0;
+
+    for (NSDictionary *component in components) {
+        if (![component isKindOfClass:[NSDictionary class]] || ![component[@"enabled"] boolValue]) continue;
+        NSString *identifier = component[@"id"];
+        if (![identifier isKindOfClass:[NSString class]] || !identifier.length) continue;
+        if ([identifier containsString:@"/"] || [identifier containsString:@".."]) continue;
+        packages++;
+        NSString *directory = [root stringByAppendingPathComponent:identifier];
+
+        NSDictionary *environment = component[@"environment"];
+        if ([environment isKindOfClass:[NSDictionary class]]) {
+            for (NSString *key in environment) {
+                NSString *value = environment[key];
+                if (![key isKindOfClass:[NSString class]] || ![value isKindOfClass:[NSString class]]) continue;
+                if (!madeira_env_name_ok(key.UTF8String) || strchr(value.UTF8String, '\n')) continue;
+                setenv(key.UTF8String, value.UTF8String, 1);
+                envs++;
+            }
+        }
+
+        NSArray *layout = component[@"layout"];
+        if (![layout isKindOfClass:[NSArray class]]) continue;
+        for (NSDictionary *item in layout) {
+            if (![item isKindOfClass:[NSDictionary class]]) { failed++; continue; }
+            NSString *source = item[@"source"], *dest = item[@"dest"];
+            if (![source isKindOfClass:[NSString class]] || ![dest isKindOfClass:[NSString class]]) { failed++; continue; }
+            if (!source.length || [source hasPrefix:@"/"] || [source containsString:@".."] ||
+                !dest.length || [dest containsString:@".."]) { failed++; continue; }
+            NSString *file = [directory stringByAppendingPathComponent:source];
+            if (![fm fileExistsAtPath:file]) { failed++; continue; }
+
+            NSString *resolved = [dest stringByReplacingOccurrencesOfString:@"${aarch64}"
+                                    withString:(use_arm64ec ? @"${sysaa64}" : @"${system32}")];
+            NSString *folder = nil;
+            for (NSString *token in tokens) {
+                NSString *marker = [NSString stringWithFormat:@"${%@}", token];
+                if ([resolved hasPrefix:marker]) {
+                    folder = token;
+                    resolved = [resolved substringFromIndex:marker.length];
+                    break;
+                }
+            }
+            if (!folder || ![resolved hasPrefix:@"/"]) { failed++; continue; }
+            NSString *name = [resolved substringFromIndex:1];
+            if (!name.length || [name containsString:@"/"]) { failed++; continue; }
+
+            NSString *farm = [windows stringByAppendingPathComponent:folder];
+            [fm createDirectoryAtPath:farm withIntermediateDirectories:YES attributes:nil error:nil];
+            NSString *target = [farm stringByAppendingPathComponent:name];
+            [fm removeItemAtPath:target error:nil];
+            if ([fm createSymbolicLinkAtPath:target withDestinationPath:file error:nil]) linked++;
+            else failed++;
+        }
+        active++;
+    }
+
+    if (packages)
+        dprintf(STDERR_FILENO, "[wcp] %d enabled package(s): %d links, %d failed, %d environment entries\n",
+                active, linked, failed, envs);
+}
+
 /* C:\windows\syswow64: the i386 farm, the Windows name for this pattern. A
  * 32-bit process's system32 is redirected here, and the unix loader's
  * machine -> directory mapping looks here for the 32-bit ntdll, kernel32 and
@@ -2330,6 +2431,9 @@ static void *wine_process_thread(void *arg) {
             if (madeira_d3d9_wined3d_wanted())
                 madeira_link_d3d9_wined3d(fm, prefix, bundlePath, has_i386_set);
             madeira_setup_vulkan(fm, prefix, bundlePath, use_arm64ec);
+            /* Imported .wcp components last, so a user package wins over both
+             * the bundle and the Microsoft VC++ overlay for this session. */
+            madeira_apply_wcp_components(fm, prefix, use_arm64ec);
 
             /* ml719: REPAIR THE SHELL FOLDERS. They ship as symlinks to the BUILD
              * MACHINE's home directory.

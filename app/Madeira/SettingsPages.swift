@@ -172,6 +172,7 @@ struct SettingsPageView: View {
             WineMonoSettingsSection()
             if VCRedistModel.enabled { VCRedistSettingsSection() }
             WineGeckoSettingsSection()
+            ComponentsSettingsSection()
         case .graphics: GraphicsSettings(refresh: refresh)
         case .display: DisplayRateSettings()
         case .memory: RuntimeMemorySyncSettings(open: { sheet = $0 }, refresh: refresh)
