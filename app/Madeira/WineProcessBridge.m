@@ -847,18 +847,44 @@ static int madeira_env_name_ok(const char *name)
     return 1;
 }
 
+/* A package that was enabled in an earlier session leaves symlinks in the
+ * prefix pointing at Documents/Components. If it is now disabled, or its files
+ * were replaced, those links break the Windows DLL search. Clear every link
+ * that points into the Components directory before the enabled ones are laid
+ * down; bundle links and anything else are left alone. */
+static void madeira_clear_wcp_links(NSFileManager *fm, NSString *windows, NSArray *tokens, NSString *root)
+{
+    NSString *components = [root stringByAppendingString:@"/"];
+    int removed = 0;
+    for (NSString *token in tokens) {
+        NSString *farm = [windows stringByAppendingPathComponent:token];
+        for (NSString *name in [fm contentsOfDirectoryAtPath:farm error:nil]) {
+            NSString *path = [farm stringByAppendingPathComponent:name];
+            NSString *destination = [fm destinationOfSymbolicLinkAtPath:path error:nil];
+            if (destination && [destination hasPrefix:components]) {
+                [fm removeItemAtPath:path error:nil];
+                removed++;
+            }
+        }
+    }
+    if (removed)
+        dprintf(STDERR_FILENO, "[wcp] cleared %d stale link(s)\n", removed);
+}
+
 static void madeira_apply_wcp_components(NSFileManager *fm, NSString *prefix, BOOL use_arm64ec)
 {
     NSString *root = [[NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject]
                       stringByAppendingPathComponent:@"Components"];
+    NSString *windows = [prefix stringByAppendingPathComponent:@"drive_c/windows"];
+    NSArray *tokens = @[@"system32", @"syswow64", @"sysx64", @"sysaa64"];
+    madeira_clear_wcp_links(fm, windows, tokens, root);
+
     NSData *data = [NSData dataWithContentsOfFile:[root stringByAppendingPathComponent:@"state.json"]];
     if (!data) return;
     NSDictionary *state = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
     NSArray *components = [state isKindOfClass:[NSDictionary class]] ? state[@"components"] : nil;
     if (![components isKindOfClass:[NSArray class]]) return;
 
-    NSString *windows = [prefix stringByAppendingPathComponent:@"drive_c/windows"];
-    NSArray *tokens = @[@"system32", @"syswow64", @"sysx64", @"sysaa64"];
     int linked = 0, failed = 0, envs = 0, active = 0, packages = 0;
 
     for (NSDictionary *component in components) {

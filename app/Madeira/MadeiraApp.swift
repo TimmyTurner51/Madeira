@@ -43,9 +43,14 @@ struct MadeiraApp: App {
                     ClaudeHelp.install()                          // the fixes guide beside madeira-log.txt (ClaudeHelp.swift)
                 }
                 // madeira://jit-network/... (the Madeira JIT shortcut returning, JITNetwork.swift),
-                // else a shared game setup (a .madeirasetup file or madeira://setup?d=..., GameSetupShare.swift),
-                // else madeira://play?exe=... (Home Screen shortcuts, SavesAndShortcuts.swift).
+                // else a .wcp component package, else a shared game setup (a .madeirasetup file or
+                // madeira://setup?d=..., GameSetupShare.swift), else madeira://play?exe=...
+                // (Home Screen shortcuts, SavesAndShortcuts.swift).
                 .onOpenURL { url in
+                    if url.isFileURL && url.pathExtension.lowercased() == "wcp" {
+                        Task { @MainActor in WCPComponentsModel.shared.install(from: url) }
+                        return
+                    }
                     if JITNetworkShortcut.shared.handle(url) || GameSetupInbox.shared.handle(url) { return }
                     ShortcutRouter.shared.handle(url)
                 }

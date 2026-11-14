@@ -500,7 +500,7 @@ final class WCPComponentsModel: ObservableObject {
     static var stateFile: URL { root.appendingPathComponent("state.json") }
 
     static var contentType: UTType {
-        UTType(filenameExtension: "wcp") ?? .data
+        UTType(importedAs: "app.madeira.wcp", conformingTo: .data)
     }
 
     private init() { reload() }

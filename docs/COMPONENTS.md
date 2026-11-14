@@ -2,7 +2,8 @@
 
 Madeira can import **FEX** and **Wine** component packages in the `.wcp` format
 used by [DroidDeck](https://github.com/Droid-Deck) and GameNative/Winlator-style
-apps. Settings › **Runtimes** › **Windows components (.wcp)** → **Import .wcp**.
+apps. Settings › **Runtimes** › **Windows components (.wcp)** → **Import .wcp**,
+or share a `.wcp` from Files to Madeira.
 
 A `.wcp` is a Zstandard-compressed tar containing a `profile.json` and the
 component's files. The importer reads the profile, checks every path, and keeps
@@ -19,8 +20,9 @@ Documents/Components/
 Nothing in the app bundle or the code signature changes: the package lives in
 the writable Documents folder, and `WineProcessBridge.m` links its files over
 the Wine prefix at the start of each Windows session, after the bundle's own
-links. Disabling or removing a package brings the bundled file back at the
-next launch.
+links. Links from a package that is no longer enabled are cleared at that
+point, so disabling or removing a package brings the bundled file back at the
+next launch. A session already running keeps the files it started with.
 
 ## Supported packages
 
