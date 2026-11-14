@@ -87,9 +87,11 @@ GAME_MODULES="msvcr70 msvcr71 msvcr80 msvcr90 msvcr100 msvcrt20 msvcrt40 msvcirt
     xaudio2_0 xaudio2_1 xaudio2_2 xaudio2_3 xaudio2_4 xaudio2_5 xaudio2_6 xaudio2_8 xaudio2_9
     x3daudio1_0 x3daudio1_1 x3daudio1_2 x3daudio1_3 x3daudio1_4 x3daudio1_5 x3daudio1_6
     xapofx1_1 xapofx1_2 xapofx1_3 xapofx1_4
-    d2d1 wmvcore winegstreamer netprofm explorerframe"
+    d2d1 wmvcore winegstreamer netprofm explorerframe gamingtcui"
 # shellcheck disable=SC2086 # the list is split on purpose
 #   tbs                     Unreal Engine shipping executables import it statically
+#   gamingtcui              Forza Horizon 6 imports api-ms-win-gaming-tcui-l1-1-0,
+#                           which the loader resolves onto this module (c0000135)
 #   wintypes                Unity IL2CPP GameAssembly.dll imports api-ms-win-core-winrt-robuffer-l1-1-0
 #   wmadmod                 XAudio2's xWMA voices decode through the WMA decoder DMO (docs/MEDIA.md)
 #   build/wine-pe/farm-modules.txt   other stock modules the farm ships for programs that import them

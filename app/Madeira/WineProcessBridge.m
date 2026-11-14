@@ -915,6 +915,13 @@ static void madeira_apply_wcp_components(NSFileManager *fm, NSString *prefix, BO
             if (!source.length || [source hasPrefix:@"/"] || [source containsString:@".."] ||
                 !dest.length || [dest containsString:@".."]) { failed++; continue; }
             NSString *file = [directory stringByAppendingPathComponent:source];
+            // Packages installed before the layout recorded a bare path wrote
+            // "payload/..." here, but the staging payload directory is what
+            // became the component folder, so that prefix points at nothing.
+            // Try the recorded path, then the same path without it.
+            if (![fm fileExistsAtPath:file] && [source hasPrefix:@"payload/"]) {
+                file = [directory stringByAppendingPathComponent:[source substringFromIndex:8]];
+            }
             if (![fm fileExistsAtPath:file]) { failed++; continue; }
 
             NSString *resolved = [dest stringByReplacingOccurrencesOfString:@"${aarch64}"

@@ -62,7 +62,7 @@ struct WCPComponent: Identifiable, Codable, Equatable {
     }
 
     struct LayoutItem: Codable, Equatable {
-        /// Path inside the component's folder, e.g. "payload/files/.../libarm64ecfex.dll".
+        /// Path inside the component's folder, e.g. "files/lib/wine/aarch64-windows/libarm64ecfex.dll".
         var source: String
         /// Prefix-relative destination with a folder token, e.g. "${system32}/xtajit64.dll".
         var dest: String
@@ -300,7 +300,12 @@ enum WCPInstaller {
         func add(_ source: String, _ dest: String) {
             guard !seen.contains(dest) else { return }
             seen.insert(dest)
-            items.append(.init(source: "payload/" + source, dest: dest))
+            // The staging `payload` directory is moved to
+            // Documents/Components/<id>, so its children (`files/...`) sit at
+            // the top of the component folder. Recording a "payload/" prefix
+            // here pointed every link at a path that does not exist, and the
+            // bridge reported the component as failed to link.
+            items.append(.init(source: source, dest: dest))
         }
 
         switch kind {
