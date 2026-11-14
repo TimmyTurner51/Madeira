@@ -28,6 +28,9 @@
 
 import Foundation
 import SwiftUI
+#if canImport(UIKit)
+import UIKit
+#endif
 import UniformTypeIdentifiers
 
 // MARK: - Errors
@@ -539,12 +542,32 @@ final class WCPComponentsModel: ObservableObject {
         busy = true
 
         let accessed = source.startAccessingSecurityScopedResource()
-        let temporary = FileManager.default.temporaryDirectory
-            .appendingPathComponent("wcp-" + UUID().uuidString + "-" + source.lastPathComponent)
+        // The picker now asks for plain `data`, so the user can pick any file.
+        // A zstd frame starts with 28 B5 2F FD; say so plainly instead of
+        // letting the tar reader report a malformed header later.
+        var head = Data()
+        if let handle = try? FileHandle(forReadingFrom: source) {
+            head = (try? handle.read(upToCount: 4)) ?? Data()
+            try? handle.close()
+        }
+        if [UInt8](head) != [0x28, 0xB5, 0x2F, 0xFD] {
+            if accessed { source.stopAccessingSecurityScopedResource() }
+            busy = false
+            error = "\(source.lastPathComponent) is not a .wcp package (no zstd header). Pick the .wcp itself, or use Import DLL or folder."
+            return
+        }
+        // Keep the original file name: the component id is derived from it, so a
+        // package imported twice replaces itself instead of stacking up copies.
+        let folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("wcp-" + UUID().uuidString, isDirectory: true)
+        let name = source.lastPathComponent.isEmpty ? "package.wcp" : source.lastPathComponent
+        let temporary = folder.appendingPathComponent(name)
         do {
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
             try FileManager.default.copyItem(at: source, to: temporary)
         } catch {
             if accessed { source.stopAccessingSecurityScopedResource() }
+            try? FileManager.default.removeItem(at: folder)
             busy = false
             report(WCPError.message("Could not read the .wcp: \(error.localizedDescription)"))
             return
@@ -552,9 +575,9 @@ final class WCPComponentsModel: ObservableObject {
         if accessed { source.stopAccessingSecurityScopedResource() }
 
         let root = Self.root
-        let fileName = source.lastPathComponent
+        let fileName = name
         Task.detached(priority: .userInitiated) {
-            defer { try? FileManager.default.removeItem(at: temporary) }
+            defer { try? FileManager.default.removeItem(at: folder) }
             do {
                 var component = try WCPInstaller.install(temporary, into: root)
                 component.sourceFile = fileName
@@ -567,8 +590,116 @@ final class WCPComponentsModel: ObservableObject {
         }
     }
 
-    /// Import DLLs or a folder straight from Files, without a `.wcp` wrapper.
-    /// The files go into the same `payload` layout the package importer uses,
+    // MARK: - Import paths that avoid the document picker
+    //
+    // iOS 26/27's Files sheet intermittently stops delivering taps: the .wcp
+    // cell highlights but never opens, and the sheet's Open button does nothing.
+    // The picker is the OS's, not ours, so the only fix on our side is to offer
+    // ways in that never present it. Both below end in the same installer.
+
+    /// Folder scanned by "Scan Import folder". It sits in the app's Documents,
+    /// so it appears as "On My iPhone › Madeira › Import" in Files wherever the
+    /// app is installed normally (LiveContainer keeps it inside its own
+    /// container, where the link or a share-sheet hand-off is the way in).
+    static var inbox: URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Import", isDirectory: true)
+    }
+
+    /// `.wcp` files waiting in `inbox`, newest first.
+    static func waitingPackages() -> [URL] {
+        let fm = FileManager.default
+        try? fm.createDirectory(at: inbox, withIntermediateDirectories: true)
+        let items = (try? fm.contentsOfDirectory(
+            at: inbox,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles])) ?? []
+        func modified(_ url: URL) -> Date {
+            (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)
+                ?? .distantPast
+        }
+        return items
+            .filter { $0.pathExtension.lowercased() == "wcp" }
+            .sorted { modified($0) > modified($1) }
+    }
+
+    /// Installs the newest package in `inbox`.
+    func importWaitingPackages() {
+        guard !busy else { return }
+        let waiting = Self.waitingPackages()
+        guard let newest = waiting.first else {
+            error = "No .wcp in Madeira's Import folder. Copy one there from Files (On My iPhone › Madeira › Import), then scan again."
+            return
+        }
+        status = waiting.count > 1
+            ? "Installing \(newest.lastPathComponent) — \(waiting.count - 1) more waiting."
+            : "Installing \(newest.lastPathComponent)…"
+        install(from: newest)
+    }
+
+    /// Downloads a `.wcp` over http(s) and installs it. Needs no file access at
+    /// all, which makes it the reliable path when the Files sheet is stuck.
+    func install(remote link: String) {
+        guard !busy else { return }
+        let trimmed = link.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URL(string: trimmed),
+              let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              url.host?.isEmpty == false else {
+            error = "Enter an http:// or https:// link to a .wcp file."
+            return
+        }
+        error = nil
+        busy = true
+        status = "Downloading \(url.lastPathComponent.isEmpty ? "package" : url.lastPathComponent)…"
+        LogStore.shared.log("[wcp] download start \(trimmed)")
+
+        let root = Self.root
+        Task.detached(priority: .userInitiated) {            let fm = FileManager.default
+            let folder = fm.temporaryDirectory.appendingPathComponent("wcp-" + UUID().uuidString, isDirectory: true)
+            defer { try? fm.removeItem(at: folder) }
+            do {
+                try fm.createDirectory(at: folder, withIntermediateDirectories: true)
+                let (downloaded, response) = try await URLSession.shared.download(from: url)
+                if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+                    throw WCPError.message("The server answered \(http.statusCode). Check the link.")
+                }
+                let name = url.lastPathComponent.isEmpty ? "package.wcp" : url.lastPathComponent
+                let package = folder.appendingPathComponent(name)
+                try fm.moveItem(at: downloaded, to: package)
+
+                // A zstd frame starts with 28 B5 2F FD. Catching a wrong link
+                // here reads better than "the tar header is malformed" later.
+                let handle = try FileHandle(forReadingFrom: package)
+                defer { try? handle.close() }
+                let head = try handle.read(upToCount: 4) ?? Data()
+                guard [UInt8](head) == [0x28, 0xB5, 0x2F, 0xFD] else {
+                    throw WCPError.message("That link did not return a .wcp package (no zstd header).")
+                }
+
+                var component = try WCPInstaller.install(package, into: root)
+                component.sourceFile = name
+                let finished = component
+                await MainActor.run { WCPComponentsModel.shared.installed(finished) }
+            } catch {
+                let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                await MainActor.run { WCPComponentsModel.shared.failed(message) }
+            }
+        }
+    }
+
+    /// Reads a link from the pasteboard, so a URL copied on a PC only needs one
+    /// tap on the phone.
+    func pasteRemoteLink() -> String? {
+        #if canImport(UIKit)
+        let text = UIPasteboard.general.string?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return text.lowercased().hasPrefix("http") ? text : nil
+        #else
+        return nil
+        #endif
+    }
+
+    /// Import DLLs or a folder straight from Files, without a `.wcp` wrapper.    /// The files go into the same `payload` layout the package importer uses,
     /// so the bridge does not need a second format.
     func installManual(from sources: [URL], kind: WCPComponent.Kind) {
         guard !busy, !sources.isEmpty else { return }
@@ -745,6 +876,7 @@ struct ComponentsSettingsSection: View {
     @State private var pendingFiles: [URL] = []
     @State private var choosingKind = false
     @State private var removing: WCPComponent?
+    @State private var remoteLink = ""
 
     var body: some View {
         Section {
@@ -789,6 +921,35 @@ struct ComponentsSettingsSection: View {
                 Label("Import .wcp", systemImage: "square.and.arrow.down")
             }
             .disabled(model.busy)
+            DisclosureGroup("Files sheet not responding?") {
+                TextField("https://example.com/component.wcp", text: $remoteLink)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .keyboardType(.URL)
+                    .textContentType(.URL)
+                HStack {
+                    Button {
+                        model.install(remote: remoteLink)
+                    } label: {
+                        Label("Install from link", systemImage: "link")
+                    }
+                    .disabled(model.busy || remoteLink.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    Spacer()
+                    Button("Paste") {
+                        if let link = model.pasteRemoteLink() { remoteLink = link }
+                    }
+                    .disabled(model.busy)
+                }
+                Button {
+                    model.importWaitingPackages()
+                } label: {
+                    Label("Scan Import folder", systemImage: "folder")
+                }
+                .disabled(model.busy)
+                Text("Madeira can install a package without the Files sheet: paste a download link, or copy the .wcp into Madeira's Import folder and scan it. Both avoid the picker, which iOS 26/27 sometimes stops delivering taps to.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
             Button {
                 importingFiles = true
             } label: {
@@ -812,7 +973,12 @@ struct ComponentsSettingsSection: View {
         } footer: {
             Text("Imports FEX and Wine packages in the DroidDeck and GameNative .wcp format, or individual DLLs and folders from Files. An enabled component replaces the matching runtime files at the start of the next Windows session; the app itself is not modified. FEX must be built with Madeira's iOS host layer; a module built for Android or Linux cannot boot a game.")
         }
-        .fileImporter(isPresented: $importing, allowedContentTypes: [WCPComponentsModel.contentType]) { result in
+        // Filtering on our own imported UTType (`app.madeira.wcp`) makes the
+        // iOS 26/27 Files sheet highlight a .wcp but never deliver the tap.
+        // Asking for plain `data` goes through the same code path as the
+        // DLL/folder importer below, which does work, and the installer
+        // validates the zstd header afterwards.
+        .fileImporter(isPresented: $importing, allowedContentTypes: [.data]) { result in
             switch result {
             case .success(let url): model.install(from: url)
             case .failure(let error): model.report(error)

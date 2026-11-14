@@ -51,6 +51,22 @@ struct MadeiraApp: App {
                         Task { @MainActor in WCPComponentsModel.shared.install(from: url) }
                         return
                     }
+                    // madeira://wcp?url=https://… downloads and installs a package, and
+                    // madeira://wcp scans Madeira's Import folder. Both exist so a
+                    // component can be installed without the Files sheet, which
+                    // iOS 26/27 sometimes stops delivering taps to.
+                    if url.scheme?.lowercased() == "madeira", url.host?.lowercased() == "wcp" {
+                        let link = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+                            .queryItems?.first { $0.name.lowercased() == "url" }?.value
+                        Task { @MainActor in
+                            if let link, !link.isEmpty {
+                                WCPComponentsModel.shared.install(remote: link)
+                            } else {
+                                WCPComponentsModel.shared.importWaitingPackages()
+                            }
+                        }
+                        return
+                    }
                     if JITNetworkShortcut.shared.handle(url) || GameSetupInbox.shared.handle(url) { return }
                     ShortcutRouter.shared.handle(url)
                 }
