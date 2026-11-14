@@ -5908,7 +5908,7 @@ static int ios_aux_find_pe( uintptr_t pe )
  * away under a table entry the unload never cleared); 0 on success */
 static int ios_aux_safe_read( uintptr_t addr, void *out, size_t len )
 {
-    unsigned char buf[24];
+    unsigned char buf[64];
     uintptr_t a = addr & ~(uintptr_t)7;
     size_t pre = addr - a, w;
     if (len + pre > sizeof(buf)) return -1;
@@ -6526,17 +6526,17 @@ static void ios_arm64ec_bind_aux_iat( char *base, size_t size )
 {
     static uintptr_t scan_pe[256], scan_jit[256];
     static int scan_tries[256], scan_n, said;
-    uintptr_t rs = (uintptr_t)base, re = rs + size, pe, jb;
+    uintptr_t rs = (uintptr_t)base, re = rs + size, pe, jb, sec_base;
     extern void *ios_jit_rw_base_global;
     extern void *ios_jit_rx_base_global;
-    IMAGE_NT_HEADERS64 nt;
+    IMAGE_SECTION_HEADER sh;
+    unsigned short nsec = 0, sizeopt = 0, magic = 0;
     unsigned int lfanew = 0;
-    const IMAGE_SECTION_HEADER *sec;
     unsigned int n, s;
     size_t pool_off;
     char *rw_img;
     uint64_t *p, *end;
-    int imp = -1, i, slot_i = -1, bound = 0;
+    int imp = -1, i, slot_i = -1, bound = 0, scanned = 0;
 
     for (i = 0; i < ios_jit_mapping_count; i++)
     {
@@ -6551,7 +6551,6 @@ static void ios_arm64ec_bind_aux_iat( char *base, size_t size )
     jb = (uintptr_t)ios_jit_mappings[imp].jit_base;
     for (i = 0; i < scan_n; i++)
         if (scan_pe[i] == pe && scan_jit[i] == jb) { slot_i = i; break; }
-
     /* Do NOT settle for a single attempt per image. The first protect call on a module
      * arrives while the loader is still fixing up its imports, and an aux slot can only
      * be bound once its main IAT entry holds a real target -- on disk it still points at
@@ -6563,25 +6562,32 @@ static void ios_arm64ec_bind_aux_iat( char *base, size_t size )
     if (slot_i < 0) return;
     scan_tries[slot_i]++;
 
-    if (ios_aux_safe_read( pe + 0x3c, &lfanew, 4 ) || lfanew < 0x40 || lfanew > 0x1000) return;
-    if (ios_aux_safe_read( pe + lfanew, &nt, sizeof(nt) )) return;
-    if (nt.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) return;
-    sec = IMAGE_FIRST_SECTION( &nt );
-    n = nt.FileHeader.NumberOfSections;
+    /* Headers, field by field through the fault-safe reader: it is bounded to one
+     * cache line, so a whole IMAGE_NT_HEADERS64 (264 bytes) does not fit and asking
+     * for it silently returned -1 -- which made this whole function a no-op. */
+    if (ios_aux_safe_read( pe + 0x3c, &lfanew, 4 ) || lfanew < 0x40 || lfanew >= 0x1000) return;
+    if (ios_aux_safe_read( pe + lfanew + 4, &nsec, 2 )) return;              /* FileHeader.NumberOfSections */
+    if (ios_aux_safe_read( pe + lfanew + 20, &sizeopt, 2 )) return;         /* FileHeader.SizeOfOptionalHeader */
+    if (ios_aux_safe_read( pe + lfanew + 24, &magic, 2 )) return;           /* OptionalHeader.Magic */
+    if (magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC || !nsec || nsec > 96) return;
+    sec_base = pe + lfanew + 24 + sizeopt;
 
     pool_off = jb - (uintptr_t)ios_jit_rx_base_global;
     rw_img = (char *)ios_jit_rw_base_global + pool_off;
 
     /* Every non-executable section can hold a slot: ucrtbase keeps them in .rdata,
      * other modules place auxiliary IATs in .data next to the main one. */
-    for (s = 0; s < n; s++)
+    for (s = 0, n = nsec; s < n; s++)
     {
-        uint32_t chars = sec[s].Characteristics;
+        uint32_t chars;
         size_t so, ss;
 
+        if (ios_aux_safe_read( sec_base + (uintptr_t)s * sizeof(sh), &sh, sizeof(sh) )) return;
+        chars = sh.Characteristics;
+
         if (chars & IMAGE_SCN_MEM_EXECUTE) continue;
-        so = sec[s].VirtualAddress;
-        ss = sec[s].Misc.VirtualSize ? sec[s].Misc.VirtualSize : sec[s].SizeOfRawData;
+        so = sh.VirtualAddress;
+        ss = sh.Misc.VirtualSize ? sh.Misc.VirtualSize : sh.SizeOfRawData;
         if (!ss || so + ss > ios_jit_mappings[imp].size) continue;
         if (ss > 0x800000) ss = 0x800000;
 
@@ -6613,6 +6619,7 @@ static void ios_arm64ec_bind_aux_iat( char *base, size_t size )
             rn = (c1 >> 5) & 0x1Fu;
             rt = c1 & 0x1Fu;
             if (rn != rd0 || rt != rd0) continue;
+            scanned++;
 
             main_slot = ios_aux_adrp_page( cont, c0 ) + (uintptr_t)((c1 >> 10) & 0xFFFu) * 8;
             if (main_slot < jb || main_slot + 8 > jb + ios_jit_mappings[imp].size) continue;
@@ -6626,14 +6633,14 @@ static void ios_arm64ec_bind_aux_iat( char *base, size_t size )
         }
     }
 
-    if (bound)
-    {
-        scan_tries[slot_i] = 64; /* this image is done -- a bound slot no longer matches */
-        if (said++ < 24)
-            dprintf( 2, "[aux-iat-bind] fh6-aux-bind image pe=%p (copy %p): bound %d slot(s) "
-                     "to their ARM64EC entry points\n",
-                     (void *)pe, (void *)jb, bound );
-    }
+    if (bound) scan_tries[slot_i] = 64; /* done -- a bound slot no longer matches */
+    /* Report every pass that saw a continuation, not only the one that bound: a pass
+     * that finds shape but no callable target is the normal first call on a module
+     * (the loader has not resolved its imports yet) and would otherwise be invisible. */
+    if (scanned && said++ < 40)
+        dprintf( 2, "[aux-iat-bind] fh6-aux-bind image pe=%p (copy %p) try %d: %d continuation(s), "
+                 "%d bound to an ARM64EC entry point\n",
+                 (void *)pe, (void *)jb, (int)scan_tries[slot_i], scanned, bound );
 }
 
 void ios_jit_sync_write(void *addr, size_t size)
