@@ -6461,6 +6461,181 @@ static int ios_iat_skip_exec_dest( void )
     return cached;
 }
 
+/* fh6-aux-bind: an ARM64EC module reaches an import through ONE auxiliary IAT slot (in
+ * .rdata) in two ways: the `br x16` stub, and -- what actually broke Forza -- a plain
+ * `blr` of the slot's contents.
+ *
+ * Windows' loader binds that slot to the native ARM64EC entry when the import resolves
+ * to EC code. Wine's never binds it, so the slot keeps the value the LINKER put there:
+ * the continuation, `ldr x11,[main IAT]; adrp x10,exit_thunk; b __os_arm64x_check_call`.
+ * That continuation is only a valid *branch* target; it returns to its caller with
+ * x9 = the callable and expects the caller to `blr x9` afterwards. A `blr` site has no
+ * such follow-up, so the callee never runs and the caller keeps whatever x0 held.
+ *
+ * Forza Horizon 6, 2026-11-14: ucrtbase's __acrt_getptd did
+ *     adrp x8,.data ; ldr w0,[x8,#0x690]   ; w0 = the CRT's TLS index
+ *     adrp x8,.rdata ; ldr x8,[x8,#0x4a0] ; TlsGetValue's aux slot
+ *     blr x8                                ; never called: x0 stayed 0x57
+ *     ldr x0,[x19,#0x80]                    ; -> c0000005 at pc=0x0
+ * (ucrtbase.dll+0x3a664, lr +0x3a65c.) Bind the slot instead: for every .rdata word that
+ * still holds a continuation, resolve the main IAT entry it names and, when that target
+ * is ARM64EC code (directly, or through the x64 fast-forward thunk the loader left in
+ * the IAT), store the EC entry point in the slot. An x64 callee keeps the continuation:
+ * a `blr` there is not something binding a slot can fix, and routing it is FEX's job. */
+/* Is v (a pool-copy address of an ARM64EC function entry) genuinely NATIVE ARM64 code?
+ * Only the largest executable section counts -- the mapping's text_offset/text_size. The
+ * catch: ios_jit_code_bounds() also spans .hexpthk, which holds x86_64 fast-forward
+ * thunks for exactly the imports we are binding. A `blr` through a slot must land on
+ * ARM64, so a .hexpthk target has to be followed, never accepted. */
+static int ios_aux_native_entry( uintptr_t v, uintptr_t *out )
+{
+    int t = ios_aux_find_copy( v );
+    uintptr_t base;
+    size_t lo, hi;
+
+    if (t < 0 || !ios_jit_mappings[t].text_size) return 0;
+    if (!ios_jit_mapping_is_hybrid( t )) return 0;
+    base = (uintptr_t)ios_jit_mappings[t].jit_base;
+    lo = ios_jit_mappings[t].text_offset;
+    hi = lo + ios_jit_mappings[t].text_size;
+    if (v < base + lo || v >= base + hi || (v & 3)) return 0;
+    *out = v;
+    return 1;
+}
+
+static int ios_aux_ec_target( uintptr_t v, uintptr_t *out )
+{
+    static const unsigned char ffs[10] = { 0x48, 0x8b, 0xc4, 0x48, 0x89, 0x58, 0x20, 0x55, 0x5d, 0xe9 };
+    unsigned char thunk[14];
+    uintptr_t cand;
+    int32_t rel;
+
+    if (ios_aux_native_entry( v, out )) return 1;
+
+    /* the loader's IAT value for a builtin can be an x64 fast-forward thunk
+     * (mov rax,rsp / mov [rax+0x20],rbx / push rbp / pop rbp / jmp target) in .hexpthk;
+     * follow it to the ARM64 body it jumps to */
+    if (ios_aux_safe_read( v, thunk, sizeof(thunk) )) return 0;
+    if (memcmp( thunk, ffs, sizeof(ffs) )) return 0;
+    memcpy( &rel, thunk + 10, 4 );
+    cand = v + 14 + (intptr_t)rel;
+    return ios_aux_native_entry( cand, out );
+}
+
+static void ios_arm64ec_bind_aux_iat( char *base, size_t size )
+{
+    static uintptr_t scan_pe[256], scan_jit[256];
+    static int scan_tries[256], scan_n, said;
+    uintptr_t rs = (uintptr_t)base, re = rs + size, pe, jb;
+    extern void *ios_jit_rw_base_global;
+    extern void *ios_jit_rx_base_global;
+    IMAGE_NT_HEADERS64 nt;
+    unsigned int lfanew = 0;
+    const IMAGE_SECTION_HEADER *sec;
+    unsigned int n, s;
+    size_t pool_off;
+    char *rw_img;
+    uint64_t *p, *end;
+    int imp = -1, i, slot_i = -1, bound = 0;
+
+    for (i = 0; i < ios_jit_mapping_count; i++)
+    {
+        uintptr_t b = (uintptr_t)ios_jit_mappings[i].pe_base;
+        if (b && rs >= b && re <= b + ios_jit_mappings[i].size) { imp = i; break; }
+    }
+    if (imp < 0 || !ios_jit_rw_base_global || !ios_jit_rx_base_global) return;
+    /* a pure x64 importer has no auxiliary IAT */
+    if (!ios_jit_mapping_is_hybrid( imp )) return;
+
+    pe = (uintptr_t)ios_jit_mappings[imp].pe_base;
+    jb = (uintptr_t)ios_jit_mappings[imp].jit_base;
+    for (i = 0; i < scan_n; i++)
+        if (scan_pe[i] == pe && scan_jit[i] == jb) { slot_i = i; break; }
+
+    /* Do NOT settle for a single attempt per image. The first protect call on a module
+     * arrives while the loader is still fixing up its imports, and an aux slot can only
+     * be bound once its main IAT entry holds a real target -- on disk it still points at
+     * the import-name thunk (ucrtbase 0xb04a0 held rva 0xd21e4, i.e. nothing callable).
+     * Keep probing until a pass actually binds something, then remember the image. */
+    if (slot_i >= 0 && (scan_tries[slot_i] >= 64))
+        return;
+    if (slot_i < 0 && scan_n < 256) { slot_i = scan_n++; scan_pe[slot_i] = pe; scan_jit[slot_i] = jb; }
+    if (slot_i < 0) return;
+    scan_tries[slot_i]++;
+
+    if (ios_aux_safe_read( pe + 0x3c, &lfanew, 4 ) || lfanew < 0x40 || lfanew > 0x1000) return;
+    if (ios_aux_safe_read( pe + lfanew, &nt, sizeof(nt) )) return;
+    if (nt.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) return;
+    sec = IMAGE_FIRST_SECTION( &nt );
+    n = nt.FileHeader.NumberOfSections;
+
+    pool_off = jb - (uintptr_t)ios_jit_rx_base_global;
+    rw_img = (char *)ios_jit_rw_base_global + pool_off;
+
+    /* Every non-executable section can hold a slot: ucrtbase keeps them in .rdata,
+     * other modules place auxiliary IATs in .data next to the main one. */
+    for (s = 0; s < n; s++)
+    {
+        uint32_t chars = sec[s].Characteristics;
+        size_t so, ss;
+
+        if (chars & IMAGE_SCN_MEM_EXECUTE) continue;
+        so = sec[s].VirtualAddress;
+        ss = sec[s].Misc.VirtualSize ? sec[s].Misc.VirtualSize : sec[s].SizeOfRawData;
+        if (!ss || so + ss > ios_jit_mappings[imp].size) continue;
+        if (ss > 0x800000) ss = 0x800000;
+
+        p = (uint64_t *)(rw_img + so);
+        end = (uint64_t *)(rw_img + so + (ss & ~(size_t)7));
+
+        for (; p < end; p++)
+        {
+            uint64_t w = *p, val;
+            uintptr_t cont, main_slot, target = 0;
+            uint32_t c0, c1, rd0, rn, rt;
+            size_t tx_lo = jb + ios_jit_mappings[imp].text_offset;
+            size_t tx_hi = tx_lo + ios_jit_mappings[imp].text_size;
+
+            if (!w) continue;
+            cont = (uintptr_t)w;
+            /* the file holds a PE VA; the copy may already hold the pool address */
+            if (cont >= pe && cont < pe + ios_jit_mappings[imp].size) cont = jb + (cont - pe);
+            if ((cont & 3) || !ios_jit_mappings[imp].text_size) continue;
+            if (cont < tx_lo || cont + 12 > tx_hi) continue;
+
+            c0 = *(volatile uint32_t *)cont;
+            c1 = *(volatile uint32_t *)(cont + 4);
+            /* continue only for the linker's continuation:
+             *   adrp xN, <main IAT page> ; ldr xN, [xN, #slot] */
+            if ((c0 & 0x9F000000u) != 0x90000000u) continue;
+            if ((c1 & 0xFFC00000u) != 0xF9400000u) continue;
+            rd0 = c0 & 0x1Fu;
+            rn = (c1 >> 5) & 0x1Fu;
+            rt = c1 & 0x1Fu;
+            if (rn != rd0 || rt != rd0) continue;
+
+            main_slot = ios_aux_adrp_page( cont, c0 ) + (uintptr_t)((c1 >> 10) & 0xFFFu) * 8;
+            if (main_slot < jb || main_slot + 8 > jb + ios_jit_mappings[imp].size) continue;
+            val = *(volatile uint64_t *)main_slot;
+            if (!val) continue;
+            if (!ios_aux_ec_target( (uintptr_t)val, &target )) continue;
+            if (!target) continue;
+
+            __atomic_store_n( (uint64_t *)p, (uint64_t)target, __ATOMIC_RELEASE );
+            bound++;
+        }
+    }
+
+    if (bound)
+    {
+        scan_tries[slot_i] = 64; /* this image is done -- a bound slot no longer matches */
+        if (said++ < 24)
+            dprintf( 2, "[aux-iat-bind] fh6-aux-bind image pe=%p (copy %p): bound %d slot(s) "
+                     "to their ARM64EC entry points\n",
+                     (void *)pe, (void *)jb, bound );
+    }
+}
+
 void ios_jit_sync_write(void *addr, size_t size)
 {
     int i, fallback = -1;
@@ -36093,6 +36268,8 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
 #ifdef WINE_IOS
     /* ml1244: the loader's IAT restore call; the thunks are still writable here */
     ios_x64_iat_bind_live_data( base, size );
+    /* fh6-aux-bind: same moment, ARM64EC auxiliary IAT (see ios_arm64ec_bind_aux_iat) */
+    ios_arm64ec_bind_aux_iat( base, size );
 #endif
 
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
