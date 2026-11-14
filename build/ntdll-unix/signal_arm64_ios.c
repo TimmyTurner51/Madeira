@@ -7917,6 +7917,81 @@ dispatch_guest_fault:
                                     "[thunk-slot] exec-relative slot @0x%llx UNREADABLE\n",
                                     (unsigned long long)adrp_tgt);
                         }
+                        /* Classify x9 itself. Every theory about this crash turns on
+                         * one question the log has never answered: is the callee the
+                         * exit thunk is dispatching to ARM64EC code or x64 code?
+                         *   - an x64 target cannot run natively here, and emulating it
+                         *     needs a CpuStateFrame that does not exist during the
+                         *     DllMain walk, which is the pc=0;
+                         *   - an EC target does not need FEX at all, so branch to it
+                         *     (FEX's ios_ec_entry).
+                         * Print the EC bit the dispatcher's own test reads, the first
+                         * eight bytes (ff 25 = bare import thunk, 48 8d a4 24 =
+                         * hotpatched thunk, anything else = code), and the module x9
+                         * falls in. Also print x9's neighbours' bits so a miss cannot
+                         * be blamed on the wrong page. */
+                        {
+                            extern void *ios_arm64ec_bitmap_base(void);
+                            extern uint64_t ios_jit_reverse_translate( uint64_t addr, uint64_t *module_base );
+                            const uint64_t *ec_map = ios_arm64ec_bitmap_base();
+                            uint64_t x9 = state.__x[9];
+                            uint64_t x9_mod = 0, x9_va = ios_jit_reverse_translate( x9, &x9_mod );
+                            unsigned char bytes[8];
+                            mach_vm_size_t got_b = 0;
+                            int ec_bit = -1;
+
+                            if (x9 && ec_map && (x9 >> 12) < 0x200000)
+                            {
+                                uint64_t w = ec_map[x9 >> 18];
+                                ec_bit = (int)((w >> ((x9 >> 12) & 63)) & 1);
+                            }
+                            dprintf(STDERR_FILENO,
+                                "[x9-probe] x9=0x%llx EC=%d pe=0x%llx %s+0x%llx\n",
+                                (unsigned long long)x9, ec_bit,
+                                (unsigned long long)x9_va,
+                                x9_mod ? ios_pe_module_name(x9_mod) : "(no module)",
+                                (unsigned long long)(x9_va && x9_mod ? x9_va - x9_mod : 0));
+                            if (mach_vm_read_overwrite(mach_task_self(),
+                                    (mach_vm_address_t)x9, sizeof(bytes),
+                                    (mach_vm_address_t)bytes, &got_b) == KERN_SUCCESS && got_b == 8)
+                                dprintf(STDERR_FILENO,
+                                    "[x9-probe] bytes: %02x %02x %02x %02x %02x %02x %02x %02x"
+                                    " -> %s\n",
+                                    bytes[0], bytes[1], bytes[2], bytes[3],
+                                    bytes[4], bytes[5], bytes[6], bytes[7],
+                                    (bytes[0] == 0xff && bytes[1] == 0x25) ? "bare jmp *IAT thunk"
+                                    : (bytes[0] == 0x48 && bytes[1] == 0x8d && bytes[2] == 0xa4
+                                       && bytes[3] == 0x24) ? "hotpatched IAT thunk"
+                                    : (bytes[0] == 0x48 && bytes[1] == 0x8b && bytes[2] == 0xc4)
+                                        ? "x64 FFS fast-forward"
+                                    : "AArch64 code (not an x64 thunk)");
+                            else
+                                dprintf(STDERR_FILENO, "[x9-probe] bytes at x9 UNREADABLE\n");
+                            /* Report where x9 sits inside its image rather than
+                             * guessing an extent: read SizeOfImage from the PE
+                             * headers so a marking gap is distinguishable from a
+                             * target that is simply outside the image. */
+                            if (x9_mod && x9_va)
+                            {
+                                uint32_t e_lfanew = 0, size_img = 0;
+                                mach_vm_size_t got_h = 0;
+                                if (mach_vm_read_overwrite(mach_task_self(),
+                                        (mach_vm_address_t)(x9_mod + 0x3c), 4,
+                                        (mach_vm_address_t)&e_lfanew, &got_h) == KERN_SUCCESS
+                                    && got_h == 4 && e_lfanew < 0x1000
+                                    && mach_vm_read_overwrite(mach_task_self(),
+                                        (mach_vm_address_t)(x9_mod + e_lfanew + 0x50), 4,
+                                        (mach_vm_address_t)&size_img, &got_h) == KERN_SUCCESS
+                                    && got_h == 4)
+                                    dprintf(STDERR_FILENO,
+                                        "[x9-probe] image %#llx..%#llx (SizeOfImage %#x):"
+                                        " x9 rva %#llx is %s the image\n",
+                                        (unsigned long long)x9_mod,
+                                        (unsigned long long)(x9_mod + size_img), size_img,
+                                        (unsigned long long)(x9_va - x9_mod),
+                                        (x9_va - x9_mod) < size_img ? "inside" : "OUTSIDE");
+                            }
+                        }
                         fp_walk = state.__fp;
                         for (fr = 0; fr < 16 && fp_walk; fr++)
                         {
