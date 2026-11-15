@@ -967,3 +967,14 @@ until `syscall_NtProtectVirtualMemory` itself. ml1260 snapshots the live
 ARM64 page around `pBeginSimulation` and writes it back after the
 protect. Look for `[exec-data] save ... pBeginSimulation=` non-NULL and
 `restore pBeginSimulation=` the same value.
+
+## 2026-11-15 16:00 — preserve memcpy used a 32-bit page mask
+
+ml1260 loaded (`SUPPRESSED via=save`) then AV READ of `0x63176000` in
+ntdll `memcpy` (`ntdll+0x65448`), called from
+`syscall_protect_preserving_ntdll_data`. Guest RIP was still the
+NtProtect hp_target; we never reached unix protect or the save log.
+`0x63176000` is the live pool page `0x163176000` with the top 32 bits
+cleared: `~0xfffUL` is 32-bit on LLP64. ml1261 uses `~(ULONG_PTR)0xfff`.
+Look for `[exec-data] save n=8192 live=0000000163176000 pBeginSimulation=`
+non-NULL, then more `[ec-syscall]`.

@@ -1,0 +1,18 @@
+diff --git a/dlls/ntdll/signal_arm64ec.c b/dlls/ntdll/signal_arm64ec.c
+index e7f4a220..a1b2c3d4 100644
+--- a/dlls/ntdll/signal_arm64ec.c
++++ b/dlls/ntdll/signal_arm64ec.c
+@@ -2753,8 +2753,11 @@ static BOOL ios_protect_notify_suppressed( const char *via, void *addr, SIZE_T s
+ static NTSTATUS syscall_protect_preserving_ntdll_data(
+     HANDLE process, PVOID *addr_ptr, SIZE_T *size_ptr, ULONG new_prot, ULONG *old_prot )
+ {
+     BYTE snap[0x2000];
+-    BYTE *page = (BYTE *)((ULONG_PTR)&pBeginSimulation & ~0xfffUL);
++    /* Windows is LLP64: ~0xfffUL is 0xfffff000 and AND with that
++     * drops bits 32..63, turning pool 0x163176000 into 0x63176000.
++     * 16:00 crashed in memcpy's LDP from that truncated address. */
++    BYTE *page = (BYTE *)((ULONG_PTR)&pBeginSimulation & ~(ULONG_PTR)0xfff);
+     void *begin = pBeginSimulation;
+     SIZE_T n = *size_ptr;
+     BOOL preserve = ios_data_exec_suppressed( "save", *addr_ptr, n, new_prot );
+     NTSTATUS st;
