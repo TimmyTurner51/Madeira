@@ -1,14 +1,14 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Madeira <madeira@example.invalid>
-Date: Sun, 15 Nov 2026 00:50:00 -0600
-Subject: [PATCH] ExitToX64: prefer a resolved native body over emulation that
- cannot exist
+Date: Sun, 15 Nov 2026 00:52:00 -0600
+Subject: [PATCH] ExitToX64: when FEX is uninitialised, prefer any real address
+ over emulation that cannot exist
 
 Signed-off-by: Madeira <madeira@example.invalid>
 ---
---- a/Source/Windows/ARM64EC/Module.S	2026-11-15 00:49:03
-+++ b/Source/Windows/ARM64EC/Module.S	2026-11-15 00:49:03
-@@ -501,6 +501,58 @@
+--- a/Source/Windows/ARM64EC/Module.S	2026-11-15 00:51:30
++++ b/Source/Windows/ARM64EC/Module.S	2026-11-15 00:51:30
+@@ -501,6 +501,67 @@
    add sp, sp, #32
    br x17
  ios_thunk_reject:
@@ -45,13 +45,22 @@ Signed-off-by: Madeira <madeira@example.invalid>
 +  cbz x16, 94f
 +  ldr x16, [x16, #0x40]            // ->EmulatorData[2] == DispatcherLoopTopEnterEC
 +  cbnz x16, 94f                    // FEX is initialised: honour the bitmap
-+  ldr x23, [sp, #24]               // hop budget, 4 when nothing was followed
-+  cmp x23, #4
-+  b.ne 95f                         // a stub was followed: x17 is a native body
-+  ldr x23, [sp]                    // the slot value actually in use
-+  movz x16, #0x10, lsl #16         // 0x100000
-+  cmp x23, x16
-+  b.lo 94f                         // rva or filler: not a target after all
++  // ml1222: FEX is uninitialised, so enter_jit is not a fallback -- it is a
++  // guaranteed `br x16` with x16 = 0. Under that condition ANY real address is
++  // a better branch than emulation. The earlier versions of this guard asked
++  // for more (that a stub had been followed, or that the slot value was
++  // >= 0x100000) and the 00:50 run proved that was too strict: the guard
++  // visibly did not fire, cpu_area[0x40] was still 0, and the crash was
++  // byte-identical to the build without any guard at all. So drop those
++  // conditions and keep only "not NULL, not filler", which are the two values
++  // that cannot be a target under any reading.
++  cbz x17, 94f
++  movz x23, #0xcccc
++  movk x23, #0xcccc, lsl #16
++  movk x23, #0xcccc, lsl #32
++  movk x23, #0xcccc, lsl #48
++  cmp x17, x23
++  b.eq 94f
 +95:
 +  adrp x16, IosFfsBypassLog
 +  add x16, x16, #:lo12:IosFfsBypassLog
