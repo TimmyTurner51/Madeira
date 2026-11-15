@@ -478,6 +478,41 @@ That downgrade is architecturally sound here (FEX reads guest bytes and never ex
 them at the guest VA), so it is recorded as a correlation to rule out rather than
 presented as the cause.
 
+### The emulator was announcing itself to the protection
+
+The encipherment is confirmed structural, not incidental. Of 414,805 `.pdata`
+function starts, 4,538 begin with `EA`, but only **247 distinct 5-byte prefixes**
+cover all of them and the most common covers **2,693** — and neighbouring functions
+carry byte-identical 13-byte prefixes. Per-function encryption cannot produce that;
+repeated ciphertext under repeated plaintext is the signature of a **block cipher in
+ECB mode**, applied over roughly the first 8–11 bytes of each prologue (the distinct-
+prefix count is flat at 8 bytes and jumps by 9× at 12). So the file holds ciphertext,
+the protection must decrypt it at run time, and it declined.
+
+That reframes the question. A protection declines for a reason, and FEX was handing it
+an unusually loud one. `FEX_HIDEHYPERVISORBIT=1` is in this game's environment and was
+doing what it advertises — clearing `CPUID.1[31]`, the "a hypervisor is present" bit —
+but the `0x40000000` range was **not** gated on it:
+
+```
+CPUID.4000_0000h  eax = 0x40000001, signature "FEXIFEXIEMU"
+CPUID.4000_0001h  eax[3:0] = 2   ->  "the host architecture is AArch64"
+```
+
+while leaf 1 said no hypervisor existed. No real machine answers both ways, so the
+inconsistency was itself the fingerprint — and a stronger one than the bit it was
+trying to hide, because emulator detection asks these leaves precisely because they are
+trivial to read. An anti-tamper that sees `FEXIFEXIEMU` and `AArch64` reaches an
+unambiguous verdict and stops decrypting, which is exactly the observable: ciphertext at
+a prologue, unchanged, with no `#UD` handler willing to decrypt it.
+
+`ml1253` gates the whole range on `HideHypervisorBit`, so with the option on both leaves
+answer all zeros — the shape a real CPU gives an unimplemented leaf — and with the
+option off nothing changes. This makes the emulator stop volunteering that it is an
+emulator; it does not weaken, skip or disable anything the game checks. It is the same
+class of fix as the hotpatch import thunks: make the ARM64EC runtime behave the way
+native x64 Windows does.
+
 ## Conclusion
 
 Three blockers have been retired. The ARM64EC import-slot mis-route is not
