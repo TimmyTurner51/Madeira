@@ -1,0 +1,72 @@
+diff --git a/dlls/ntdll/exception.c b/dlls/ntdll/exception.c
+index e90eb016..e82347d6 100644
+--- a/dlls/ntdll/exception.c
++++ b/dlls/ntdll/exception.c
+@@ -159,6 +159,48 @@ static LONG call_vectored_handlers( EXCEPTION_RECORD *rec, CONTEXT *context )
+ 
+     RtlEnterCriticalSection( &vectored_handlers_section );
+ 
++#ifdef __arm64ec__
++    /* iOS-Madeira ml1251: IS THE PROTECTION'S DECRYPTOR IN THIS CHAIN AT ALL?
++     *
++     * A protected title can carry per-function encrypted prologues whose first
++     * byte is not a valid instruction; its own handler decrypts the function
++     * and returns EXCEPTION_CONTINUE_EXECUTION. Such a decryptor is normally a
++     * VECTORED handler, because a vectored handler is the only kind that runs
++     * before the frame-based walk and can resume at the faulting address.
++     *
++     * Whether that handler exists here cannot be inferred from the log: the
++     * per-handler lines in this function are TRACE, and Madeira captures no
++     * trace channels at all, so an EMPTY chain and a chain of handlers that all
++     * decline look identical. It matters because they call for opposite work --
++     * a registration problem in Wine versus a verdict from the protection.
++     *
++     * Reports the chain length and each entry once per process, and each
++     * handler's verdict below. The critical section is already held, so this
++     * walks the list rather than locking it again, and it formats into the log
++     * only -- no allocation, no recursion. */
++    if (rec->ExceptionCode == STATUS_ILLEGAL_INSTRUCTION)
++    {
++        static LONG ih_n;
++        if (InterlockedIncrement( &ih_n ) <= 4)
++        {
++            unsigned int count = 0;
++            PLIST_ENTRY scan;
++            ERR( "[veh-chain] ml1251 #%ld code=%08x addr=%p tid=%04x\n", ih_n,
++                 (int)rec->ExceptionCode, rec->ExceptionAddress,
++                 (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread );
++            for (scan = vectored_exception_handlers.Flink; scan != &vectored_exception_handlers; scan = scan->Flink)
++            {
++                VECTORED_HANDLER *v = CONTAINING_RECORD( scan, VECTORED_HANDLER, entry );
++                if (++count > 32) break;
++                ERR( "[veh-chain] ml1251   #%u handler=%p\n", count, RtlDecodePointer( v->func ) );
++            }
++            ERR( "[veh-chain] ml1251 %s (%u handler(s)); the frame-based walk runs next\n",
++                 count ? "checking them in order" : "EMPTY -- nothing can decrypt a function here",
++                 count );
++        }
++    }
++#endif
++
+     mark = &vectored_exception_handlers;
+     entry = mark->Flink;
+     while (entry != mark)
+@@ -209,6 +251,18 @@ static LONG call_vectored_handlers( EXCEPTION_RECORD *rec, CONTEXT *context )
+ #endif
+         ret = func( &except_ptrs );
+ #ifdef __arm64ec__
++        /* ml1251: what each vectored handler decided about the #UD. A
++         * CONTINUE_EXECUTION here means the protection decrypted the function
++         * and the frame-based walk never runs; CONTINUE_SEARCH means it saw the
++         * fault and passed, which is a verdict rather than a missing handler. */
++        if (rec->ExceptionCode == STATUS_ILLEGAL_INSTRUCTION)
++        {
++            static LONG ihv_n;
++            if (InterlockedIncrement( &ihv_n ) <= 16)
++                ERR( "[veh-chain] ml1251 handler %p -> %ld (%s)\n", func, (long)ret,
++                     ret == EXCEPTION_CONTINUE_EXECUTION ? "CONTINUE_EXECUTION: decrypted, resuming" :
++                     ret == EXCEPTION_CONTINUE_SEARCH ? "CONTINUE_SEARCH: declined" : "other" );
++        }
+         if (rec->ExceptionCode == STATUS_ACCESS_VIOLATION)
+         {
+             static LONG vehr_n;

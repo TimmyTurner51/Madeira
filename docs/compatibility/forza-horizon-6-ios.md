@@ -297,6 +297,34 @@ above the window for every other game, which is the failure `ml1037` was written
 to avoid, so the per-game key stays the mechanism and the auto path stays
 conservative.
 
+### The next question: is the decryptor in the chain at all
+
+`[ud-decrypt]` proves the protection declined. It cannot say *why*, and the two
+possibilities need opposite work:
+
+- the protection's decryptor is not registered as a vectored handler at all —
+  a Wine/ARM64EC registration problem, ours to fix;
+- it is registered and declines deliberately — a verdict, and the remaining
+  difference is the environment, not the handler machinery.
+
+That distinction is invisible in a log by construction. A decryptor must be a
+**vectored** handler, because only a vectored handler runs before the frame-based
+walk and can resume at the faulting address. But `call_vectored_handlers`'s
+per-handler lines are `TRACE` and Madeira captures no trace channels (`rg 'trace:'`
+over a full session log returns nothing), so an empty chain prints exactly what a
+chain of declining handlers prints.
+
+`[veh-chain]` (`0006`) reports the chain length once per process, names the empty
+case explicitly rather than printing `0 handler(s)`, and then reports every
+handler's verdict with `CONTINUE_EXECUTION` called out as "decrypted, resuming".
+It walks the list under the critical section the caller already holds — taking it
+again would deadlock inside exception dispatch — bounded to 32 entries, and
+allocates nothing.
+
+If the chain is empty, the next step is Wine's `RtlAddVectoredExceptionHandler`
+path on ARM64EC. If it is populated and declining, the handler machinery is
+exonerated and the environment is the whole question.
+
 ## Conclusion
 
 Three blockers have been retired. The ARM64EC import-slot mis-route is not
