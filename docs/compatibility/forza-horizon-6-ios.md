@@ -408,6 +408,70 @@ that has needed the most repair. It does not by itself explain a declined
 verdict — the handler ran either way — but it is part of the configuration known
 to work, and this tree cannot express it.
 
+### How the game expects to be told about the `#UD`
+
+This is now the crux, and the answer is not "a vectored handler registered by name".
+
+The exe's import table contains **no** vectored-exception API at all, and the string
+`AddVectoredExceptionHandler` does not appear anywhere in the 175 MB binary (nor does
+`RtlAdd…` or `RemoveVectored…`). The only exception-registration APIs it imports are
+`SetUnhandledExceptionFilter` from `KERNEL32.dll` and `UnhandledExceptionFilter` from
+`api-ms-win-core-errorhandling-l1-1-0.dll`.
+
+Yet `[veh-chain]` found a handler inside the exe itself (`0x1453CD858`, RVA
+`0x53CD858`), so one is registered without a name — resolved by hash, as protections
+do. That handler is the `Dr7` harness and it declines, correctly.
+
+Where the walk actually went is visible in `[seh-xlate]`: for the faulting thread it
+invoked exactly two handlers, `forzahorizon6.exe+0x5eaa3b8` and then ntdll's terminal
+root. `0x5eaa3b8` disassembles to `ff 25 …` — an **import thunk**, i.e. the frame walk
+resolved the game's handler to `UnhandledExceptionFilter` and called it, and it
+declined. So the game's frame-based and unhandled-filter paths both exist and both
+said no; nothing decrypted.
+
+### What is not the cause
+
+Two plausible explanations were tested and rejected, which narrows the search:
+
+- **A fixed 5-byte stub.** `0x537099C` has a textbook MSVC prologue with an `/GS`
+  cookie load exactly 5 bytes in, which invited the theory that the trap is a constant
+  5-byte prefix the handler skips. Across all 4,538 `EA`-starting functions only
+  **one** has a recognisable prologue at `+5` (and at `+1`…`+9` the counts are 0–12 of
+  4,538). So it is encryption, not a fixed stub that can be stepped over.
+- **A failed DLL load.** The game's process window has exactly two `[dll-missing]`
+  entries, `Kerberos.dll` and `MSV1_0.dll`, both authentication-related and irrelevant
+  to the protection. The 42 `c0000135` and 16 `c000007b` failures in the session all
+  belong to Steam's webhelper and `SDL3.dll`.
+
+### The allocation shape just before death
+
+Between module load and the fault the game issues a storm of failed allocations —
+28,416 attempts, sampled into 523 log lines — of exactly one shape:
+
+```
+[alloc-fail] ml814 #28416 status=c0000018 hint=0x70512c1000 size=0x1001000 type=0x3000 protect=0x40
+                              | STAGE=fixed-map err=3
+```
+
+`type=0x3000` is `MEM_COMMIT|MEM_RESERVE`, `protect=0x40` is `PAGE_EXECUTE_READWRITE`,
+the size is 16 MB + 4 KB, and `err=3` is Mach's `KERN_INVALID_ADDRESS` at the hinted
+address. The hints step by `0x40040000`, so this is the protection probing for a free
+16 MB RWX slot. Failing a hinted `VirtualAlloc` whose address is taken is correct
+Windows behaviour, so the failures themselves are not a bug — and the probing does
+succeed twice (`0x704b2b0000`, then `0x70692d0000`).
+
+The successful one is worth noting, because it is the last thing in the log before the
+fault and this port deliberately refuses `PROT_EXEC` on it:
+
+```
+[guest-rwx] #1 0x70692d0000+0x100c000 prot=rwx — anonymous guest memory, EXEC is FEX bookkeeping; applying rw- instead
+Add SMC interval: 70692D0000 - 706A2DA000
+```
+
+That downgrade is architecturally sound here (FEX reads guest bytes and never executes
+them at the guest VA), so it is recorded as a correlation to rule out rather than
+presented as the cause.
+
 ## Conclusion
 
 Three blockers have been retired. The ARM64EC import-slot mis-route is not
