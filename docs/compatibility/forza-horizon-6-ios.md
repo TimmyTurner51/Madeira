@@ -167,25 +167,93 @@ the same Madeira session as the game and diff against the reference:
 The `diff` column is the direct test of candidate 2, and the reference values are
 `/Users/timmycraft/Library/Application Support/Cursor/AgentStores/u289638033/files/fh6_linux_conf2.txt`.
 
+## 2026-11-15 10:33 — Dock launch: the licence path works, a pool limit is next
+
+Routing the game through Madeira Dock instead of a direct spawn changed the
+picture completely. Valve's own client, running headless in the session,
+authenticated online and authorised the launch:
+
+```
+[dock-report] session-authenticated-online=1
+[dock-report] session-requested-app-entitled=1
+[dock-report] session-requested-app-listed=1
+[dock-report] session-offline-ready=1
+[dock-report] launch-request-submitted=1
+[phase] spawn:L"...\ForzaHorizon6\forzahorizon6.exe" t+ 10.639s
+```
+
+That settles candidate 1: given a real, authenticated Steam session the
+protection's prerequisites are met, and the game is started by Valve's client
+with Valve's own `LaunchApp`. The Dock's own report ends with
+`launch-client-error=46`, but that is downstream of the real failure — the
+process exited within a second of being created — not a refusal to authorise.
+
+The real failure is the pool, and it is arithmetic:
+
+```
+ml985: preferred base 0x140000000+0xb3c0000 REFUSED status=0xc0000018
+[jit-pool] EXHAUSTED (image 0x132050000+0xb3c0000): want=0xb3c0000
+           bump=0xba44000/0x20000000 tail_resv=0x11004000 freelist=0
+wine: failed to start ... c0000017
+```
+
+- The pool was **512 MB**, not the 896 MB standard: a Dock launch defaults to the
+  compact pool (`DockPerformancePolicy.compactPoolMB`), on the assumption that a
+  headless client needs less.
+- Valve's client had already spent **186 MB** (`bump=0xba44000`) of it on its own
+  image copies before the game loaded.
+- FEX's code buffers held **272 MB** (`tail_resv`).
+- The game's own image copy wants **180 MB** (`0xb3c0000`, its `SizeOfImage`),
+  because TXM cannot execute anything except from a debugger-allocated pool, so
+  the main image is copied whole.
+
+186 + 272 + 180 = 638 MB against a 512 MB pool, so the copy fails and the load
+dies with `STATUS_NO_MEMORY`. Direct-spawn runs never hit this because the game
+loaded first, into an empty 512 MB pool (`used=0xb3c4000` right after its copy).
+
+The fix is the game's own config, which wins over both the compact-pool default
+and `madeira.cfg`:
+
+```
+pool = 896
+pool-split = 1
+pool-pair = 1
+pool-low = 1
+```
+
+The pool census at launch found no single run big enough for 896 MB, but three
+usable runs — `0x1301a4000+254MB` (below the executable window),
+`0x148000000+598MB` and `0x16ddc0000+290MB`. `pool-pair` takes the two above the
+window as one split pool (≈888 MB), and `pool-low` moves FEX's code buffers to
+the run below the window so the pool above is left to image copies. Either
+mechanism alone covers the 638 MB; together there is margin.
+
+Nothing about this touches the game: it is the same exe, unmodified, launched by
+Valve's client, and the pool is Madeira's own execution substrate.
+
 ## Conclusion
 
-The remaining blocker is not an ARM64EC import slot, nor a JIT-pool fault, nor a
-lost `#UD`. The protection raises its decrypt trigger and declines it **4.5
-seconds in, before its own integrity sweep**, having done no decryption and
-having asked Steam nothing. That points at the initial licence gate.
+Two blockers have been retired by measurement rather than inference. The ARM64EC
+import-slot mis-route is not present in a current run: no `c0000005` at `pc=0`,
+and the iat-sync pass binds every slot it is asked to. And the licence gate is
+real but is now satisfied: with Valve's client authenticated in the session, the
+client itself starts the game.
 
-Candidate 1 has a supported, faithful path in this tree (`dockhost.exe`, verified
-against this prefix's exact `steamclient64.dll`) and is the next thing to
-exercise. Candidate 2 remains a divergence from Proton worth closing for
-faithfulness, but it does not touch the game's own `.text`.
+What is left is capacity, and it is the third distinct thing this session has
+uncovered: a Dock launch's compact 512 MB pool cannot hold the Steam client's
+186 MB of image copies, FEX's 272 MB of code buffers and the game's 180 MB image
+copy at once. The fix is sizing, not emulation.
+
+`[ud-decrypt]` stays in the tree because it is still the only way to tell a
+protection verdict from a later failure, and the game has not yet reached its
+first instruction in a Dock session.
 
 Nothing here requires modifying the game, and doing so is excluded: the
 protection is meant to run exactly as shipped.
 
 ## Next measurement
 
-If the licence path still declines, the decisive question is whether the game's
-handler decrypted anything before giving up. The probe to answer it is a 16-byte
-snapshot at `ExceptionAddress` taken when the `#UD` is dispatched and again when
-the handler walk finishes: changed bytes mean the protection decrypted and then
-failed on something else, unchanged bytes mean it never decrypted at all.
+With the pool raised, the first question is whether the game now reaches its
+encrypted entry and what `[ud-decrypt]` says about it — `DECRYPTED` means the
+protection accepted this environment, `BYTES UNCHANGED` means it still declined
+and the remaining difference is something other than Steam authentication.
