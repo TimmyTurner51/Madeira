@@ -1042,3 +1042,21 @@ those needles, and overlays kernel32/shell32/dxgi/d3d12/user32/dbghelp
 so import names match the hidden exports. GameConfigs `env.FEX_*`
 stays reverted. Look for `[wine-export]` unix=0 on kernel32/ntdll and
 a non-empty `[veh-add]` before the next `#UD`.
+
+## 2026-11-15 16:51 — unix gone from kernel32; still Wine staging, still 0 VEH
+
+ml1265 ntdll probe: only `xtajit64.dll` still had `wine_get_version`
+(FEX's `GetProcAddress` needle). kernel32/ntdll did not log, so the
+unix string was gone from those mapped images. The game still took the
+Wine path: 28k failed 16MB maps, then `[guest-rwx] 0x70722e0000+0x1004000`
+and an SMC interval — the same staging 14:38 used before it registered
+the Dr7 VEH. This launch jumped from staging to the encrypted `#UD` at
+`0x14537099C` with **no** `[veh-add]`. CRT UEF at `+0x5A669D0` did
+install. `nr=50` and ntdll `.data` skip/restore held.
+
+Hiding `wine_get_version` was a miss: FEX sets `IsWine` from
+`GetProcAddress(ntdll, "wine_get_version")`. ml1266 restores that export,
+keeps only unix/dos hidden, and FNV-1a's every PEB module's **export
+directory** for `0xb2dc38a8e4baecd` at iat-sync, ntdll `.data` exec, and
+empty VEH so the remaining hit names the DLL. `[veh-add] enter` logs even
+if the heap insert never happens.
