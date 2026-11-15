@@ -513,6 +513,53 @@ emulator; it does not weaken, skip or disable anything the game checks. It is th
 class of fix as the hotpatch import thunks: make the ARM64EC runtime behave the way
 native x64 Windows does.
 
+## The anti-tamper is past: `ml1253` removed the last `#UD`
+
+With the hypervisor leaves hidden, the run of 2026-11-15 11:04 behaves like a different
+game. The `#UD` (`0xc000001d`) at RVA `0x537099C` and the `c0000005` at `pc=0` are both
+**gone**: the log contains no `c0000` fault of any kind, `arm64ec_process_init` returns
+`status=0` for `pProcessInit`, `create_cross_process_work_list` and `pThreadInit`, and the
+session runs for 99 s to 24 threads with the emulator executing at IPC 3.39. The
+protection decrypted its functions, exactly as the ECB analysis predicted once the
+`FEXIFEXIEMU` signature stopped giving it a reason not to.
+
+The nine-build hunt through `[ffs-slot]`, `[veh-chain]`, `[veh-add]` and the ARM64EC
+import-slot routing was chasing a symptom. The mechanism was never a mis-routed slot —
+it was the guest refusing to decrypt.
+
+## Next blocker: the JIT pool cannot fit `libxess.dll`
+
+The process now dies for an ordinary reason, and not a crash:
+
+```
+[jit-pool] EXHAUSTED (image 0x71ea600000+0x4a3b000): want=0x4a40000 bump=0x1b768000/0x33818000
+           tail_resv=0x10000000 freelist=0
+[pool-capacity] failed_want=0x4a40000 entries=0 free_bytes=0x0 main_virgin=0x7898000 ...
+[jit-pool] L"...\libxess.dll": no JIT-pool copy for executable section .text -- the load fails
+00e8:err:module:import_dll Loading library libxess.dll (which is needed by ...forzahorizon6.exe) failed
+[Wine ntdll/server] process_exit_wrapper(-1073741515)      <- STATUS_DLL_NOT_FOUND
+```
+
+`libxess.dll` is a **static** import of the exe, so the load must succeed. It needs
+`0x4a40000` (74 MB) **contiguous**. The pool is one 824 MB span that the app splits with
+an 8 MB hole (the main thread's stack) at offsets `0x1F000000..0x1F818000`, and the head
+has already bumped to `0x1b768000`:
+
+| region | bytes |
+|---|---|
+| below the hole: `0x1F000000 - 0x1b768000` | 59 MB |
+| above the hole up to `pool_limit` (`0x23818000`) | 67 MB |
+| **largest contiguous run available** | **67 MB** |
+| **requested** | **74 MB** |
+
+So 126 MB is genuinely free and still unusable: the hole splits it into 59 + 67, and
+`pool_limit` is `jit_pool_size - ios_jit_tail_reserved` where the tail's live reservation
+is the full 256 MB cap (measured peak 112 MB). Seven megabytes short, on a span that is
+84 % committed (439 MB head + 256 MB tail of 824 MB). This is a capacity problem, not a
+correctness one, and it needs either a larger span (the geometry comes from the app's
+`WINE_IOS_JIT_RX`/`RW`/`SIZE`/`HOLE` region request) or a head that can borrow the tail's
+unused reservation.
+
 ## Conclusion
 
 Three blockers have been retired. The ARM64EC import-slot mis-route is not
