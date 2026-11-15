@@ -630,7 +630,16 @@ enum StikJITHelper {
             let singleFit = largest < vm_address_t(poolSize)
                 ? poolRunSize(available: largest, wanted: vm_address_t(poolSize), pageFit: pageFit)
                 : vm_address_t(poolSize)
-            if ["1", "on", "true", "yes"].contains(splitValue) && windowHeld && !pairOff && singleFit < vm_address_t(poolSize) {
+            // ml1263: pair even when the 0x140000000 window is not held. Occupants
+            // at 0x147d00000 / 0x148000000 skip the window reservation; the old
+            // windowHeld gate then skipped pair and first-fit a shrunk pool into
+            // the hole that swallows 0x140000000 (BAD POOL, Wine never started).
+            // Holes with base >= exeWinBase+exeWinSize are still usable (FH6
+            // 16:16: 514MB at 0x14d9b8000 + 284MB at 0x16e378000).
+            if ["1", "on", "true", "yes"].contains(splitValue) && !pairOff && singleFit < vm_address_t(poolSize) {
+                if !windowHeld {
+                    LogStore.shared.log("[pool-split] ml1263: executable window not held — pairing above 0x140000000 anyway")
+                }
                 // Where the single-region request lands: first-fit, past ml1040's plugs
                 // (holes below the placeholder, only when a hole above it fits).
                 let steered = earlyPoolBase != 0 && holes.contains { $0.base + $0.size > earlyPoolBase && $0.size >= singleFit }
@@ -686,12 +695,16 @@ enum StikJITHelper {
                     }
                 }
             }
-            if pairA == nil && largest < vm_address_t(poolSize) {
-                let fit = Int(poolRunSize(available: largest, wanted: vm_address_t(poolSize), pageFit: pageFit))
+            // ml1263: never shrink into a hole that swallows 0x140000000. The
+            // 552MB hole at 0x12547c000 was the largest on the 16:16 FH6 launch
+            // and first-fit put 544MB there (BAD POOL). Use the largest hole
+            // that does not overlap the executable window (514MB at 0x14d9b8000).
+            let largestSafe = holes.filter { !overlapsExeWindow($0.base, $0.size) }.map { $0.size }.max() ?? 0
+            if pairA == nil && largestSafe < vm_address_t(poolSize) {
+                let fit = Int(poolRunSize(available: largestSafe, wanted: vm_address_t(poolSize), pageFit: pageFit))
                 if fit >= 256 << 20 {
-                    LogStore.shared.log("ml1036: no hole fits a \(poolSize >> 20)MB pool — SHRINKING to \(fit >> 20)MB "
-                        + "(the alternative is a pool in the guest window or on top of 0x140000000, "
-                        + "both of which are fatal)", level: .error)
+                    LogStore.shared.log("ml1263: no hole above 0x140000000 fits a \(poolSize >> 20)MB pool — SHRINKING to \(fit >> 20)MB "
+                        + "(largest overall \(largest >> 20)MB swallows the executable window)", level: .error)
                     poolSize = fit
                     // ml1135: ~400MB of the pool is PE image copies, so below ~500MB FEX's
                     // code cache is starved and rolls over every few seconds in game
@@ -701,7 +714,7 @@ enum StikJITHelper {
                             + "Quit and relaunch the app for a smooth session.", level: .error)
                     }
                 } else {
-                    LogStore.shared.log("ml1036: largest hole is only \(largest >> 20)MB — cannot place a usable pool",
+                    LogStore.shared.log("ml1263: largest hole above 0x140000000 is only \(largestSafe >> 20)MB — cannot place a usable pool",
                                         level: .error)
                 }
             }
@@ -730,6 +743,21 @@ enum StikJITHelper {
                     if vm_allocate(mach_task_self_, &a, vm_size_t(h.size), 0 /* FIXED */) == KERN_SUCCESS && a == h.base {
                         plugs.append((a, vm_size_t(h.size)))
                         LogStore.shared.log(String(format: "ml1040: plugged lower hole 0x%lx+%luMB so first-fit lands above the window",
+                                                   Int(h.base), Int(h.size >> 20)))
+                    } else if a != h.base { vm_deallocate(mach_task_self_, a, vm_size_t(h.size)) }
+                }
+            }
+            // ml1263: a hole that swallows 0x140000000 is never a safe landing site,
+            // even when it is the largest and the window reservation failed. Plug it
+            // whenever a non-overlapping hole can take the (possibly shrunk) pool so
+            // first-fit cannot put 544MB at 0x12547c000 again.
+            let safeFits = holes.contains { !overlapsExeWindow($0.base, $0.size) && $0.size >= vm_address_t(poolSize) }
+            if pairA == nil && safeFits {
+                for h in holes where overlapsExeWindow(h.base, h.size) && h.size >= vm_address_t(poolSize) {
+                    var a = h.base
+                    if vm_allocate(mach_task_self_, &a, vm_size_t(h.size), 0 /* FIXED */) == KERN_SUCCESS && a == h.base {
+                        plugs.append((a, vm_size_t(h.size)))
+                        LogStore.shared.log(String(format: "ml1263: plugged window-overlapping hole 0x%lx+%luMB so first-fit lands above 0x140000000",
                                                    Int(h.base), Int(h.size >> 20)))
                     } else if a != h.base { vm_deallocate(mach_task_self_, a, vm_size_t(h.size)) }
                 }

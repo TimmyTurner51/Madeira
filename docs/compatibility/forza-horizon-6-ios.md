@@ -994,3 +994,18 @@ those statics live in. ml1262 writes the FEX hooks back through the existing
 protect, and forwards the exec notify so FEX can SMC-watch the page. A unix
 skip of that PE→pool memcpy sits in `virtual_ios.c` for the next IPA; the
 guest protect still applies either way.
+
+## 2026-11-15 16:16 — JIT pool swallowed 0x140000000; Wine never started
+
+After a full Madeira quit for ml1262, the 896MB pool did not fit. Census:
+
+`0x12547c000+552MB` (swallows `0x140000000`), `0x14d9b8000+514MB`,
+`0x16e378000+284MB`. Occupants at `0x147d00000` and `0x148000000+4MB`
+left `windowHeld=false`, so `pool-pair` was skipped. Shrink used the
+overlapping 552MB hole (544MB at `0x12547c000`, BAD POOL), then the
+guest 64G window, then "The JIT memory landed at an address Madeira
+cannot use."
+
+ml1263 pairs above `0x140000000` even when the window is not held
+(514+284MB), shrinks from the largest non-overlapping hole, and plugs
+holes that swallow the executable window so first-fit cannot land there.
