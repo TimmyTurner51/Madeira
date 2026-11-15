@@ -181,6 +181,30 @@ int main() {
            (unsigned long long)c2, (unsigned long long)s2, (unsigned long long)head);
 
     if (fails) return 1;
+
+    /* --- 6. the fix survives the requests that come after libxess -------- */
+    /* libxess is not the last large import, and every image copied after it
+     * lands above the hole too. Region C sized for one carve leaves the tail at
+     * 128 MB, which is the same reservation the earlier healthy session carried,
+     * so the whole sequence that used to succeed does so again. Assert the
+     * slack at a spread of plausible request sizes rather than only the one
+     * that failed, so a later geometry change cannot quietly take the margin
+     * that this fix depends on. */
+    struct { size_t want; const char* what; } cases[] = {
+        { 0x4a40000,  "libxess.dll (74 MB, the observed failure)" },
+        { 0x6000000,  "96 MB" },
+        { 0x8000000,  "128 MB" },
+    };
+    for (size_t i = 0; i < sizeof(cases)/sizeof(cases[0]); i++) {
+        size_t e = ios_pool_holes_head_place(head, cases[i].want, hole_off, hole_end, 0, 0) + cases[i].want;
+        if (e > limit_fix) {
+            printf("FAIL %s no longer fits: extent 0x%llx > limit 0x%llx\n",
+                   cases[i].what, (unsigned long long)e, (unsigned long long)limit_fix);
+            fails++;
+        }
+    }
+    printf("with the tail at 128 MB every request up to 128 MB still fits above the hole\n");
+
     printf("ok\n");
     return 0;
 }
