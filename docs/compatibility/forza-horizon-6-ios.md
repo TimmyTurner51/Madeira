@@ -1060,3 +1060,19 @@ keeps only unix/dos hidden, and FNV-1a's every PEB module's **export
 directory** for `0xb2dc38a8e4baecd` at iat-sync, ntdll `.data` exec, and
 empty VEH so the remaining hit names the DLL. `[veh-add] enter` logs even
 if the heap insert never happens.
+
+## 2026-11-15 17:00 — unix-hits=0; FEX xrems ntdll `.data` after the honest protect
+
+Census at iat-sync (6 mods), ntdll `.data` exec (85), and empty VEH (85):
+**unix-hits=0**. Zero `[veh-add] enter`. This is the Windows path: no
+Dr7 VEH, decrypt gadgets on ntdll `.data`. Guest
+`VirtualProtect(.data, PAGE_EXECUTE_READWRITE)` returned success, FEX
+`Add SMC interval: 71F3372000-71F3374000`, then hook restore
+`unix_ios_sync_pe_write` mprotect'd the page without EXEC and FEX
+`[iOS-xrem] via=protect` dropped the interval. Then the 16MB staging
+alloc and `#UD` at the still-encrypted `EA` prologue.
+
+ml1267 skips the post-notify restore (hooks already restored post-unix)
+so the SMC interval Denuvo armed stays. Look for Add SMC on ntdll `.data`
+**without** a following `[iOS-xrem]` of the same range, then either a
+decrypt VEH or no `#UD`.
