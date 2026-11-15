@@ -1,0 +1,3 @@
+Restore ARM64EC ntdll FEX hooks after Denuvo's honest VirtualProtect of
+ntdll .data, using unix_ios_sync_pe_write so the pool RW alias matches
+the live values. Do not skip FEX NotifyMemoryProtect on that page.

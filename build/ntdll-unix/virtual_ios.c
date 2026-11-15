@@ -36604,6 +36604,48 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
                     uintptr_t pool_offset = (uintptr_t)ios_jit_mappings[idx].jit_base
                                           - (uintptr_t)ios_jit_rx_base_global;
                     char *jit_rw_dest = (char *)ios_jit_rw_base_global + pool_offset + off;
+                    int skip_ntdll_data_exec = 0;
+                    /* DroidDeck/Android mprotects ntdll in place. iOS IAT-sync
+                     * copies the PE file (zeros for ARM64EC .data statics) over
+                     * the pool copy the ARM64 ntdll actually reads. A guest
+                     * PAGE_EXECUTE_* of that .data is Denuvo making the page
+                     * runnable — the protect itself already ran; copying file
+                     * zeros over pBeginSimulation is not what Windows does.
+                     * Skip only the PE→pool memcpy. */
+                    if ((new_prot & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                                     PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
+                    {
+                        const char *nm = ios_pe_module_name( (const void *)pe_start, pe_end - pe_start );
+                        if (nm && !strcasecmp( nm, "ntdll.dll" ))
+                        {
+                            const IMAGE_DOS_HEADER *dos = (const void *)pe_start;
+                            const IMAGE_NT_HEADERS64 *nt;
+                            const IMAGE_SECTION_HEADER *sec;
+                            size_t si, nsec, sec_off;
+                            if (dos->e_magic == IMAGE_DOS_SIGNATURE)
+                            {
+                                nt = (const void *)((const char *)pe_start + dos->e_lfanew);
+                                sec_off = dos->e_lfanew + FIELD_OFFSET( IMAGE_NT_HEADERS64, OptionalHeader )
+                                          + nt->FileHeader.SizeOfOptionalHeader;
+                                sec = (const void *)((const char *)pe_start + sec_off);
+                                nsec = nt->FileHeader.NumberOfSections;
+                                for (si = 0; si < nsec; si++)
+                                {
+                                    size_t lo = sec[si].VirtualAddress, hi = lo + sec[si].Misc.VirtualSize;
+                                    if (memcmp( sec[si].Name, ".data\0\0\0", IMAGE_SIZEOF_SHORT_NAME )) continue;
+                                    if (sec[si].Characteristics & (IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE))
+                                        continue;
+                                    if (off < lo || off >= hi) continue;
+                                    dprintf( 2, "[ntdll-data-sync] SKIP PE→pool copy of ntdll .data "
+                                             "%p+0x%lx prot=0x%x (live ARM64 statics; guest exec-protect applied)\n",
+                                             base, (unsigned long)size, (unsigned)new_prot );
+                                    skip_ntdll_data_exec = 1;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if (skip_ntdll_data_exec) break;
                     /* MADEIRA_NTDLL_DATA_SYNC_RANGE: off, never reached. */
                     if (ios_ntdll_data_sync_range_enabled())
                     {

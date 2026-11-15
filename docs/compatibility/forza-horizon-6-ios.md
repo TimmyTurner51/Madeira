@@ -978,3 +978,19 @@ NtProtect hp_target; we never reached unix protect or the save log.
 cleared: `~0xfffUL` is 32-bit on LLP64. ml1261 uses `~(ULONG_PTR)0xfff`.
 Look for `[exec-data] save n=8192 live=0000000163176000 pBeginSimulation=`
 non-NULL, then more `[ec-syscall]`.
+
+## 2026-11-15 16:08 — this is Denuvo's protect, not a failed check
+
+ml1261 save/restore logged `pBeginSimulation=0000000163595600` then the next
+`dispatch_emulation` loaded 0 from the same slot. The guest
+`VirtualProtect(ntdll .data, PAGE_EXECUTE_READWRITE)` is Denuvo making that
+page runnable, the same thing DroidDeck runs under `FEX_SMCCHECKS=full`. We
+do not skip it and we do not hide it from FEX.
+
+DroidDeck has one mapping and `mprotect`s in place, so live ARM64 ntdll
+statics survive. iOS IAT-sync copies the PE file (zeros) over the pool copy
+those statics live in. ml1262 writes the FEX hooks back through the existing
+8-byte `unix_ios_sync_pe_write` path (the loader's CHPE slot path) after the
+protect, and forwards the exec notify so FEX can SMC-watch the page. A unix
+skip of that PE→pool memcpy sits in `virtual_ios.c` for the next IPA; the
+guest protect still applies either way.
