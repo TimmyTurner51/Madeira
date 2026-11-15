@@ -1024,3 +1024,21 @@ encrypted prologue). `[veh-chain] EMPTY (0 handler(s))` — the game
 never registered a decrypt VEH. b29's IPA restored stock kernel32
 (`wine_get_unix_file_name` visible). Hide it again in the farm copies
 and the WCP overlay; look for a non-empty VEH on the next `#UD`.
+
+## 2026-11-15 16:35 — kernel32 unix hide live; still 0 VEH
+
+WCP overlay `ml1264-hide-wine-exports` was on device (`wine=0 xine=2`
+in mapped kernel32). Pool, CHPE, ntdll `.data` skip, and `nr=50` all
+held. Zero `[veh-add]` lines: `RtlAddVectoredExceptionHandler` was
+never called. The documented hash is still
+`wine_get_unix_file_name`; kernel32 was clean. Remaining Wine-only
+names on the same PEB walk: ntdll `wine_get_version` /
+`wine_get_build_id` / `wine_get_host_version`, kernel32
+`wine_get_dos_file_name`, and matching import strings in dxgi/d3d12.
+
+ml1265 rewrites every same-length pair to `xine_*` (not `wine_server_*`),
+ships unstripped ntdll with a mapped-image `[wine-export]` count of
+those needles, and overlays kernel32/shell32/dxgi/d3d12/user32/dbghelp
+so import names match the hidden exports. GameConfigs `env.FEX_*`
+stays reverted. Look for `[wine-export]` unix=0 on kernel32/ntdll and
+a non-empty `[veh-add]` before the next `#UD`.

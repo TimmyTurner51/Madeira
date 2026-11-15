@@ -8,30 +8,45 @@ exactly wine_get_unix_file_name (kernel32). Windows does not export it. Finding
 it sets a flag that skips decrypt-map setup and makes the handler return
 CONTINUE_SEARCH on the encrypted EA prologues.
 
-Same-length rewrite so RVAs, ordinals, and already-built IATs stay valid:
-  wine_get_unix_file_name -> xine_get_unix_file_name
+ntdll also exports wine_get_version / wine_get_build_id / wine_get_host_version,
+which Windows does not. Those are hashed on the same PEB walk because ntdll is
+always loaded. Same-length rewrites so RVAs, ordinals, and already-built IATs
+stay valid. wine_server_* is left alone; Wine calls those by name internally.
 
-Wine modules that import the old name (shell32) must be rewritten too, or they
-fail to bind. GetProcAddress("wine_get_unix_file_name") then returns NULL;
-madeira-d3d12 already has a fallback for that.
+GetProcAddress("wine_get_unix_file_name") then returns NULL; madeira-d3d12
+already has a fallback. wine_get_version callers (winver, winecfg, wined3d)
+already tolerate NULL.
 """
 from __future__ import annotations
 
 import sys
 
-OLD = b"wine_get_unix_file_name"
-NEW = b"xine_get_unix_file_name"
+# Longer names first so a short needle cannot rewrite inside a long one.
+PAIRS = [
+    (b"wine_get_unix_file_name", b"xine_get_unix_file_name"),
+    (b"wine_get_dos_file_name", b"xine_get_dos_file_name"),
+    (b"wine_get_host_version", b"xine_get_host_version"),
+    (b"wine_get_build_id", b"xine_get_build_id"),
+    (b"wine_get_version", b"xine_get_version"),
+]
 
-if len(OLD) != len(NEW):
-    raise SystemExit("replacement must be the same length as the original")
+for old, new in PAIRS:
+    if len(old) != len(new):
+        raise SystemExit(f"replacement length mismatch: {old!r} vs {new!r}")
 
 
 def rewrite(path: str) -> int:
     orig = open(path, "rb").read()
-    count = orig.count(OLD)
-    if count:
-        open(path, "wb").write(orig.replace(OLD, NEW))
-    return count
+    data = orig
+    total = 0
+    for old, new in PAIRS:
+        n = data.count(old)
+        if n:
+            data = data.replace(old, new)
+            total += n
+    if data != orig:
+        open(path, "wb").write(data)
+    return total
 
 
 def main(argv: list[str]) -> int:

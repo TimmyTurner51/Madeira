@@ -26,10 +26,9 @@ done
 # FH6 hashes kernel32 export names for wine_get_unix_file_name. Windows does
 # not export it; leaving the Wine name makes the game skip decrypt VEH setup.
 python3 "$ROOT/tools/wcp/hide-wine-exports.py" \
-  "$ROOT/app/Madeira/arm64ec-windows/kernel32.dll" \
-  "$ROOT/app/Madeira/arm64ec-windows/shell32.dll" \
-  "$ROOT/app/Madeira/aarch64-windows/kernel32.dll" \
-  "$ROOT/app/Madeira/aarch64-windows/shell32.dll" \
+  "$ROOT/app/Madeira/arm64ec-windows/"*.dll \
+  "$ROOT/app/Madeira/aarch64-windows/"*.dll \
+  "$ROOT/app/Madeira/i386-windows/ntdll.dll" \
   "$ROOT/app/Madeira/i386-windows/kernel32.dll" \
   "$ROOT/app/Madeira/i386-windows/shell32.dll"
 
