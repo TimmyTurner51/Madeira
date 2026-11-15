@@ -7723,34 +7723,54 @@ dispatch_guest_fault:
                                 uint64_t lr_rva = va - mod;
                                 uint64_t pool_base = (uint64_t)state.__lr - lr_rva;
                                 uint32_t *cp = (uint32_t *)(uintptr_t)state.__lr;
-                                uint32_t adrp_i = cp[-7];   /* lr-0x1c */
-                                uint32_t ldr_i  = cp[-3];   /* lr-0xc  */
-                                int is_adrp = ((adrp_i >> 24) & 0x9f) == 0x90;
-                                int is_ldr  = ((ldr_i  >> 22) & 0x3ff) == 0x3e5; /* LDR imm,64 unsigned */
-                                if (is_adrp && is_ldr)
+                                int k, found = 0;
+
+                                /* The dispatch sequence is
+                                 *   adrp Rx,page ; ldr Rt,[Rx,#off] ; blr Rt
+                                 * and the fault returns to the word after the
+                                 * blr, so the adrp is three words back and the
+                                 * ldr two. This probe was written for the
+                                 * `blr x8` shape, where they sit seven and
+                                 * three words back, and assuming one spacing
+                                 * reported "not adrp+ldr" for the other. Scan
+                                 * a small window and take the first pair whose
+                                 * base registers agree. */
+                                dprintf(STDERR_FILENO,
+                                    "[nullfp-probe] words lr-0x1c..lr: %08x %08x %08x %08x %08x %08x %08x %08x lr_rva=0x%llx mod=%s\n",
+                                    cp[-7], cp[-6], cp[-5], cp[-4], cp[-3], cp[-2], cp[-1], cp[0],
+                                    (unsigned long long)lr_rva, ios_pe_module_name(mod));
+                                for (k = 2; k <= 8 && !found; k++)
                                 {
-                                    int64_t immlo = (adrp_i >> 29) & 0x3;
-                                    int64_t immhi = (adrp_i >> 5) & 0x7ffff;
-                                    int64_t imm = (immhi << 2) | immlo;
+                                    uint32_t adrp_i = cp[-k];
+                                    uint32_t ldr_i = cp[-(k - 1)];
+                                    int64_t immlo, immhi, imm;
+                                    uint64_t adrp_pc, page, off, g_pool, g_rva;
+                                    if (((adrp_i >> 24) & 0x9f) != 0x90) continue;
+                                    if (((ldr_i >> 22) & 0x3ff) != 0x3e5) continue; /* LDR imm,64 unsigned */
+                                    if ((adrp_i & 0x1f) != ((ldr_i >> 5) & 0x1f)) continue; /* Rd != Rn */
+                                    found = 1;
+                                    immlo = (adrp_i >> 29) & 0x3;
+                                    immhi = (adrp_i >> 5) & 0x7ffff;
+                                    imm = (immhi << 2) | immlo;
                                     if (imm & (1LL << 20)) imm |= ~((1LL << 21) - 1);
-                                    uint64_t adrp_pc = (uint64_t)state.__lr - 0x1c;
-                                    uint64_t page = (adrp_pc & ~0xfffULL) + ((uint64_t)imm << 12);
-                                    uint64_t off  = (uint64_t)((ldr_i >> 10) & 0xfff) << 3;
-                                    uint64_t g_pool = page + off;
-                                    uint64_t g_rva  = g_pool - pool_base;
-                                    uint64_t gv_pool = exc_peek64(g_pool);
-                                    uint64_t gv_pe   = exc_peek64(mod + g_rva);
+                                    adrp_pc = (uint64_t)state.__lr - 4ull * (unsigned)k;
+                                    page = (adrp_pc & ~0xfffULL) + ((uint64_t)imm << 12);
+                                    off  = (uint64_t)((ldr_i >> 10) & 0xfff) << 3;
+                                    g_pool = page + off;
+                                    g_rva  = g_pool - pool_base;
                                     dprintf(STDERR_FILENO,
-                                        "[nullfp-probe] tgt-global rva=0x%llx pool[0x%llx]=0x%llx PE[0x%llx]=0x%llx mod=%s lr_rva=0x%llx\n",
+                                        "[nullfp-probe] tgt-global rva=0x%llx pool[0x%llx]=0x%llx PE[0x%llx]=0x%llx mod=%s lr_rva=0x%llx adrp@lr-0x%x\n",
                                         (unsigned long long)g_rva,
-                                        (unsigned long long)g_pool, (unsigned long long)gv_pool,
-                                        (unsigned long long)(mod + g_rva), (unsigned long long)gv_pe,
-                                        ios_pe_module_name(mod), (unsigned long long)lr_rva);
+                                        (unsigned long long)g_pool,
+                                        (unsigned long long)exc_peek64(g_pool),
+                                        (unsigned long long)(mod + g_rva),
+                                        (unsigned long long)exc_peek64(mod + g_rva),
+                                        ios_pe_module_name(mod), (unsigned long long)lr_rva, 4u * (unsigned)k);
                                 }
-                                else
+                                if (!found)
                                     dprintf(STDERR_FILENO,
-                                        "[nullfp-probe] caller not adrp+ldr: adrp_i=0x%08x ldr_i=0x%08x lr_rva=0x%llx mod=%s\n",
-                                        adrp_i, ldr_i, (unsigned long long)(va - mod), ios_pe_module_name(mod));
+                                        "[nullfp-probe] no adrp+ldr pair in lr-0x20..lr, mod=%s lr_rva=0x%llx\n",
+                                        ios_pe_module_name(mod), (unsigned long long)lr_rva);
                             }
                         }
                         /* fp-chain backtrace of the faulting thread — names
