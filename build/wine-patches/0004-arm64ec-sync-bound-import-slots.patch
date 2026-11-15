@@ -1,104 +1,150 @@
-From b838dc06ef732d5ea074f38dcddaa35727b5435a Mon Sep 17 00:00:00 2001
+From 580615171ed573239c22cc17bdb951a71749fdb5 Mon Sep 17 00:00:00 2001
 From: Madeira <madeira@example.invalid>
-Date: Sun, 15 Nov 2026 01:33:14 -0600
-Subject: [PATCH] ntdll: report the GetCommandLineA slot rva and its PE value
+Date: Sun, 15 Nov 2026 01:38:03 -0600
+Subject: [PATCH] ntdll: sync hotpatched import thunks into the pool copy
 
-The unix-side [x9-probe] computes the slot address as x9+14+rel and
-reported 0x153a96e80 (rva 0x46e80) for the kernel32 thunk that ucrtbase's
-exit uses, but that thunk's own `ff 25` displacement encodes rva 0x50650
-(pool 0x153aa0650). Both cannot be the same slot, and the difference decides
-whether the pool copy really kept 0xcc after the sync or the probe simply
-read the wrong address.
+ExitToX64 decodes the import thunk at x9, and x9 is a pool address because the
+guest executes the pool copy. On kernel32+0x35a70 the pool copy's rel32 reads
+0x11402, landing on rva 0x46e80 -- the gap between .hexpthk and .rdata,
+uninitialised, so it reads as 0xcc. The file's rel32 is 0x1abd2, landing on
+0x50650, which is really GetCommandLineA's IAT slot (checked against the
+built kernel32.dll). The decoded thunk therefore names nothing, while the
+slot the loader bound lives elsewhere.
 
-Capture the name match on every slot rather than only on the resolve path,
-which never triggers here because nothing is unbound, and print the slot's
-rva together with the value the PE view holds. That is the PE-side truth the
-probe can be compared against.
+ExitToX64 already works around this (ml1209) by re-deriving the slot from the
+PE copy, but falls back to the pool-derived slot when that read looks
+unbound, and the fallback is the 0xcc address.
+
+Repair the data instead: scan each hybrid module's executable sections for the
+10-byte prologue build/wine-patches/0001 installs, and push each thunk's
+4-byte rel32 from the PE view into the pool copy through the same unix call
+0004 uses. size 4 selects the byte-copy branch, not the pointer branch -- a
+rel32 is a displacement, and translating it as an address would repeat the
+0xcc mistake in another form. Only a full prologue match writes, and it writes
+the value the PE view already holds, so a false positive is a no-op.
 
 Signed-off-by: Madeira <madeira@example.invalid>
 Co-authored-by: Cursor <cursoragent@cursor.com>
 ---
  dlls/ntdll/loader.c         |  2 +-
- dlls/ntdll/signal_arm64ec.c | 32 ++++++++++++++++++++++++--------
- 2 files changed, 25 insertions(+), 9 deletions(-)
+ dlls/ntdll/signal_arm64ec.c | 84 ++++++++++++++++++++++++++++++++++---
+ 2 files changed, 80 insertions(+), 6 deletions(-)
 
 diff --git a/dlls/ntdll/loader.c b/dlls/ntdll/loader.c
-index 1e678b6a..e97737fc 100644
+index e97737fc..69482fc7 100644
 --- a/dlls/ntdll/loader.c
 +++ b/dlls/ntdll/loader.c
 @@ -5809,7 +5809,7 @@ void loader_init( CONTEXT *context, void **entry )
          ERR( "loader_init: [iOS] early locale_init done (casemap wired before arm64ec module)\n" );
          /* The suffix identifies THIS ntdll: the deployed PE can be shadowed by
           * the app bundle's copy, and a bare line cannot tell them apart. */
--        ERR( "loader_init: calling load_arm64ec_module [ntdll ml1227 iat-sync v3]\n" );
-+        ERR( "loader_init: calling load_arm64ec_module [ntdll ml1228 iat-sync v4]\n" );
+-        ERR( "loader_init: calling load_arm64ec_module [ntdll ml1228 iat-sync v4]\n" );
++        ERR( "loader_init: calling load_arm64ec_module [ntdll ml1229 iat-sync v5]\n" );
          load_arm64ec_module();
          ERR( "loader_init: load_arm64ec_module returned, calling update_load_config\n" );
          update_load_config( wm->ldr.DllBase );
 diff --git a/dlls/ntdll/signal_arm64ec.c b/dlls/ntdll/signal_arm64ec.c
-index 04416099..1f10c4dc 100644
+index 1f10c4dc..5112f6ca 100644
 --- a/dlls/ntdll/signal_arm64ec.c
 +++ b/dlls/ntdll/signal_arm64ec.c
-@@ -1211,7 +1211,7 @@ ULONG arm64ec_sync_bound_iat_slots(void)
-         IMAGE_IMPORT_DESCRIPTOR *desc;
-         ULONG mslots = 0, msynced = 0, munbound = 0, mfiller = 0, size;
-         int have_gcla = 0;
--        ULONG_PTR gcla = 0;
-+        ULONG_PTR gcla = 0, gcla_rva = 0;
+@@ -1183,6 +1183,74 @@ static HMODULE find_loaded_module_ansi( const char *name )
+  * for explicitly rather than by size. */
+ #define IAT_TRAP_FILLER 0xccccccccccccccccULL
  
-         if (!module) continue;
-         /* Only hybrid images care: a pure x64 importer must keep the x64
-@@ -1238,6 +1238,26 @@ ULONG arm64ec_sync_bound_iat_slots(void)
-                 void *proc;
- 
-                 mslots++;
-+                /* Record the GetCommandLineA slot whatever happens to it.
-+                 * The unix-side [x9-probe] that reads this slot from the pool
-+                 * computes its address as x9+14+rel and reported 0x153a96e80
-+                 * (rva 0x46e80) for a thunk whose own `ff 25` displacement
-+                 * encodes rva 0x50650 (pool 0x153aa0650). Two different slots
-+                 * cannot both be right, so log the PE-side truth here: the
-+                 * slot's rva and the value the PE view holds. Comparing that
-+                 * against the probe tells us whether the pool really kept
-+                 * 0xcc, or whether the probe read somewhere else entirely. */
-+                if (!IMAGE_SNAP_BY_ORDINAL( ilt->u1.Ordinal ))
-+                {
-+                    IMAGE_IMPORT_BY_NAME *gn =
-+                        get_rva( module, (DWORD)ilt->u1.AddressOfData );
-+                    if (!strcmp( (const char *)gn->Name, "GetCommandLineA" ))
-+                    {
-+                        have_gcla = 1;
-+                        gcla = (ULONG_PTR)iat->u1.Function;
-+                        gcla_rva = (ULONG_PTR)iat - (ULONG_PTR)module;
-+                    }
-+                }
-                 /* Is the PE view bound? A bound slot holds a VA, and every VA
-                  * in this process is above 4 GB: PE images load near
-                  * 0x71fe..., the JIT pool near 0x153..., FEX's arena at
-@@ -1290,11 +1310,6 @@ ULONG arm64ec_sync_bound_iat_slots(void)
-                     if (!proc) continue;
-                     if ((pmeta = arm64ec_get_module_metadata( provider )))
-                         proc = arm64ec_redirect_ptr( provider, proc, pmeta );
--                    if (!strcmp( (const char *)by_name->Name, "GetCommandLineA" ))
--                    {
--                        have_gcla = 1;
--                        gcla = (ULONG_PTR)proc;
--                    }
-                     {
-                         void *base = iat;
-                         SIZE_T range = sizeof(void *);
-@@ -1330,8 +1345,9 @@ ULONG arm64ec_sync_bound_iat_slots(void)
-              (unsigned long)(mslots - munbound - mfiller), (unsigned long)munbound,
-              (unsigned long)mfiller, (unsigned long)msynced );
++/*******************************************************************
++ *         sync_hotpatched_thunks
++ *
++ * Make the POOL copy of every hotpatched import thunk agree with the file.
++ *
++ * build/wine-patches/0001 gives each x64 import thunk the hotpatch prologue
++ * Forza's anti-tamper inspects:
++ *
++ *     48 8d a4 24 00 00 00 00   lea rsp,[rsp+0]
++ *     ff 25 <rel32>             jmp *__imp_x(%rip)
++ *
++ * ExitToX64 decodes exactly this shape from the address in x9, and x9 is a POOL
++ * address because that is the copy the guest executes. On kernel32+0x35a70 the
++ * pool copy's rel32 reads 0x11402, which lands on rva 0x46e80 -- the gap
++ * between .hexpthk (0x40000+0x1cc0) and .rdata (0x50000), uninitialised, so it
++ * reads as 0xcc filler. The FILE's rel32 is 0x1abd2, landing on rva 0x50650,
++ * which really is GetCommandLineA's IAT slot (verified against the built
++ * kernel32.dll: bytes `48 8d a4 24 00 00 00 00 ff 25 d2 ab 01 00`).
++ *
++ * So the thunk the guest decodes points at nothing, while the slot the loader
++ * bound sits somewhere else entirely. ExitToX64's ml1209 workaround re-derives
++ * the slot from the PE copy and falls back to the pool-derived slot when that
++ * read looks unbound -- and the fallback is the 0xcc address. Repairing the
++ * data removes the disagreement instead of teaching every consumer about it.
++ *
++ * Only the 4-byte rel32 is written, only with the value the PE view already
++ * holds, and only where the full 10-byte prologue matched, so a false positive
++ * writes back the bytes that were already there. */
++static ULONG sync_hotpatched_thunks( void *module, ULONG *found )
++{
++    const IMAGE_NT_HEADERS *nt = RtlImageNtHeader( module );
++    const IMAGE_SECTION_HEADER *sec = IMAGE_FIRST_SECTION( nt );
++    ULONG i, hits = 0, synced = 0;
++
++    for (i = 0; i < nt->FileHeader.NumberOfSections; i++, sec++)
++    {
++        const BYTE *p = get_rva( module, sec->VirtualAddress );
++        const BYTE *end = p + sec->Misc.VirtualSize;
++
++        if (!(sec->Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
++        for (; p + 14 <= end; p++)
++        {
++            struct ios_sync_pe_write_params params;
++
++            if (p[0] != 0x48 || p[1] != 0x8d || p[2] != 0xa4 || p[3] != 0x24) continue;
++            if (p[4] || p[5] || p[6] || p[7]) continue;
++            if (p[8] != 0xff || p[9] != 0x25) continue;
++
++            hits++;
++            params.address = (void *)(p + 10);
++            params.size = sizeof(ULONG);
++            params.synced = 0;
++            if (__wine_unixlib_handle)
++            {
++                /* size 4 takes unixcall_ios_sync_pe_write's byte-copy branch
++                 * (ios_jit_sync_write), not the pointer branch: a rel32 is an
++                 * integer displacement, and translating it as a VA would be
++                 * the same class of mistake as the 0xcc boundness test. */
++                WINE_UNIX_CALL( unix_ios_sync_pe_write, &params );
++                if (params.synced) synced++;
++            }
++            p += 13;  /* past this thunk's rel32 */
++        }
++    }
++    *found += hits;
++    return synced;
++}
++
+ ULONG arm64ec_sync_bound_iat_slots(void)
+ {
+     PEB *peb = RtlGetCurrentPeb();
+@@ -1339,11 +1407,17 @@ ULONG arm64ec_sync_bound_iat_slots(void)
+         bound += mslots - munbound - mfiller;
+         synced += msynced;
+         filler += mfiller;
+-        ERR( "[iat-sync] %s: %lu slot(s), %lu already bound, %lu unbound, "
+-             "%lu trap filler, %lu synced to pool\n",
+-             debugstr_w( entry->BaseDllName.Buffer ), (unsigned long)mslots,
+-             (unsigned long)(mslots - munbound - mfiller), (unsigned long)munbound,
+-             (unsigned long)mfiller, (unsigned long)msynced );
++        {
++            ULONG thunks = 0;
++            ULONG tsynced = sync_hotpatched_thunks( module, &thunks );
++            ERR( "[iat-sync] %s: %lu slot(s), %lu already bound, %lu unbound, "
++                 "%lu trap filler, %lu synced to pool; hotpatched thunks %lu found, "
++                 "%lu rel32 synced\n",
++                 debugstr_w( entry->BaseDllName.Buffer ), (unsigned long)mslots,
++                 (unsigned long)(mslots - munbound - mfiller), (unsigned long)munbound,
++                 (unsigned long)mfiller, (unsigned long)msynced,
++                 (unsigned long)thunks, (unsigned long)tsynced );
++        }
          if (have_gcla)
--            ERR( "[iat-sync]   %s GetCommandLineA -> %p\n",
--                 debugstr_w( entry->BaseDllName.Buffer ), (void *)gcla );
-+            ERR( "[iat-sync]   %s GetCommandLineA slot rva=%lx pe-value=%p\n",
-+                 debugstr_w( entry->BaseDllName.Buffer ),
-+                 (unsigned long)gcla_rva, (void *)gcla );
-     }
- 
-     ERR( "[iat-sync] done: %lu hybrid module(s), %lu slot(s), %lu bound, "
+             ERR( "[iat-sync]   %s GetCommandLineA slot rva=%lx pe-value=%p\n",
+                  debugstr_w( entry->BaseDllName.Buffer ),
 -- 
 2.54.0 (Apple Git-156)
 
