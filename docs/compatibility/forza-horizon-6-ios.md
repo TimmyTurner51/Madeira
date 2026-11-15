@@ -853,3 +853,25 @@ Two things are now cheap and decisive, and both are in the build that is compili
   caller), and `UnhandledExceptionFilter`'s verdict: `BeingDebugged`, `top_filter`, and
   what the filter returned. The unhandled filter is the other chain a decryptor could
   register on, and nothing has ever looked at it.
+
+## 2026-11-15 14:34 — the handler is the game's, and Dr7 is the next lever
+
+Build 28 with the decoded `[veh-add]` (ml1254 ntdll in the bundle, stock kernelbase
+after a WCP overlay of ARM64EC kernelbase onto system32 killed wineboot in 0.8s
+with `c000007b`).
+
+```
+[veh-add] ml1254 #1 func=00000001453CD858 module=0000000140000000 L"forzahorizon6.exe" order=first
+[veh-chain] handler 00000001453CD858 -> 0 (CONTINUE_SEARCH)
+[ud-decrypt] BYTES UNCHANGED (eae96be61448897c)
+```
+
+That is the body at RVA `0x53D9270`: it matches `STATUS_SINGLE_STEP` /
+`STATUS_BREAKPOINT` (the xor constants decode to `0x80000004` / `0x80000003`),
+copies `Dr0`-`Dr3` out of the exception CONTEXT, and for a `#UD` only continues
+if `Dr7` is set. Wine's ARM64EC path memsets the x64 CONTEXT and drops
+`CONTEXT_AMD64_DEBUG_REGISTERS`, so `Dr7` is 0 and the handler declines.
+
+ml1256 stores `Dr0`-`Dr7` in the per-thread cpu-area blob and writes them back
+after every ARM→x64 conversion (Set/GetContext, NtContinue, exception
+dispatch). Pushed as ntdll in the bundle only.

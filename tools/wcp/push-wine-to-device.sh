@@ -134,6 +134,11 @@ for dll in "${DLLS[@]}"; do
 done
 echo "       $DEST"
 
+if [ "${#REMOTE_DLLS[@]}" -eq 0 ]; then
+    echo "no prefix links (bundle copies only); state.json unchanged"
+    exit 0
+fi
+
 python3 - "$TMP/state.json" "$ID" "$NAME" "${REMOTE_DLLS[@]}" <<'PY'
 import hashlib, json, sys, time
 

@@ -1,0 +1,250 @@
+--- a/dlls/ntdll/signal_arm64ec.c
++++ b/dlls/ntdll/signal_arm64ec.c
+@@ -135,6 +135,23 @@ struct ec_thread_state
+ {
+     struct ec_stack_window win;
+     int root_used;          /* ml633: terminal root frame accepted once per walk */
++    /* iOS-Madeira ml1256: software x64 debug registers.
++     *
++     * context_arm_to_x64() memsets the x64 CONTEXT, so Dr0-Dr7 are always 0
++     * in every GetThreadContext and every exception the guest VEH sees.
++     * ARM64 unix Set/GetContext FIXMEs CONTEXT_DEBUG_REGISTERS, and
++     * ctx_flags_x64_to_arm() drops the AMD64 debug bit, so a SetThreadContext
++     * of Dr7 never lands anywhere.
++     *
++     * Forza Horizon 6's only vectored handler (forzahorizon6.exe+0x53CD858)
++     * matches STATUS_SINGLE_STEP / STATUS_BREAKPOINT, copies Dr0-Dr3 out of
++     * the exception CONTEXT, and for a #UD only continues if Dr7 is set.
++     * With Dr7 stuck at 0 it always CONTINUE_SEARCHes and the enciphered
++     * prologue at RVA 0x537099C stays EA. Store them here (the same
++     * per-thread blob as the unwind window) and put them back after every
++     * ARM->x64 conversion. */
++    DWORD64 dr0, dr1, dr2, dr3, dr6, dr7;
++    ULONG   dr_valid;
+ };
+ static struct ec_thread_state ec_state_fallback;
+ static inline struct ec_thread_state *ec_state( void )
+@@ -149,6 +166,47 @@ static inline struct ec_thread_state *ec_state( void )
+ #define ec_win          (ec_state()->win)
+ #define ml633_root_used (ec_state()->root_used)
+ 
++static int x64_debug_is_self( HANDLE handle )
++{
++    return handle == NtCurrentThread() || handle == (HANDLE)(LONG_PTR)-2;
++}
++
++static void x64_debug_save( const ARM64EC_NT_CONTEXT *ec )
++{
++    struct ec_thread_state *s;
++    static LONG n;
++
++    if (!ec || !(ec->ContextFlags & CONTEXT_AMD64_DEBUG_REGISTERS)) return;
++    s = ec_state();
++    s->dr0 = ec->AMD64_Dr0;
++    s->dr1 = ec->AMD64_Dr1;
++    s->dr2 = ec->AMD64_Dr2;
++    s->dr3 = ec->AMD64_Dr3;
++    s->dr6 = ec->AMD64_Dr6;
++    s->dr7 = ec->AMD64_Dr7;
++    s->dr_valid = 1;
++    if (InterlockedIncrement( &n ) <= 24)
++        ERR( "[x64-dr] ml1256 SET dr0=%p dr1=%p dr2=%p dr3=%p dr6=%p dr7=%p\n",
++             (void *)(ULONG_PTR)s->dr0, (void *)(ULONG_PTR)s->dr1,
++             (void *)(ULONG_PTR)s->dr2, (void *)(ULONG_PTR)s->dr3,
++             (void *)(ULONG_PTR)s->dr6, (void *)(ULONG_PTR)s->dr7 );
++}
++
++static void x64_debug_load( ARM64EC_NT_CONTEXT *ec )
++{
++    struct ec_thread_state *s;
++
++    if (!ec) return;
++    s = ec_state();
++    ec->AMD64_Dr0 = s->dr0;
++    ec->AMD64_Dr1 = s->dr1;
++    ec->AMD64_Dr2 = s->dr2;
++    ec->AMD64_Dr3 = s->dr3;
++    ec->AMD64_Dr6 = s->dr6;
++    ec->AMD64_Dr7 = s->dr7;
++    ec->ContextFlags |= CONTEXT_AMD64_DEBUG_REGISTERS;
++}
++
+ static void ec_stack_window_begin( ULONG_PTR rsp )
+ {
+     MEMORY_BASIC_INFORMATION mbi;
+@@ -1803,6 +1861,7 @@ NTSTATUS SYSCALL_API NtContinue( CONTEXT *context, BOOLEAN alertable )
+ {
+     ARM64_NT_CONTEXT arm_ctx;
+ 
++    x64_debug_save( (const ARM64EC_NT_CONTEXT *)context );
+     context_x64_to_arm( &arm_ctx, (ARM64EC_NT_CONTEXT *)context );
+     return syscall_NtContinue( &arm_ctx, alertable );
+ }
+@@ -1811,6 +1870,7 @@ NTSTATUS SYSCALL_API NtContinueEx( CONTEXT *context, KCONTINUE_ARGUMENT *args )
+ {
+     ARM64_NT_CONTEXT arm_ctx;
+ 
++    x64_debug_save( (const ARM64EC_NT_CONTEXT *)context );
+     context_x64_to_arm( &arm_ctx, (ARM64EC_NT_CONTEXT *)context );
+     return syscall_NtContinueEx( &arm_ctx, args );
+ }
+@@ -2243,10 +2303,20 @@ NTSTATUS SYSCALL_API NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_
+ 
+ NTSTATUS SYSCALL_API NtGetContextThread( HANDLE handle, CONTEXT *context )
+ {
+-    ARM64_NT_CONTEXT arm_ctx = { .ContextFlags = ctx_flags_x64_to_arm( context->ContextFlags ) };
++    ARM64EC_NT_CONTEXT *ec = (ARM64EC_NT_CONTEXT *)context;
++    ULONG want = ec->ContextFlags;
++    ARM64_NT_CONTEXT arm_ctx = { .ContextFlags = ctx_flags_x64_to_arm( want ) };
+     NTSTATUS status = syscall_NtGetContextThread( handle, &arm_ctx );
+ 
+-    if (!status) context_arm_to_x64( (ARM64EC_NT_CONTEXT *)context, &arm_ctx );
++    if (!status)
++    {
++        context_arm_to_x64( ec, &arm_ctx );
++        /* ml1256: restore the x64 debug registers memset wiped. Other-thread
++         * GetContext still cannot see the target's DRs (those live in that
++         * thread's cpu-area); the VEH that declined the #UD reads its own. */
++        if (x64_debug_is_self( handle ) && (want & CONTEXT_AMD64_DEBUG_REGISTERS))
++            x64_debug_load( ec );
++    }
+ 
+     /* ml715: WHAT THE CALLER ACTUALLY RECEIVES.
+      *
+@@ -2732,6 +2802,14 @@ NTSTATUS SYSCALL_API NtSetContextThread( HANDLE handle, const CONTEXT *context )
+ {
+     ARM64_NT_CONTEXT arm_ctx;
+ 
++    if (x64_debug_is_self( handle ))
++        x64_debug_save( (const ARM64EC_NT_CONTEXT *)context );
++    else if ( ((const ARM64EC_NT_CONTEXT *)context)->ContextFlags & CONTEXT_AMD64_DEBUG_REGISTERS )
++    {
++        static LONG n;
++        if (InterlockedIncrement( &n ) <= 8)
++            ERR( "[x64-dr] ml1256 SET other-thread handle=%p ignored (no per-target store yet)\n", handle );
++    }
+     context_x64_to_arm( &arm_ctx, (ARM64EC_NT_CONTEXT *)context );
+     return syscall_NtSetContextThread( handle, &arm_ctx );
+ }
+@@ -3312,6 +3390,75 @@ static void ios_fatal_probe( const CONTEXT *ctx )
+ }
+ 
+ static void ios_tlswatch_pe_arm( const char *where );
++
++/* iOS-Madeira ml1250: DOES THE PROTECTION DECRYPT BEFORE IT GIVES UP?
++ *
++ * A protected title can carry per-function encrypted prologues whose first
++ * byte is not a valid 64-bit instruction. On a working machine the title's own
++ * exception handler decrypts that function in place and returns
++ * ExceptionContinueExecution. Here the handler is reached and then returns
++ * ExceptionContinueSearch, and Wine unwinds to the unhandled filter.
++ *
++ * Two very different causes look identical in a log: the protection decided not
++ * to decrypt at all (a licence/tamper verdict), or it decrypted and something
++ * else then failed. The bytes at the faulting address separate them, and they
++ * are the only evidence that does: snapshot them at dispatch, and read them
++ * again when a handler declines.
++ *
++ * Reads go through NtReadVirtualMemory, which returns a status instead of
++ * faulting, and this runs inside exception dispatch, so it allocates nothing,
++ * takes no lock and recurses into nothing. */
++static ULONG_PTR ml1250_ud_addr;
++static BYTE ml1250_ud_before[16];
++static LONG ml1250_ud_armed, ml1250_ud_reports;
++
++static void ml1250_ud_snapshot( EXCEPTION_RECORD *rec )
++{
++    SIZE_T got = 0;
++
++    ml1250_ud_armed = 0;
++    ml1250_ud_addr = 0;
++    if (!rec || rec->ExceptionCode != STATUS_ILLEGAL_INSTRUCTION || !rec->ExceptionAddress) return;
++    if (!NT_SUCCESS( NtReadVirtualMemory( NtCurrentProcess(), rec->ExceptionAddress,
++                                          ml1250_ud_before, sizeof(ml1250_ud_before), &got ) )
++        || got != sizeof(ml1250_ud_before)) return;
++    ml1250_ud_addr = (ULONG_PTR)rec->ExceptionAddress;
++    ml1250_ud_armed = 1;
++}
++
++static void ml1250_ud_report( const char *where )
++{
++    BYTE after[16];
++    SIZE_T got = 0;
++    int i, same = 1;
++
++    if (!ml1250_ud_armed) return;
++    ml1250_ud_armed = 0;
++    if (InterlockedIncrement( &ml1250_ud_reports ) > 16) return;
++    if (!NT_SUCCESS( NtReadVirtualMemory( NtCurrentProcess(), (void *)ml1250_ud_addr,
++                                          after, sizeof(after), &got ) )
++        || got != sizeof(after))
++    {
++        ERR( "[ud-decrypt] %s at %p: unreadable afterwards, undecidable\n",
++             where, (void *)ml1250_ud_addr );
++        return;
++    }
++    for (i = 0; i < (int)sizeof(after); i++) if (after[i] != ml1250_ud_before[i]) same = 0;
++    if (same)
++        ERR( "[ud-decrypt] %s at %p: BYTES UNCHANGED (%02x%02x%02x%02x%02x%02x%02x%02x) "
++             "-- the protection never decrypted this function\n",
++             where, (void *)ml1250_ud_addr, ml1250_ud_before[0], ml1250_ud_before[1],
++             ml1250_ud_before[2], ml1250_ud_before[3], ml1250_ud_before[4],
++             ml1250_ud_before[5], ml1250_ud_before[6], ml1250_ud_before[7] );
++    else
++        ERR( "[ud-decrypt] %s at %p: DECRYPTED (%02x%02x%02x%02x%02x%02x%02x%02x -> "
++             "%02x%02x%02x%02x%02x%02x%02x%02x) -- the handler wrote plaintext and still declined\n",
++             where, (void *)ml1250_ud_addr, ml1250_ud_before[0], ml1250_ud_before[1],
++             ml1250_ud_before[2], ml1250_ud_before[3], ml1250_ud_before[4],
++             ml1250_ud_before[5], ml1250_ud_before[6], ml1250_ud_before[7],
++             after[0], after[1], after[2], after[3], after[4], after[5], after[6], after[7] );
++}
++
+ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
+ {
+     if (rec && rec->ExceptionCode == 0x406D1388) ios_tlswatch_pe_arm( "call_seh_handlers entry" );
+@@ -3521,6 +3668,13 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
+         }
+     }
+ 
++    /* ml1250: before the walk, keep the bytes the #UD was raised on. The
++     * handlers are the only thing that could decrypt them, and whether they
++     * changed is the one fact that separates "never decrypted" (a verdict
++     * against us) from "decrypted and still gave up". Independent of the
++     * ml811 probe above, which is itself recursion-guarded. */
++    ml1250_ud_snapshot( rec );
++
+     context.AMD64_Context = *orig_context;
+     context.ContextFlags &= ~0x40; /* Clear xstate flag. */
+ 
+@@ -3918,6 +4072,7 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
+                 if (rec->ExceptionFlags & EXCEPTION_NONCONTINUABLE) return STATUS_NONCONTINUABLE_EXCEPTION;
+                 return STATUS_SUCCESS;
+             case ExceptionContinueSearch:
++                ml1250_ud_report( "EC handler declined" );
+                 break;
+             case ExceptionNestedException:
+                 rec->ExceptionFlags |= EXCEPTION_NESTED_CALL;
+@@ -3947,6 +4102,7 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
+                 if (rec->ExceptionFlags & EXCEPTION_NONCONTINUABLE) return STATUS_NONCONTINUABLE_EXCEPTION;
+                 return STATUS_SUCCESS;
+             case ExceptionContinueSearch:
++                ml1250_ud_report( "TEB handler declined" );
+                 break;
+             case ExceptionNestedException:
+                 rec->ExceptionFlags |= EXCEPTION_NESTED_CALL;
+@@ -4010,6 +4166,15 @@ static void * __attribute__((used)) prepare_exception_arm64ec( EXCEPTION_RECORD
+ {
+     if (rec->ExceptionCode == STATUS_EMULATION_SYSCALL) dispatch_syscall( arm_ctx );
+     context_arm_to_x64( context, arm_ctx );
++    x64_debug_load( context );
++    if (rec->ExceptionCode == STATUS_ILLEGAL_INSTRUCTION)
++    {
++        static LONG dr_n;
++        if (InterlockedIncrement( &dr_n ) <= 8)
++            ERR( "[x64-dr] ml1256 EXC #UD rip=%p dr0=%p dr7=%p valid=%u\n",
++                 rec->ExceptionAddress, (void *)(ULONG_PTR)context->AMD64_Dr0,
++                 (void *)(ULONG_PTR)context->AMD64_Dr7, ec_state()->dr_valid );
++    }
+     /* iOS-Madeira task#34 probe: FEX's LogMan output is invisible on iOS (its
+      * write(2) resolves to the PE CRT's WriteFile → unplumbed std handle),
+      * so trace the guest-exception conversion from the wine side. Rate-
