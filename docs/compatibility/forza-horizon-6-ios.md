@@ -875,3 +875,37 @@ if `Dr7` is set. Wine's ARM64EC path memsets the x64 CONTEXT and drops
 ml1256 stores `Dr0`-`Dr7` in the per-thread cpu-area blob and writes them back
 after every ARM→x64 conversion (Set/GetContext, NtContinue, exception
 dispatch). Pushed as ntdll in the bundle only.
+
+## 2026-11-15 14:38 — Dr7 was never armed; the decline is a Wine export fingerprint
+
+ml1256 was live. 25 `[x64-dr] SET` lines, every one all-zero: those were
+`NtContinue` of a context we ourselves had tagged `CONTEXT_AMD64_DEBUG_REGISTERS`
+after filling zeros. The `#UD` at `0x14537099C` still had `dr7=0 valid=1`. The
+VEH declined, `BYTES UNCHANGED`. Staging still succeeded (`[guest-rwx]
+0x70702e0000+0x1004000`, SMC interval set). No other-thread SET.
+
+So missing `Dr7` is not why this `#UD` is declined. The same handler body at
+`0x1453D9270` is more than a debug-register harness:
+
+1. Exception-code xor `0xf58ad36680ab1cf9` then `*2` matches
+   `STATUS_SINGLE_STEP` (`0xeb15a6cc015639fa`), `STATUS_BREAKPOINT`
+   (`0xeb15a6cc015639f4`), `STATUS_PRIVILEGED_INSTRUCTION`
+   (`0xeb15a6cc815638de`, RIP word `0x6cf3`), and `#UD`
+   (`0xeb15a6cc815639c8`).
+2. For `#UD` it first looks for `UD2` (`0F 0B`) at RIP and skips two bytes.
+   Encrypted entries begin with `EA`, so that path is not taken.
+3. The `EA` path needs a decrypt-map pointer. If that global is null, it
+   returns `CONTINUE_SEARCH`. That is the 14:38 verdict.
+4. First-time init calls `0x1453E2A50`, which FNV-1a's every loaded module's
+   export names (offset `0x811c9dc5`, prime `0x1000193`, ASCII folded) looking
+   for `0xb2dc38a8e4baecd`. That value is exactly `wine_get_unix_file_name` in
+   kernel32. Windows does not export it. Finding it sets the flag that skips
+   the Windows-only gadget/map setup (`jne 0x1453cb01b`).
+
+Dr7 only feeds the `#UD` path when that flag is 0. On Wine it is 1, so Dr7 is
+ignored. Hiding the named export (same-length rewrite to
+`xine_get_unix_file_name` in kernel32 and in shell32's import of it, via
+`tools/wcp/hide-wine-exports.py`) makes the PEB walk see what Windows has.
+That is not decrypting their functions; it is not advertising a non-Windows
+API. `[uef]` kernelbase is on sysx64 for the same launch, so the unhandled
+filter chain is logged if the flag change is not enough.

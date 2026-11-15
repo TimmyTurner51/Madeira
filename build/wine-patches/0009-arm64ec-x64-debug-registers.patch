@@ -1,3 +1,5 @@
+diff --git a/dlls/ntdll/signal_arm64ec.c b/dlls/ntdll/signal_arm64ec.c
+index 3942332e..22dd5830 100644
 --- a/dlls/ntdll/signal_arm64ec.c
 +++ b/dlls/ntdll/signal_arm64ec.c
 @@ -135,6 +135,23 @@ struct ec_thread_state
@@ -24,7 +26,7 @@
  };
  static struct ec_thread_state ec_state_fallback;
  static inline struct ec_thread_state *ec_state( void )
-@@ -149,6 +166,47 @@ static inline struct ec_thread_state *ec_state( void )
+@@ -149,6 +166,54 @@ static inline struct ec_thread_state *ec_state( void )
  #define ec_win          (ec_state()->win)
  #define ml633_root_used (ec_state()->root_used)
  
@@ -39,6 +41,13 @@
 +    static LONG n;
 +
 +    if (!ec || !(ec->ContextFlags & CONTEXT_AMD64_DEBUG_REGISTERS)) return;
++    /* The 14:38 run: 24 SETs, every one all-zero. Those were NtContinue of a
++     * context we ourselves had tagged CONTEXT_AMD64_DEBUG_REGISTERS after
++     * filling zeros. They drowned any real guest write and set dr_valid with
++     * nothing in it. Only store a context that actually names a breakpoint. */
++    if (!ec->AMD64_Dr0 && !ec->AMD64_Dr1 && !ec->AMD64_Dr2 && !ec->AMD64_Dr3 &&
++        !ec->AMD64_Dr7)
++        return;
 +    s = ec_state();
 +    s->dr0 = ec->AMD64_Dr0;
 +    s->dr1 = ec->AMD64_Dr1;
@@ -72,7 +81,7 @@
  static void ec_stack_window_begin( ULONG_PTR rsp )
  {
      MEMORY_BASIC_INFORMATION mbi;
-@@ -1803,6 +1861,7 @@ NTSTATUS SYSCALL_API NtContinue( CONTEXT *context, BOOLEAN alertable )
+@@ -1803,6 +1868,7 @@ NTSTATUS SYSCALL_API NtContinue( CONTEXT *context, BOOLEAN alertable )
  {
      ARM64_NT_CONTEXT arm_ctx;
  
@@ -80,7 +89,7 @@
      context_x64_to_arm( &arm_ctx, (ARM64EC_NT_CONTEXT *)context );
      return syscall_NtContinue( &arm_ctx, alertable );
  }
-@@ -1811,6 +1870,7 @@ NTSTATUS SYSCALL_API NtContinueEx( CONTEXT *context, KCONTINUE_ARGUMENT *args )
+@@ -1811,6 +1877,7 @@ NTSTATUS SYSCALL_API NtContinueEx( CONTEXT *context, KCONTINUE_ARGUMENT *args )
  {
      ARM64_NT_CONTEXT arm_ctx;
  
@@ -88,7 +97,7 @@
      context_x64_to_arm( &arm_ctx, (ARM64EC_NT_CONTEXT *)context );
      return syscall_NtContinueEx( &arm_ctx, args );
  }
-@@ -2243,10 +2303,20 @@ NTSTATUS SYSCALL_API NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_
+@@ -2243,10 +2310,20 @@ NTSTATUS SYSCALL_API NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_
  
  NTSTATUS SYSCALL_API NtGetContextThread( HANDLE handle, CONTEXT *context )
  {
@@ -111,7 +120,7 @@
  
      /* ml715: WHAT THE CALLER ACTUALLY RECEIVES.
       *
-@@ -2732,6 +2802,14 @@ NTSTATUS SYSCALL_API NtSetContextThread( HANDLE handle, const CONTEXT *context )
+@@ -2732,6 +2809,14 @@ NTSTATUS SYSCALL_API NtSetContextThread( HANDLE handle, const CONTEXT *context )
  {
      ARM64_NT_CONTEXT arm_ctx;
  
@@ -126,7 +135,7 @@
      context_x64_to_arm( &arm_ctx, (ARM64EC_NT_CONTEXT *)context );
      return syscall_NtSetContextThread( handle, &arm_ctx );
  }
-@@ -3312,6 +3390,75 @@ static void ios_fatal_probe( const CONTEXT *ctx )
+@@ -3312,6 +3397,75 @@ static void ios_fatal_probe( const CONTEXT *ctx )
  }
  
  static void ios_tlswatch_pe_arm( const char *where );
@@ -202,7 +211,7 @@
  NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
  {
      if (rec && rec->ExceptionCode == 0x406D1388) ios_tlswatch_pe_arm( "call_seh_handlers entry" );
-@@ -3521,6 +3668,13 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
+@@ -3521,6 +3675,13 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
          }
      }
  
@@ -216,7 +225,7 @@
      context.AMD64_Context = *orig_context;
      context.ContextFlags &= ~0x40; /* Clear xstate flag. */
  
-@@ -3918,6 +4072,7 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
+@@ -3918,6 +4079,7 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
                  if (rec->ExceptionFlags & EXCEPTION_NONCONTINUABLE) return STATUS_NONCONTINUABLE_EXCEPTION;
                  return STATUS_SUCCESS;
              case ExceptionContinueSearch:
@@ -224,7 +233,7 @@
                  break;
              case ExceptionNestedException:
                  rec->ExceptionFlags |= EXCEPTION_NESTED_CALL;
-@@ -3947,6 +4102,7 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
+@@ -3947,6 +4109,7 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
                  if (rec->ExceptionFlags & EXCEPTION_NONCONTINUABLE) return STATUS_NONCONTINUABLE_EXCEPTION;
                  return STATUS_SUCCESS;
              case ExceptionContinueSearch:
@@ -232,11 +241,17 @@
                  break;
              case ExceptionNestedException:
                  rec->ExceptionFlags |= EXCEPTION_NESTED_CALL;
-@@ -4010,6 +4166,15 @@ static void * __attribute__((used)) prepare_exception_arm64ec( EXCEPTION_RECORD
+@@ -4010,6 +4173,21 @@ static void * __attribute__((used)) prepare_exception_arm64ec( EXCEPTION_RECORD
  {
      if (rec->ExceptionCode == STATUS_EMULATION_SYSCALL) dispatch_syscall( arm_ctx );
      context_arm_to_x64( context, arm_ctx );
 +    x64_debug_load( context );
++    /* Do not mark CONTEXT_AMD64_DEBUG_REGISTERS on a context that still has
++     * zero DRs: NtContinue would then save zeros and we would believe the
++     * guest armed them (14:38, 24 false SETs, valid=1, dr7=0). */
++    if (!context->AMD64_Dr7 && !context->AMD64_Dr0 && !context->AMD64_Dr1 &&
++        !context->AMD64_Dr2 && !context->AMD64_Dr3)
++        context->ContextFlags &= ~CONTEXT_AMD64_DEBUG_REGISTERS;
 +    if (rec->ExceptionCode == STATUS_ILLEGAL_INSTRUCTION)
 +    {
 +        static LONG dr_n;

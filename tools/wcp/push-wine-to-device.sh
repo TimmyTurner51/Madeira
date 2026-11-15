@@ -94,23 +94,30 @@ ROOT="$MAD/Components/$ID"
 DEST="$ROOT/files/arm64ec-windows"
 REMOTE_DLLS=()
 
-for dll in "${DLLS[@]}"; do
-    base="$(basename "$dll")"
-    lower="$(printf '%s' "$dll" | tr '[:upper:]' '[:lower:]')"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+HIDE="$SCRIPT_DIR/hide-wine-exports.py"
+
+for src in "${DLLS[@]}"; do
+    base="$(basename "$src")"
+    lower="$(printf '%s' "$src" | tr '[:upper:]' '[:lower:]')"
     case "/$lower/" in
         */i386-windows/*|*/i386-unix/*)  token='${syswow64}' ;;
         */aarch64-windows/*|*/arm64-windows/*) token='${aarch64}' ;;
+        */arm64ec-windows/*) token='${sysx64}' ;;
         *) token='${system32}' ;;
     esac
     # 2026-11-15: a ${system32} overlay of ARM64EC kernelbase made ARM64
     # wineboot load it as kernel32's import (c000007b, session died in 0.8s).
     # system32 is the first search path for every process, including the 0xaa64
-    # host. ARM64EC copies of the boot DLLs belong in sysx64 (the EC farm);
-    # ntdll is loaded from the bundle, so it needs no prefix link at all.
+    # host. ARM64EC copies belong in sysx64 (the EC farm); ntdll is loaded
+    # from the bundle, so it needs no prefix link at all.
     case "$(printf '%s' "$base" | tr '[:upper:]' '[:lower:]')" in
         ntdll.dll) token="" ;;
         kernelbase.dll|kernel32.dll) token='${sysx64}' ;;
     esac
+    dll="$TMP/$base"
+    cp "$src" "$dll"
+    python3 "$HIDE" "$dll" >/dev/null
     # ntdll: skip the prefix link entirely (empty token).
     if [ -z "$token" ]; then
         if iosdev app-put "$dll" "Documents/Applications/com.willfaust.madeora.app/arm64ec-windows/$base" >/dev/null 2>&1; then
