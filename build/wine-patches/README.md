@@ -19,6 +19,18 @@ The patches change build output only: 0001 has `winebuild` rewrite the thunk
 bytes as it installs each builtin, and 0002 is compiled into the ARM64EC ntdll.
 Rebuild the PE modules after changing either.
 
+**Deploying ntdll is not enough on its own.** On device, the `ntdll.dll` that
+runs is the one in the LiveContainer app bundle
+(`Documents/Applications/com.willfaust.madeora.app/arm64ec-windows/ntdll.dll`),
+not the `${system32}/ntdll.dll` link the Wine component creates: the bundle copy
+shadows the prefix link. Through the whole 2026-11-15 session every `ntdll` and
+`xtajit64` push went to the prefix and had no effect, so builds 24..34 all
+crashed identically -- the patched code never executed. Both
+`tools/wcp/push-wine-to-device.sh` and `push-fex-to-device.sh` now write the
+bundle copy as well; confirm a run picked the new DLL by the
+`[ntdll ml1xxx iat-sync vN]` suffix on `loader_init: calling
+load_arm64ec_module`, which a stale bundle cannot print.
+
 A Forza Horizon 6 run against a farm that still had bare `jmp *__imp_x` thunks
 died deterministically with `0xC000001D` at `forzahorizon6.exe+0x537099C`: the
 anti-tamper read its own imports as hooked, set its tampered flag, and then

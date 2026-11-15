@@ -1,13 +1,38 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From ee695c8fd197f2709088a3acb5a6d80bc18df6de Mon Sep 17 00:00:00 2001
 From: Madeira <madeira@example.invalid>
-Date: Sun, 15 Nov 2026 01:09:00 -0600
+Date: Sun, 15 Nov 2026 01:17:23 -0600
 Subject: [PATCH] ntdll: sync bound import slots into the pool copy before the
  DllMain walk
 
+ucrtbase's DllMain exits to x64 to call kernelbase!GetCommandLineA through
+kernel32's import thunk (x9 = kernel32 + 0x35a70). ExitToX64 follows that
+thunk's `ff 25` into the IAT slot of the pool copy -- the mapping the guest
+actually executes. loader.c binds imports by storing through a PE VA, so the
+pool slot still held 0xcccccccccccccccc filler: no target, fall through to
+enter_jit, `ldr x16,[cpu_area,#0x40]; br x16` with DispatcherLoopTopEnterEC
+still NULL because FEX's ProcessInit/ThreadInit only run after this walk.
+That branch to 0 is the pc=0 of builds 24..34.
+
+Walk the load list before process_attach: sync already-bound slots into the
+pool with unix_ios_sync_pe_write, and resolve still-unbound ones from the
+provider's export directory (RtlFindExportedRoutineByName, then
+arm64ec_redirect_ptr) so DllMain never sees filler.
+
+Also mark the loader_init banner and the function entry unconditionally. The
+first build emitted nothing, which read as "never ran" but was equally
+consistent with an early LdrData bail; the banner now also identifies this
+ntdll, because on device the app bundle's copy can shadow the deployed one.
+
 Signed-off-by: Madeira <madeira@example.invalid>
+Co-authored-by: Cursor <cursoragent@cursor.com>
 ---
+ dlls/ntdll/loader.c         |  13 +-
+ dlls/ntdll/ntdll_misc.h     |   3 +
+ dlls/ntdll/signal_arm64ec.c | 264 ++++++++++++++++++++++++++++++++++--
+ 3 files changed, 269 insertions(+), 11 deletions(-)
+
 diff --git a/dlls/ntdll/loader.c b/dlls/ntdll/loader.c
-index f9f412be..9a1b08d1 100644
+index f9f412be..b68c0017 100644
 --- a/dlls/ntdll/loader.c
 +++ b/dlls/ntdll/loader.c
 @@ -5461,8 +5461,13 @@ static void load_arm64ec_module(void)
@@ -26,6 +51,17 @@ index f9f412be..9a1b08d1 100644
          ERR( "process_attach for %s (root+deps) failed, status %lx\n", debugstr_w(module), status );
          NtTerminateProcess( GetCurrentProcess(), status );
      }
+@@ -5802,7 +5807,9 @@ void loader_init( CONTEXT *context, void **entry )
+          * actctx available so the activeCodePage manifest still applies. */
+         locale_init();
+         ERR( "loader_init: [iOS] early locale_init done (casemap wired before arm64ec module)\n" );
+-        ERR( "loader_init: calling load_arm64ec_module\n" );
++        /* The suffix identifies THIS ntdll: the deployed PE can be shadowed by
++         * the app bundle's copy, and a bare line cannot tell them apart. */
++        ERR( "loader_init: calling load_arm64ec_module [ntdll ml1226 iat-sync v2]\n" );
+         load_arm64ec_module();
+         ERR( "loader_init: load_arm64ec_module returned, calling update_load_config\n" );
+         update_load_config( wm->ldr.DllBase );
 diff --git a/dlls/ntdll/ntdll_misc.h b/dlls/ntdll/ntdll_misc.h
 index 5199cc9d..4261f155 100644
 --- a/dlls/ntdll/ntdll_misc.h
@@ -41,7 +77,7 @@ index 5199cc9d..4261f155 100644
  extern NTSTATUS arm64ec_process_init( HMODULE module );
  extern NTSTATUS arm64ec_thread_init(void);
 diff --git a/dlls/ntdll/signal_arm64ec.c b/dlls/ntdll/signal_arm64ec.c
-index d5647738..fbd5a19c 100644
+index d5647738..05f58c60 100644
 --- a/dlls/ntdll/signal_arm64ec.c
 +++ b/dlls/ntdll/signal_arm64ec.c
 @@ -984,8 +984,14 @@ IMAGE_ARM64EC_METADATA *arm64ec_get_module_metadata( HMODULE module )
@@ -134,7 +170,7 @@ index d5647738..fbd5a19c 100644
  #define SET_FUNC(func,val) update_hybrid_pointer( module, sec, metadata->func, val )
              SET_FUNC( __os_arm64x_dispatch_call, arm64x_check_call );
              SET_FUNC( __os_arm64x_dispatch_call_no_redirect, __os_arm64x_dispatch_call_no_redirect );
-@@ -1076,6 +1117,203 @@ void arm64ec_update_hybrid_metadata( void *module, IMAGE_NT_HEADERS *nt,
+@@ -1076,6 +1117,213 @@ void arm64ec_update_hybrid_metadata( void *module, IMAGE_NT_HEADERS *nt,
  }
  
  
@@ -205,7 +241,17 @@ index d5647738..fbd5a19c 100644
 +    LIST_ENTRY *link;
 +    ULONG modules = 0, slots = 0, bound = 0, synced = 0, rebound = 0;
 +
-+    if (!peb->LdrData) return 0;
++    /* Unconditional entry marker. ml1225 emitted nothing at all and that was
++     * ambiguous: "the function never ran" and "it returned at the ldr NULL
++     * check" look identical from the log. */
++    ERR( "[iat-sync] enter: ldr=%p unix=%p\n",
++         peb->LdrData, __wine_unixlib_handle );
++
++    if (!peb->LdrData)
++    {
++        ERR( "[iat-sync] no LdrData yet, nothing to sync\n" );
++        return 0;
++    }
 +
 +    for (link = peb->LdrData->InLoadOrderModuleList.Flink;
 +         link != &peb->LdrData->InLoadOrderModuleList; link = link->Flink)
@@ -339,4 +385,5 @@ index d5647738..fbd5a19c 100644
   *         syscalls
   */
 -- 
-2.51.0
+2.54.0 (Apple Git-156)
+

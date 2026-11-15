@@ -47,6 +47,20 @@ PY
 
 REMOTE="$MAD/Components/$ID/files/lib/wine/aarch64-windows/libarm64ecfex.dll"
 iosdev app-put "$DLL" "$REMOTE" >/dev/null
+
+# The component link is NOT what the session loads. Wine resolves xtajit64.dll
+# out of the app bundle's own arm64ec-windows folder, and the bundle's copy
+# shadows the ${system32}/xtajit64.dll link that WineProcessBridge.m creates
+# over the prefix. A component pushed without this second copy is a no-op: on
+# 2026-11-15 five FEX pushes in a row all resolved to the old bundle DLL, and
+# the crash stayed byte-identical because none of the patched code ever ran.
+BUNDLE="Documents/Applications/com.willfaust.madeora.app/arm64ec-windows/xtajit64.dll"
+if iosdev app-put "$DLL" "$BUNDLE" >/dev/null 2>&1; then
+    echo "bundle $BUNDLE  (this is the copy the session loads)"
+else
+    echo "bundle copy SKIPPED -- $BUNDLE is missing, so the component link is the" >&2
+    echo "       only path; verify it is really the one loaded before trusting a run" >&2
+fi
 echo "dll    $(shasum -a 256 "$DLL" | cut -c1-64)"
 echo "       $REMOTE"
 

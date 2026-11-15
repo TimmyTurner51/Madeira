@@ -11,7 +11,14 @@
 # This is the Wine-side twin of push-fex-to-device.sh, for the other half of the
 # Forza fix surface: a .wcp can replace any PE module in the prefix, so a fix
 # that lives in a Windows DLL (ucrtbase, kernel32, d3d9, vkd3d, dxgi, ...) ships
-# as a component and leaves the app bundle alone.
+# as a component.
+#
+# Modules Wine resolves out of the app bundle -- ntdll, xtajit64 -- are the
+# exception. The prefix link WineProcessBridge.m makes over them is shadowed by
+# the bundle's own arm64ec-windows copy, so this script writes those two into
+# the bundle as well. Without that second copy the run is a no-op: on
+# 2026-11-15 five pushes resolved to a months-old ntdll/xtajit64 and the crash
+# stayed byte-identical because none of the patched code ever executed.
 #
 # It can NOT replace the iOS unix layer (build/ntdll-unix/*.c: virtual_ios.c,
 # signal_arm64_ios.c, loader_ios.c). That is compiled into the app binary
@@ -98,6 +105,15 @@ for dll in "${DLLS[@]}"; do
     iosdev app-put "$dll" "$DEST/$base" >/dev/null
     REMOTE_DLLS+=("$base|$token")
     printf '%-34s %s  -> %s/%s\n' "$base" "$(shasum -a 256 "$dll" | cut -c1-16)" "$token" "$base"
+
+    # The ${system32} link is shadowed for the modules Wine takes from the app
+    # bundle (ntdll, xtajit64): the bundle's own arm64ec-windows copy wins, so
+    # a component written only into the prefix changes nothing at runtime. Write
+    # the bundle copy too. Best effort -- a normal install has no writable
+    # bundle, and then the component link is all there is.
+    if iosdev app-put "$dll" "Documents/Applications/com.willfaust.madeora.app/arm64ec-windows/$base" >/dev/null 2>&1; then
+        printf '%-34s %s  -> app bundle arm64ec-windows/%s (the copy that loads)\n' '' 'bundle' "$base"
+    fi
 done
 echo "       $DEST"
 
