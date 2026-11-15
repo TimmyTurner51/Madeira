@@ -780,6 +780,30 @@ struct LibraryEntry: Codable, Identifiable {
 
     /// Runs on the launch worker, before the JIT pool is taken.
     func applyEnvironment() {
+        // WCPComponents ml1254: an enabled component's `environment` map is the
+        // preset the package ships with, so it is exported FIRST -- before this
+        // game's own choices below, before madeira.cfg's env lines and before the
+        // game's config lines, all of which therefore still win.
+        //
+        // It has to be the first statement, ahead of configureLaunch(), because
+        // that function RETURNS EARLY for a Steam game started through Madeira
+        // Dock -- which is exactly the case a FEX preset package is installed
+        // for. Written after it, the preset would be exported for every launch
+        // except the one that needs it.
+        //
+        // A FEX package's keys are only read once, when FEX starts, and the
+        // process environment is the only place it looks, so a component that is
+        // installed but not exported is indistinguishable from one that was never
+        // installed -- which is what the 2026-11-15 11:17 run showed: FEX ran
+        // under its own defaults (SMCChecks=mtrack, hypervisor bit set,
+        // 0x40000000 answering FEXIFEXIEMU) while the package said otherwise.
+        let componentEnvironment = WCPComponentsModel.shared.launchEnvironment
+        for entry in componentEnvironment { setenv(entry.name, entry.value, 1) }
+        if !componentEnvironment.isEmpty {
+            LogStore.shared.log("[wcp-env] " + componentEnvironment.map { "\($0.name)=\($0.value)" }.joined(separator: " "))
+        } else {
+            LogStore.shared.log("[wcp-env] no enabled component exports an environment")
+        }
         configureLaunch()
         // MADEIRA_ARGS now holds an Epic game's sign-in code; nothing else needs it.
         Self.setTransientArguments(nil, for: id)
@@ -789,7 +813,16 @@ struct LibraryEntry: Codable, Identifiable {
         switch x87Precision {
         case .reduced: setenv("FEX_X87REDUCEDPRECISION", "1", 1)
         case .full: setenv("FEX_X87REDUCEDPRECISION", "0", 1)
-        case .automatic: unsetenv("FEX_X87REDUCEDPRECISION")   // madeira.cfg's line, if any, comes later (WineProcessBridge per_launch)
+        case .automatic:
+            // "Automatic" means "leave the baseline alone", and with a component
+            // installed the baseline is the component's own value -- unsetting
+            // here would delete a key the package deliberately set. Without one,
+            // unset as before, so a previous game's choice never survives.
+            if componentEnvironment.contains(where: { $0.name == "FEX_X87REDUCEDPRECISION" }) {
+                LogStore.shared.log("[wcp-env] FEX_X87REDUCEDPRECISION kept at the component's value")
+            } else {
+                unsetenv("FEX_X87REDUCEDPRECISION")   // madeira.cfg's line, if any, comes later (WineProcessBridge per_launch)
+            }
         }
         // Exported only when chosen: unset keeps the engine's own default (and any
         // madeira.cfg setting), as before these choices existed.

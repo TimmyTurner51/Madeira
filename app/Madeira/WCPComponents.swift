@@ -896,6 +896,31 @@ final class WCPComponentsModel: ObservableObject {
     var environmentCount: Int {
         components.filter(\.enabled).reduce(0) { $0 + $1.environment.count }
     }
+
+    /// The environment every enabled component asks for (WCPComponents ml1254).
+    ///
+    /// A `.wcp` carries an `environment` map for the same reason DroidDeck's
+    /// packages do: the component *is* the preset. A FEX package needs
+    /// `FEX_SMCCHECKS=full`, `FEX_HIDEHYPERVISORBIT=1` and the rest of the set to
+    /// be in the process environment before FEX reads its configuration, and the
+    /// package itself only carries files. Until this existed the map was dead
+    /// data -- it reached no `setenv` at all, only the count on the settings row
+    /// -- so an installed FH6 FEX component ran under FEX's own defaults
+    /// (`SMCChecks=mtrack`, hypervisor bit set, `0x40000000` answering
+    /// `FEXIFEXIEMU`) while the package said otherwise. The launch log is the
+    /// proof it was never exported: no `[madeira-env]` line for any of the keys.
+    ///
+    /// Ordered by id so two runs merge the same way, and so a later-id package
+    /// deterministically wins a key two of them set. Everything here is a
+    /// baseline: this game's own choices and its config lines are written after
+    /// it and win, which is the rule the DroidDeck preset documents.
+    var launchEnvironment: [(name: String, value: String)] {
+        var merged: [String: String] = [:]
+        for component in components.filter(\.enabled).sorted(by: { $0.id < $1.id }) {
+            for (name, value) in component.environment { merged[name] = value }
+        }
+        return merged.sorted { $0.key < $1.key }.map { (name: $0.key, value: $0.value) }
+    }
 }
 
 // MARK: - Settings › Windows components
