@@ -23,6 +23,16 @@ for path in "${required[@]}"; do
   [[ -f "$path" ]] || { echo "ERROR: required build artifact missing: $path" >&2; exit 1; }
 done
 
+# FH6 hashes kernel32 export names for wine_get_unix_file_name. Windows does
+# not export it; leaving the Wine name makes the game skip decrypt VEH setup.
+python3 "$ROOT/tools/wcp/hide-wine-exports.py" \
+  "$ROOT/app/Madeira/arm64ec-windows/kernel32.dll" \
+  "$ROOT/app/Madeira/arm64ec-windows/shell32.dll" \
+  "$ROOT/app/Madeira/aarch64-windows/kernel32.dll" \
+  "$ROOT/app/Madeira/aarch64-windows/shell32.dll" \
+  "$ROOT/app/Madeira/i386-windows/kernel32.dll" \
+  "$ROOT/app/Madeira/i386-windows/shell32.dll"
+
 python3 "$ROOT/tools/build/runtime-components.py" verify all
 
 rm -rf "$DERIVED" "$DIST/Payload"

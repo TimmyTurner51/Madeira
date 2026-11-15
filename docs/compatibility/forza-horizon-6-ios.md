@@ -1009,3 +1009,18 @@ cannot use."
 ml1263 pairs above `0x140000000` even when the window is not held
 (514+284MB), shrinks from the largest non-overlapping hole, and plugs
 holes that swallow the executable window so first-fit cannot land there.
+
+## 2026-11-15 16:27 — pool + ntdll `.data` held; `#UD` with empty VEH
+
+b29 placed an 800MB pair at `0x14c000000+544MB` / `0x16f500000+256MB`,
+`windowHeld=true`. FH6 loaded at `0x140000000`. Child CHPE
+`dispatch_call rva=d0b90 pe=00000001630FB2C4`. Twelve raw syscalls
+including `nr=50`. Guest `VirtualProtect` of ntdll `.data` RWX:
+`[ntdll-data-sync] SKIP PE→pool copy` and
+`restore pBeginSimulation=0000000163595600` both sides.
+
+Then `#UD` at `forzahorizon6.exe+0x537099c` (`ea e9 6b e6…`, the
+encrypted prologue). `[veh-chain] EMPTY (0 handler(s))` — the game
+never registered a decrypt VEH. b29's IPA restored stock kernel32
+(`wine_get_unix_file_name` visible). Hide it again in the farm copies
+and the WCP overlay; look for a non-empty VEH on the next `#UD`.
