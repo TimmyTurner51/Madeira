@@ -1134,3 +1134,27 @@ ml1268: `DECLSPEC_NOINLINE` plus a local `n = 21` so the loop cannot run
 away. Unstripped ntdll overlay. Look for `restore via=post-unix … n=21`,
 Add SMC on `71F3372000-71F3374000` without `[iOS-xrem] via=protect`, then
 either a decrypt VEH or no `#UD`.
+
+## 2026-11-15 17:20 — restore bounded; SMC still xrem'd; empty VEH `#UD`
+
+ml1268 held: `restore via=post-unix … n=21`, unix-hits=0, libxess loaded,
+`[ntdll-data-sync] SKIP`, `skip post-notify restore`. Then in order:
+
+```
+[exec-req] #2 addr=71F3372000 size=2000 new_prot=40 -> status=00000000
+Add SMC interval: 71F3372000 - 71F3374000
+skip post-notify restore (keeps FEX SMC)
+[iOS-xrem] via=protect … 0x71f3372000-0x71f3374000
+```
+
+ml1267's skipped second restore was not the xrem. The 16 MB staging scan
+then succeeded (`[jit-pool] anon RWX 0x706f2d0000`, Add SMC
+`706F2D0000-70702E0000`), `[veh-chain] EMPTY`, `#UD` at
+`forzahorizon6.exe+0x537099c` (`ea e9 6b e6…`), `exit_code=0xc000001d`.
+
+ml1269 (FEX): a non-exec protect notify of a small range that is already
+an RWX/SMC interval does not drop that interval. Host mprotect without
+EXEC is the dual-map, not the guest dropping execute. Look for
+`[iOS-xrem] SUPPRESSED SMC keep` on `71F3372000-71F3374000`, build-id
+`rev=ml1269`, then either gadgets on ntdll `.data` or a decrypt VEH
+before the next `#UD`.
