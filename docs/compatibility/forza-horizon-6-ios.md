@@ -1197,3 +1197,42 @@ the still-encrypted `EA` prologue. `[iOS-prot] protect … prot=0x4` names
 who restated the page as PAGE_READWRITE after the honest RWX. Do not
 re-add GameConfigs `env.FEX_*`. Do not strip ntdll. Do not hide
 `wine_get_version`.
+
+## 2026-11-15 17:51 — ml1270 loaded; Query reports 0x80; gadgets never compiled
+
+ml1270 loaded (`rev=ml1270 compiled Nov 15 2026 17:43:11`). Restore `n=21`,
+unix-hits=0, SMC keep held, JIT pair 831 MB / peak 543 MB. In order:
+
+```
+[exec-req] #2 addr=71F3372000 size=2000 new_prot=40 -> status=00000000
+Add SMC interval: 71F3372000 - 71F3374000
+query via=ntdll-data-exec Protect=80 AllocProtect=80  (PAGE_EXECUTE_WRITECOPY)
+bytes pe= pool= 16×00 at +0
+[iOS-xrem] SUPPRESSED SMC keep … notify_prot=0x4
+(~28k 16MB alloc-fails)
+[guest-rwx] #1 0x70712e0000+0x1004000
+Invalid instruction … 14537099C  bytes=ea e9 6b e6…
+[veh-chain] EMPTY
+census via=empty-veh   (no exec-data dump — ios_fex_hooks_pe was NULL)
+NtTerminateProcess exit_code=0xc000001d
+```
+
+Zero `[ios-smc-fetch]`: guest RIP never entered `0x71F3372xxx`, so the
+pool-fetch alias never engaged. Dual-map fetch remains correct for when
+they do JMP; it was not this launch's blocker.
+
+Wine `get_vprot_flags(PAGE_EXECUTE_READWRITE, image)` stores
+`VPROT_EXEC|READ|WRITECOPY`, so `NtQueryVirtualMemory` reports `0x80`
+even after a successful guest `VirtualProtect(..., 0x40)`. Windows after
+that protect reports `PAGE_EXECUTE_READWRITE` (`0x40`). The empty-veh dump
+pointer lives in the same 8KB (`ios_fex_hooks_pe` rva `0xd3f00`) Denuvo
+writes, so the post-write dump did not run.
+
+ml1271 (PE ntdll): `NtQueryVirtualMemory` remaps that honestly
+exec-protected ntdll `.data` page from `0x80`/`0x08` to `0x40`, matching
+Windows. Dump pointers live next to `ios_fex_arena_*` (first `.data`
+page, outside the 8KB). Look for `query-win32 … Protect=80->40`, empty-veh
+bytes at `+0` / `+ea0` that are not 16×00, then `[ios-smc-fetch]` of
+`71F3372…` or a decrypt VEH before the next `#UD`. Do not re-add
+GameConfigs `env.FEX_*`. Do not strip ntdll. Do not hide
+`wine_get_version`.

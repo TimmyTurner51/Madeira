@@ -16009,6 +16009,10 @@ static NTSTATUS get_vprot_flags( DWORD protect, unsigned int *vprot, BOOL image 
         *vprot = VPROT_EXEC | VPROT_READ;
         break;
     case PAGE_EXECUTE_READWRITE:
+        /* Image WRITECOPY here makes NtQueryVirtualMemory report 0x80
+         * (PAGE_EXECUTE_WRITECOPY). Windows after VirtualProtect(RWX) reports
+         * 0x40. PE ntdll remaps Denuvo's ntdll .data page (ml1271). A unix
+         * VPROT_WRITE here needs an IPA. */
         if (image)
             *vprot = VPROT_EXEC | VPROT_READ | VPROT_WRITECOPY;
         else
