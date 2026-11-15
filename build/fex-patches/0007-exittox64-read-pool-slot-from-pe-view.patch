@@ -1,7 +1,24 @@
 diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
-index 73ee54eda..992de0793 100644
+index 73ee54eda..f217dd732 100644
 --- a/FEXCore/Source/Interface/Core/Core.cpp
 +++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -1353,14 +1353,14 @@ extern "C" uint64_t IosCbEntryLog[8];
+ extern "C" uint64_t IosJitReverseTranslate(uint64_t Addr);
+ /* iOS-Madeira ml316: ExitToX64's FFS-bypass counters, defined in Module.cpp and written by
+  * the bypass asm in Module.S. Reported below the same way as [cb-entry]. */
+-extern "C" uint64_t IosFfsBypassLog[12];
++extern "C" uint64_t IosFfsBypassLog[16];
+ #else
+ /* The WOW64 module (libwow64fex.dll) is a plain aarch64 PE with no Module.S, no EC entry thunks
+  * and no FFS bypass, so the last two symbols above do not exist in its link. Zeroed storage and an
+  * identity translation: the FFS reporter below compares against counters nothing increments, and
+  * the module has no PE-image-to-pool alias table (its guest images are mapped normally). */
+ extern "C" uint64_t IosCbEntryLog[8];
+-static uint64_t IosFfsBypassLog[12] {};
++static uint64_t IosFfsBypassLog[16] {};
+ static inline uint64_t IosJitReverseTranslate(uint64_t Addr) {
+   return Addr;
+ }
 @@ -1575,6 +1575,20 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
      }
    }
@@ -24,7 +41,7 @@ index 73ee54eda..992de0793 100644
      static uint64_t CBLastCount = 0;
      static uint32_t CBReports = 0;
 diff --git a/Source/Windows/ARM64EC/Module.S b/Source/Windows/ARM64EC/Module.S
-index fcb72a925..0b11f466b 100644
+index fcb72a925..2600244ac 100644
 --- a/Source/Windows/ARM64EC/Module.S
 +++ b/Source/Windows/ARM64EC/Module.S
 @@ -77,6 +77,37 @@
@@ -65,7 +82,7 @@ index fcb72a925..0b11f466b 100644
  // Read by RetToEntryThunk below; ARM64EC/Module.cpp sets it at process init.
  .data
  .balign 8
-@@ -198,7 +229,69 @@ ios_thunk_bare:
+@@ -198,7 +229,87 @@ ios_thunk_bare:
    add x17, x9, x16
    add x17, x17, #6
  ios_thunk_slot:
@@ -121,9 +138,27 @@ index fcb72a925..0b11f466b 100644
 +  b.eq 89f                         // filler: likewise
 +  movz x11, #0x10, lsl #16         // 0x100000
 +  cmp x10, x11
-+  b.lo 89f                         // an rva, not an address: still unbound
++  b.hs 83f
++  // ml1212: a value below 1 MB is an rva that leaked out of an unbound slot,
++  // not an address. No real target here is that low (PE images sit near
++  // 0x71fe..., the JIT pool near 0x15..., the FEX arena at 0x7c00000000), and
++  // treating one as a code address is exactly how this crash worked: it is not
++  // NULL and not filler, so it survived every earlier test, then passed the EC
++  // bitmap's range check and ended in enter_jit's `br x16` with x16 = 0.
++  adrp x11, IosFfsBypassLog
++  add x11, x11, #:lo12:IosFfsBypassLog
++  ldr x12, [x11, #104]
++  add x12, x12, #1
++  str x12, [x11, #104]             // [13] = rva guard fired
++  b 89f
++83:
 +  mov x16, x17                     // slot address, for the filler/NULL re-read below
 +  mov x17, x10                     // the value, from the copy loader.c writes
++  adrp x11, IosFfsBypassLog
++  add x11, x11, #:lo12:IosFfsBypassLog
++  ldr x12, [x11, #96]
++  add x12, x12, #1
++  str x12, [x11, #96]              // [12] = slot values taken from the PE view
 +  add sp, sp, #16                  // taken: drop the fallback
 +  b 84f
 +89:
@@ -135,7 +170,7 @@ index fcb72a925..0b11f466b 100644
    // ml1136: the slot rarely holds the native body. loader.c's
    // arm64ec_iat_is_exported_x64 keeps the x64-VISIBLE 14-byte fast-forward stub
    // of a hybrid export (in the importer's .hexpthk) so x64 callers and hook
-@@ -239,6 +332,30 @@ ios_thunk_slot:
+@@ -239,6 +350,30 @@ ios_thunk_slot:
    // Frame: [sp+0]=slot value, [sp+8]=x4 (x64 R10), [sp+16]=x23, [sp+24]=hop budget.
    stp x17, x4, [sp, #-32]!         // keep sp 16-aligned; save slot value + R10
    stp x23, xzr, [sp, #16]
@@ -166,3 +201,84 @@ index fcb72a925..0b11f466b 100644
    // Bounded FFS chain. One hop is the normal case -- a hybrid export's slot holds a
    // single 14-byte FFS whose jmp target is the native EC body -- but kernel32 ->
    // kernelbase forwarders can put a second hybrid export in the way, so follow up to
+diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+index a5840d4d6..4082db515 100644
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -96,7 +96,7 @@ static uint64_t IosEcCodeBitMapValue = 0;
+  *       unexplained, since the register probe lives in the app binary and does
+  *       not ship with a FEX component.
+  * Read by the [ffs-bypass] reporter in Core.cpp's CompileBlock. */
+-extern "C" uint64_t IosFfsBypassLog[12];
++extern "C" uint64_t IosFfsBypassLog[16];
+ /* Defined in FEXCore Arm64Emitter.cpp; read when the dispatcher and blocks are emitted. */
+ extern "C" uint32_t IosEcReturnWithRet;
+ 
+@@ -109,7 +109,11 @@ extern "C" uint32_t IosCallRetStackElided;
+ /* uint32_t, not bool: a 1-byte global here misaligned the adrp/ldr pair
+  * lld generates for the neighbouring word ("misaligned ldr/str offset"). */
+ static uint32_t IosTebTsdImportFound = 0;
+-uint64_t IosFfsBypassLog[12] {};
++/* ml1212: 16 entries now. [12] counts slot values read successfully from the PE
++ * view, [13] counts times the sub-0x100000 "this is an rva, not an address"
++ * guard turned a value away -- between them they say whether ExitToX64's new
++ * PE-side read ran and whether the value it found looked bound. */
++uint64_t IosFfsBypassLog[16] {};
+ /* ml1131: transition probe, written by Module.S and read by wine's ntdll-unix
+  * sampler through this DATA export (libarm64ecfex_ios.def). Layout in bytes:
+  *   0     magic 'MADXPFEX' (set in ProcessInit)
+@@ -1335,6 +1339,54 @@ NTSTATUS ProcessInit() {
+ void ProcessTerm(HANDLE Handle, BOOL After, NTSTATUS Status) {
+   if (!After) {
+     ProcessTerminating.store(true, std::memory_order_relaxed);
++    /* ml1212: dump the ExitToX64 dispatch counters on the way out.
++     *
++     * These live in Module.S and were effectively write-only: nothing could read
++     * them, because LogMan's messages never reach madeira-log.txt in this build
++     * (Msg::MFmtImpl drops them when the allocator looks dead, and the [ffs-*]
++     * reporters in Core.cpp sit behind that). The game dies in its own
++     * pseudo-process, but ntdll still calls this on the way down, so the numbers
++     * survive the crash and name the stage that failed:
++     *
++     *   slot=0                 never even reached the import-slot path
++     *   slot>0, follow=0       a slot value was produced but held no x64 FFS
++     *   follow>0, bypass=0     the FFS was unwrapped and the target still lost
++     *   peread=0               the PE-view read never ran (pool fallback used)
++     *   rva>0                  the guard saw a value too small to be an address
++     *
++     * WriteFile to the PEB's hStdError is the channel [fex-arena] already uses. */
++    static bool Dumped = false;
++    if (!Dumped) {
++      Dumped = true;
++      HANDLE h = nullptr;
++      if (auto Peb = NtCurrentTeb() ? NtCurrentTeb()->ProcessEnvironmentBlock : nullptr) {
++        if (auto Params = reinterpret_cast<RTL_USER_PROCESS_PARAMETERS64*>(Peb->ProcessParameters)) {
++          h = reinterpret_cast<HANDLE>(Params->hStdError);
++        }
++      }
++      if (h) {
++        static const char kLabels[16][9] = {
++          "bypass", "bypLast", "reject", "rejLast", "ecEnt", "ecEntLst",
++          "slot",   "slotLast", "follow", "folLast", "slotCopy", "peread",
++          "pereadOK", "rvaGuard", "x14", "x15",
++        };
++        char buf[64 + 16 * 22];
++        int n = 0;
++        const char* tag = "[ffs-log] ";
++        while (*tag) buf[n++] = *tag++;
++        const char hexd[] = "0123456789abcdef";
++        for (int i = 0; i < 16; ++i) {
++          for (const char* p = kLabels[i]; *p; ++p) buf[n++] = *p;
++          buf[n++] = '=';
++          buf[n++] = '0';
++          buf[n++] = 'x';
++          for (int j = 60; j >= 0; j -= 4) buf[n++] = hexd[(IosFfsBypassLog[i] >> j) & 0xf];
++          buf[n++] = (i == 15) ? '\n' : ' ';
++        }
++        ULONG written = 0;
++        WriteFile(h, buf, n, &written, nullptr);
++      }
++    }
+   }
+ }
+ 
