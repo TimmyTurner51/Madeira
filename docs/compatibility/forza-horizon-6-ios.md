@@ -286,16 +286,21 @@ log records `region C has 0xffc000 of 0xa000000 left, not enough for carve
 contiguity. The pool becomes 810 MB with the wider window, still far above the
 638 MB that failed.
 
-### Why the auto-widening did not fire
+### Why the auto-widening did not fire — and then did
 
-`StikJITHelper.fixedBaseWindowMB` measures the game's exe before the pool is
-placed, but only widens for an image whose relocations are stripped
-(`characteristics & 1` or an empty relocation directory). This exe reports
-`chars=0x22` — relocatable — so it is skipped even though it is authored for
-`0x140000000`. Widening for every large relocatable image would shrink the hole
-above the window for every other game, which is the failure `ml1037` was written
-to avoid, so the per-game key stays the mechanism and the auto path stays
-conservative.
+As checked in, `StikJITHelper.fixedBaseWindowMB` only widens for an image whose
+relocations are stripped (`characteristics & 1` or an empty relocation directory).
+This exe reports `chars=0x22` with a `0x2b1ac0`-byte `.reloc`, so that measurement
+returns nil: `0x22 & 1 == 0` and `relocSize != 0`, and the function computes nothing.
+
+The installed build nevertheless widened to exactly the value that measurement would
+have produced — `ceil(0xb3c0000 / 16MB) * 16 = 192` MB — and the game's entry carries
+no `exe-window-mb`, `pool`, `pool-split` or `pool-pair` key. So on device the sizing is
+arriving from Madeira itself rather than from a hand-edited key, and the guard in this
+tree is stricter than what produced the successful run. That discrepancy is recorded
+rather than resolved: the window is 192 MB and the image loads at its base either way,
+and the per-game key remains the explicit override if the automatic path ever stops
+covering this image.
 
 ### The next question: is the decryptor in the chain at all
 
@@ -327,18 +332,19 @@ exonerated and the environment is the whole question.
 
 ### Relocation is refuted; the fault is a deliberate `#UD` trap
 
-`exe-window-mb = 192` fixed the refusal. The window is now
-`[0x140000000,0x14c000000)` and the image maps at its preferred base:
+The image now maps at its preferred base, and relocation is refuted as the cause of the
+decline. The window that allows it is 192 MB, and the log names the mechanism:
 
 ```
+[exe-window] widened to [0x140000000,0x14c000000) 192MB for a large fixed-base image (exe-window-mb); the pool is placed above it
 ml977: executable window [0x140000000,0x14c000000) is reserved
 Load module forzahorizon6.exe (forzahorizon6.exe-7352369b5ed8f54b): 140000000
 Invalid instruction in entry block: 14537099C
 ```
 
-So relocation was not the cause. The fault moved from `0x7069B7099C` (pool copy)
-to `0x14537099C` (the image itself) and stayed at RVA `0x537099C` — the same RVA
-in every run at every base, which is what a deliberate trap looks like.
+The fault moved from `0x7069B7099C` (pool copy) to `0x14537099C` (the image itself)
+and stayed at RVA `0x537099C` — the same RVA in every run at every base, which is what
+a deliberate trap looks like.
 
 **The five bytes are invalid in the file, not just in memory.** `EA E9 6B E6 14`
 sits at `0x537099C`, and `EA` is `JMP FAR`, invalid in 64-bit mode. `.pdata`
