@@ -24,7 +24,7 @@ index 73ee54eda..992de0793 100644
      static uint64_t CBLastCount = 0;
      static uint32_t CBReports = 0;
 diff --git a/Source/Windows/ARM64EC/Module.S b/Source/Windows/ARM64EC/Module.S
-index fcb72a925..ee5175459 100644
+index fcb72a925..d65ab11fb 100644
 --- a/Source/Windows/ARM64EC/Module.S
 +++ b/Source/Windows/ARM64EC/Module.S
 @@ -77,6 +77,37 @@
@@ -65,7 +65,7 @@ index fcb72a925..ee5175459 100644
  // Read by RetToEntryThunk below; ARM64EC/Module.cpp sets it at process init.
  .data
  .balign 8
-@@ -198,6 +229,47 @@ ios_thunk_bare:
+@@ -198,7 +229,66 @@ ios_thunk_bare:
    add x17, x9, x16
    add x17, x17, #6
  ios_thunk_slot:
@@ -102,18 +102,37 @@ index fcb72a925..ee5175459 100644
 +  add x17, x16, x10
 +  add x17, x17, #6
 +87:
-+  IOS_PE_TO_POOL_TO x17, x10, x11, x12, x16, 86f   // read the value from the pool copy
-+86:
++  // x17 is now the slot's address in PE space. Read the VALUE from the PE view:
++  // loader.c binds an import by storing through a PE VA, and the log proves the
++  // PE view carries the resolved pointer (the ucrtbase dispatcher slot reads
++  // back as a pool address there). The pool copy of a *plain* IAT slot is not
++  // carried over: rva 0x50650 there still holds the file's unbound 0x63fc8
++  // hint/name rva, which is neither NULL nor 0xcc filler, so it sailed past the
++  // filler test below, failed the FFS-prologue test, and then had 0x63fc8
++  // classified against the EC bitmap -- rejected, into emulation, into
++  // enter_jit's `ldr x16,[x17,#0x40]; br x16` and the br to NULL at pc=0.
++  ldr x10, [x17]
++  cbz x10, 89f                     // unbound here too: try the pool-derived slot
++  movz x11, #0xcccc
++  movk x11, #0xcccc, lsl #16
++  movk x11, #0xcccc, lsl #32
++  movk x11, #0xcccc, lsl #48
++  cmp x10, x11
++  b.eq 89f                         // filler: likewise
++  mov x16, x17                     // slot address, for the filler/NULL re-read below
++  mov x17, x10                     // the value, from the copy loader.c writes
 +  add sp, sp, #16                  // taken: drop the fallback
-+  b 85f
++  b 84f
 +89:
-+  ldr x17, [sp], #16               // fallback: the pool-derived slot
++  ldr x17, [sp], #16               // fallback: the pool-derived slot address
 +85:
 +  mov x16, x17                     // ml1207: keep the slot address itself
    ldr x17, [x17]                   // the pointer the jmp loads
++84:
    // ml1136: the slot rarely holds the native body. loader.c's
    // arm64ec_iat_is_exported_x64 keeps the x64-VISIBLE 14-byte fast-forward stub
-@@ -239,6 +311,30 @@ ios_thunk_slot:
+   // of a hybrid export (in the importer's .hexpthk) so x64 callers and hook
+@@ -239,6 +329,30 @@ ios_thunk_slot:
    // Frame: [sp+0]=slot value, [sp+8]=x4 (x64 R10), [sp+16]=x23, [sp+24]=hop budget.
    stp x17, x4, [sp, #-32]!         // keep sp 16-aligned; save slot value + R10
    stp x23, xzr, [sp, #16]
