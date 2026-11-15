@@ -1,389 +1,144 @@
-From ee695c8fd197f2709088a3acb5a6d80bc18df6de Mon Sep 17 00:00:00 2001
+From b0a7bf9db4286982fd362c32a076c7146f6e1019 Mon Sep 17 00:00:00 2001
 From: Madeira <madeira@example.invalid>
-Date: Sun, 15 Nov 2026 01:17:23 -0600
-Subject: [PATCH] ntdll: sync bound import slots into the pool copy before the
- DllMain walk
+Date: Sun, 15 Nov 2026 01:28:01 -0600
+Subject: [PATCH] ntdll: trap filler is not a bound import slot
 
-ucrtbase's DllMain exits to x64 to call kernelbase!GetCommandLineA through
-kernel32's import thunk (x9 = kernel32 + 0x35a70). ExitToX64 follows that
-thunk's `ff 25` into the IAT slot of the pool copy -- the mapping the guest
-actually executes. loader.c binds imports by storing through a PE VA, so the
-pool slot still held 0xcccccccccccccccc filler: no target, fall through to
-enter_jit, `ldr x16,[cpu_area,#0x40]; br x16` with DispatcherLoopTopEnterEC
-still NULL because FEX's ProcessInit/ThreadInit only run after this walk.
-That branch to 0 is the pc=0 of builds 24..34.
+The 01:20 run finally executed this function and reported every kernel32
+slot "already bound" -- 932 bound, 0 unbound, 0 rebound -- and then faulted
+with `thunk -> slot = 0xcccccccccccccccc`. The boundness test was
 
-Walk the load list before process_attach: sync already-bound slots into the
-pool with unix_ios_sync_pe_write, and resolve still-unbound ones from the
-provider's export directory (RtlFindExportedRoutineByName, then
-arm64ec_redirect_ptr) so DllMain never sees filler.
+    iat->u1.Function >= 0x100000000ULL
 
-Also mark the loader_init banner and the function entry unconditionally. The
-first build emitted nothing, which read as "never ran" but was equally
-consistent with an early LdrData bail; the banner now also identifies this
-ntdll, because on device the app bundle's copy can shadow the deployed one.
+which separates a real VA from a hint/name RVA, but the loader also fills
+unresolved slots with the 0xcc trap pattern, and 0xcccccccccccccccc is a
+64-bit value far above 4 GB. Filler therefore classified as "already bound"
+and the sync copied it into the pool verbatim: the function reproduced the
+exact fault it exists to prevent, and the "0 unbound" counters were the only
+symptom.
+
+Test filler explicitly and send it down the resolve path, where
+RtlFindExportedRoutineByName + arm64ec_redirect_ptr install a real target
+and the sync carries that across. Report the filler count separately so a
+module that needed resolution is distinguishable from one already in order,
+and bump the identity banner to ml1227 / iat-sync v3.
 
 Signed-off-by: Madeira <madeira@example.invalid>
 Co-authored-by: Cursor <cursoragent@cursor.com>
 ---
- dlls/ntdll/loader.c         |  13 +-
- dlls/ntdll/ntdll_misc.h     |   3 +
- dlls/ntdll/signal_arm64ec.c | 264 ++++++++++++++++++++++++++++++++++--
- 3 files changed, 269 insertions(+), 11 deletions(-)
+ dlls/ntdll/loader.c         |  2 +-
+ dlls/ntdll/signal_arm64ec.c | 45 +++++++++++++++++++++++++------------
+ 2 files changed, 32 insertions(+), 15 deletions(-)
 
 diff --git a/dlls/ntdll/loader.c b/dlls/ntdll/loader.c
-index f9f412be..b68c0017 100644
+index b68c0017..1e678b6a 100644
 --- a/dlls/ntdll/loader.c
 +++ b/dlls/ntdll/loader.c
-@@ -5461,8 +5461,13 @@ static void load_arm64ec_module(void)
-      * and xtajit64's own DllMain is a harmless stub, so attaching the root is
-      * safe there too. Idempotent: process_attach() early-outs on
-      * LDR_PROCESS_ATTACHED. */
--    if ((status = process_attach( wm->ldr.DdagNode, NULL )))
--    {
-+    /* Phase 1.4: make the pool copies of the import slots agree with the PE
-+     * view before any DllMain runs. ucrtbase's DllMain exits to x64 to call
-+     * kernelbase!GetCommandLineA, and ExitToX64 follows that thunk's jmp into
-+     * the pool copy of kernel32's IAT, which still held 0xcc trap filler. */
-+    arm64ec_sync_bound_iat_slots();
-+
-+    if ((status = process_attach( wm->ldr.DdagNode, NULL )))    {
-         ERR( "process_attach for %s (root+deps) failed, status %lx\n", debugstr_w(module), status );
-         NtTerminateProcess( GetCurrentProcess(), status );
-     }
-@@ -5802,7 +5807,9 @@ void loader_init( CONTEXT *context, void **entry )
-          * actctx available so the activeCodePage manifest still applies. */
-         locale_init();
+@@ -5809,7 +5809,7 @@ void loader_init( CONTEXT *context, void **entry )
          ERR( "loader_init: [iOS] early locale_init done (casemap wired before arm64ec module)\n" );
--        ERR( "loader_init: calling load_arm64ec_module\n" );
-+        /* The suffix identifies THIS ntdll: the deployed PE can be shadowed by
-+         * the app bundle's copy, and a bare line cannot tell them apart. */
-+        ERR( "loader_init: calling load_arm64ec_module [ntdll ml1226 iat-sync v2]\n" );
+         /* The suffix identifies THIS ntdll: the deployed PE can be shadowed by
+          * the app bundle's copy, and a bare line cannot tell them apart. */
+-        ERR( "loader_init: calling load_arm64ec_module [ntdll ml1226 iat-sync v2]\n" );
++        ERR( "loader_init: calling load_arm64ec_module [ntdll ml1227 iat-sync v3]\n" );
          load_arm64ec_module();
          ERR( "loader_init: load_arm64ec_module returned, calling update_load_config\n" );
          update_load_config( wm->ldr.DllBase );
-diff --git a/dlls/ntdll/ntdll_misc.h b/dlls/ntdll/ntdll_misc.h
-index 5199cc9d..4261f155 100644
---- a/dlls/ntdll/ntdll_misc.h
-+++ b/dlls/ntdll/ntdll_misc.h
-@@ -164,6 +164,9 @@ extern void sync_init_madeira_lean(void);
- 
- #ifdef __arm64ec__
- 
-+/* ml1223: carry the loader's import bindings into the pool copies before the
-+ * DllMain walk; see the comment on the definition in signal_arm64ec.c. */
-+extern ULONG arm64ec_sync_bound_iat_slots(void);
- extern NTSTATUS arm64ec_process_init_dispatchers( HMODULE module );
- extern NTSTATUS arm64ec_process_init( HMODULE module );
- extern NTSTATUS arm64ec_thread_init(void);
 diff --git a/dlls/ntdll/signal_arm64ec.c b/dlls/ntdll/signal_arm64ec.c
-index d5647738..05f58c60 100644
+index 05f58c60..04416099 100644
 --- a/dlls/ntdll/signal_arm64ec.c
 +++ b/dlls/ntdll/signal_arm64ec.c
-@@ -984,8 +984,14 @@ IMAGE_ARM64EC_METADATA *arm64ec_get_module_metadata( HMODULE module )
+@@ -1178,11 +1178,16 @@ static HMODULE find_loaded_module_ansi( const char *name )
+     return NULL;
  }
  
- 
-+static UINT watch_rva;   /* the dispatcher slot the crash reads through */
++/* The loader's probe filler for an import slot it has not resolved yet. It is
++ * NOT a pointer, and it is numerically larger than any VA, so it must be tested
++ * for explicitly rather than by size. */
++#define IAT_TRAP_FILLER 0xccccccccccccccccULL
 +
- static void update_hybrid_pointer( void *module, const IMAGE_SECTION_HEADER *sec, UINT rva, void *ptr )
+ ULONG arm64ec_sync_bound_iat_slots(void)
  {
-+    /* Set by arm64ec_update_hybrid_metadata to the one slot the 2026-11-14
-+     * crash reads through (ucrtbase's __os_arm64x_dispatch_call_no_redirect).
-+     * That slot is reported on every write, success or not: sampling it hid
-+     * the re-patch pass, which is the write that actually matters. */
-     if (!rva) return;
+     PEB *peb = RtlGetCurrentPeb();
+     LIST_ENTRY *link;
+-    ULONG modules = 0, slots = 0, bound = 0, synced = 0, rebound = 0;
++    ULONG modules = 0, slots = 0, bound = 0, synced = 0, rebound = 0, filler = 0;
  
-     if (rva < sec->VirtualAddress || rva >= sec->VirtualAddress + sec->Misc.VirtualSize)
-@@ -995,6 +1001,11 @@ static void update_hybrid_pointer( void *module, const IMAGE_SECTION_HEADER *sec
-     {
-         void *dest = get_rva( module, rva );
+     /* Unconditional entry marker. ml1225 emitted nothing at all and that was
+      * ambiguous: "the function never ran" and "it returned at the ldr NULL
+@@ -1204,7 +1209,7 @@ ULONG arm64ec_sync_bound_iat_slots(void)
+         void *module = entry->DllBase;
+         IMAGE_ARM64EC_METADATA *meta;
+         IMAGE_IMPORT_DESCRIPTOR *desc;
+-        ULONG mslots = 0, msynced = 0, munbound = 0, size;
++        ULONG mslots = 0, msynced = 0, munbound = 0, mfiller = 0, size;
+         int have_gcla = 0;
+         ULONG_PTR gcla = 0;
  
-+        NTSTATUS sync;
-+        ULONG copied = 0;
-+        static int said;
-+        int loud = (rva == watch_rva);
+@@ -1236,13 +1241,20 @@ ULONG arm64ec_sync_bound_iat_slots(void)
+                 /* Is the PE view bound? A bound slot holds a VA, and every VA
+                  * in this process is above 4 GB: PE images load near
+                  * 0x71fe..., the JIT pool near 0x153..., FEX's arena at
+-                 * 0x7c00.... An UNBOUND slot still holds its hint/name RVA
++                 * 0x7c00.... An UNBOUND slot holds either its hint/name RVA
+                  * from the file -- kernel32's GetCommandLineA slot reads
+-                 * 0x63fc8 -- which is under 4 GB and is NOT a target. Testing
+-                 * `>= 0x10000` here instead would have classified that RVA as
+-                 * bound and copied it into the pool, recreating the exact
+-                 * failure this function exists to prevent. */
+-                if (iat->u1.Function >= 0x100000000ULL)
++                 * 0x63fc8, under 4 GB -- or the 0xcc trap filler.
++                 *
++                 * The filler is the trap this test fell into first. It is
++                 * 0xcccccccccccccccc, a 64-bit value far above 4 GB, so a bare
++                 * `>= 0x100000000` test calls it "already bound" and copies it
++                 * into the pool verbatim. The 01:20 run reported "932
++                 * already bound, 0 unbound" for kernel32 and then faulted with
++                 * `thunk -> slot = 0xcccccccccccccccc`: the sync had carried
++                 * the filler across instead of resolving over it. Filler is
++                 * never a target, so it takes the resolve path. */
++                if (iat->u1.Function >= 0x100000000ULL &&
++                    iat->u1.Function != IAT_TRAP_FILLER)
+                 {
+                     /* Already bound in the PE view: this is the case that only
+                      * needs carrying across to the pool. */
+@@ -1254,6 +1266,8 @@ ULONG arm64ec_sync_bound_iat_slots(void)
+                     continue;
+                 }
+ 
++                if (iat->u1.Function == IAT_TRAP_FILLER) filler++;
 +
-         *(void **)dest = ptr;
-         /* The guest executes the pool copy of this image, and nothing syncs a
-          * plain PE store into it. ucrtbase's
-@@ -1005,17 +1016,44 @@ static void update_hybrid_pointer( void *module, const IMAGE_SECTION_HEADER *sec
-          * for its TLS index. */
-         {
-             struct ios_sync_pe_write_params params = { dest, sizeof(void *), 0 };
--            static int said;
--            NTSTATUS sync = __wine_unixlib_handle
-+
-+            sync = __wine_unixlib_handle
-                 ? WINE_UNIX_CALL( unix_ios_sync_pe_write, &params )
-                 : STATUS_PROCEDURE_NOT_FOUND;   /* too early: no unix side yet */
--            if (said++ < 32)
--                ERR( "hybrid-slot rva=%x <- %p sync=%lx copied=%lu\n",
--                     rva, ptr, sync, params.synced );
--            /* A failure here leaves the pool copy stale (the old bug), which is
--             * no worse than before, so report it and carry on rather than take
--             * the process down for a diagnostic slot. */
-+            copied = params.synced;
-+
-+            /* The android-era unix layer only knows the four-byte TLS-index
-+             * request and refuses a pointer slot outright (c000000d), which
-+             * leaves the pool copy at its on-disk zero and hands the guest a
-+             * null branch target. It still copies raw bytes for a four-byte
-+             * request, and every dispatcher written here is already a JIT-pool
-+             * address on iOS (ExitToX64 and arm64x_check_call both live in the
-+             * pool), so two halves reproduce the same eight bytes. Only take
-+             * that road when the wide request was refused: a unix layer that
-+             * understands it also translates the value to the pool alias, which
-+             * a raw half-write cannot do. */
-+            if (sync == STATUS_INVALID_PARAMETER)
-+            {
-+                unsigned int half;
-+
-+                sync = STATUS_SUCCESS;
-+                for (half = 0; half < sizeof(void *); half += sizeof(ULONG))
-+                {
-+                    struct ios_sync_pe_write_params p4 =
-+                        { (char *)dest + half, sizeof(ULONG), 0 };
-+                    NTSTATUS st = WINE_UNIX_CALL( unix_ios_sync_pe_write, &p4 );
-+                    if (st) { sync = st; break; }
-+                    copied += p4.synced;
-+                }
-+            }
-         }
-+
-+        /* Always name a failure, and always name the watched slot; sample the
-+         * rest so a healthy run stays short. A silent zero at the watched slot
-+         * is the bug this whole block exists for. */
-+        if (sync || (ptr && !copied) || loud || said++ < 24)
-+            ERR( "hybrid-slot rva=%x <- %p sync=%lx copied=%lu%s\n",
-+                 rva, ptr, sync, copied, loud ? " (watched)" : "" );
+                 /* Still an rva: the loader never bound it here either. Resolve
+                  * it from the provider's export directory. RtlFindExported-
+                  * RoutineByName does not attach the module, unlike
+@@ -1307,20 +1321,23 @@ ULONG arm64ec_sync_bound_iat_slots(void)
+ 
+         modules++;
+         slots += mslots;
+-        bound += mslots - munbound;
++        bound += mslots - munbound - mfiller;
+         synced += msynced;
+-        ERR( "[iat-sync] %s: %lu slot(s), %lu already bound, %lu unbound, %lu synced to pool\n",
++        filler += mfiller;
++        ERR( "[iat-sync] %s: %lu slot(s), %lu already bound, %lu unbound, "
++             "%lu trap filler, %lu synced to pool\n",
+              debugstr_w( entry->BaseDllName.Buffer ), (unsigned long)mslots,
+-             (unsigned long)(mslots - munbound), (unsigned long)munbound,
+-             (unsigned long)msynced );
++             (unsigned long)(mslots - munbound - mfiller), (unsigned long)munbound,
++             (unsigned long)mfiller, (unsigned long)msynced );
+         if (have_gcla)
+             ERR( "[iat-sync]   %s GetCommandLineA -> %p\n",
+                  debugstr_w( entry->BaseDllName.Buffer ), (void *)gcla );
      }
+ 
+-    ERR( "[iat-sync] done: %lu hybrid module(s), %lu slot(s), %lu bound, %lu rebound, %lu synced\n",
++    ERR( "[iat-sync] done: %lu hybrid module(s), %lu slot(s), %lu bound, "
++         "%lu trap filler, %lu rebound, %lu synced\n",
+          (unsigned long)modules, (unsigned long)slots, (unsigned long)bound,
+-         (unsigned long)rebound, (unsigned long)synced );
++         (unsigned long)filler, (unsigned long)rebound, (unsigned long)synced );
+     return synced;
  }
  
-@@ -1051,6 +1089,9 @@ void arm64ec_update_hybrid_metadata( void *module, IMAGE_NT_HEADERS *nt,
- 
-             NtProtectVirtualMemory( NtCurrentProcess(), &base, &size, PAGE_READWRITE, &protect_old );
- 
-+            /* Arm the always-on report for the slot the crash reads through. */
-+            watch_rva = metadata->__os_arm64x_dispatch_call_no_redirect;
-+
- #define SET_FUNC(func,val) update_hybrid_pointer( module, sec, metadata->func, val )
-             SET_FUNC( __os_arm64x_dispatch_call, arm64x_check_call );
-             SET_FUNC( __os_arm64x_dispatch_call_no_redirect, __os_arm64x_dispatch_call_no_redirect );
-@@ -1076,6 +1117,213 @@ void arm64ec_update_hybrid_metadata( void *module, IMAGE_NT_HEADERS *nt,
- }
- 
- 
-+/*******************************************************************
-+ *         arm64ec_sync_bound_iat_slots
-+ *
-+ * Make the pool copy of every bound import slot agree with the PE view
-+ * BEFORE any module's DllMain runs.
-+ *
-+ * 2026-11-15, the pc=0 that survived builds 24..34. ucrtbase's DllMain
-+ * calls kernel32's x64-visible import thunk for kernelbase!GetCommandLineA,
-+ * x9 = kernel32 + 0x35a70. ExitToX64 follows that thunk's `ff 25 rel32` to
-+ * the IAT slot and reads the slot out of the POOL copy, because that is the
-+ * copy the guest executes. loader.c binds imports by storing through a PE
-+ * VA, and the pool copy is a separate mapping: the pool slot still held
-+ * 0xcccccccccccccccc trap filler, so there was no target, and the call fell
-+ * through to enter_jit, which ran `ldr x16,[cpu_area,#0x40]; br x16` with
-+ * DispatcherLoopTopEnterEC still NULL (FEX's ProcessInit/ThreadInit are
-+ * Phase 2, after this walk) -> branch to 0.
-+ *
-+ * The dispatcher slots already get this treatment one at a time in
-+ * update_hybrid_pointer; imports never did, and there are ~1500 of them per
-+ * module. Do them in one pass, before the DllMain walk, so an exit thunk
-+ * anywhere in the walk resolves to a real target. Report per module so a
-+ * module whose slots were already in place is distinguishable from one that
-+ * needed the sync.
-+ */
-+/* ntdll cannot call kernel32's GetModuleHandleA, so find the provider the way
-+ * the loader does: walk the already-loaded list and compare BaseDllName. The
-+ * module is guaranteed present -- it is the importer's dependency -- and this
-+ * cannot attach anything, which matters because we are about to run the walk. */
-+static HMODULE find_loaded_module_ansi( const char *name )
-+{
-+    PEB *peb = RtlGetCurrentPeb();
-+    LIST_ENTRY *link;
-+
-+    if (!peb->LdrData) return NULL;
-+    for (link = peb->LdrData->InLoadOrderModuleList.Flink;
-+         link != &peb->LdrData->InLoadOrderModuleList; link = link->Flink)
-+    {
-+        LDR_DATA_TABLE_ENTRY *entry = CONTAINING_RECORD( link, LDR_DATA_TABLE_ENTRY,
-+                                                        InLoadOrderLinks );
-+        const WCHAR *w = entry->BaseDllName.Buffer;
-+        const char *a = name;
-+        ULONG i = 0;
-+
-+        if (!w || !entry->DllBase) continue;
-+        for (;; i++)
-+        {
-+            char lc;
-+            WCHAR wc;
-+            if (i >= entry->BaseDllName.Length / sizeof(WCHAR)) { lc = 0; wc = 0; }
-+            else
-+            {
-+                wc = w[i];
-+                lc = (wc >= 'A' && wc <= 'Z') ? (char)(wc - 'A' + 'a') : (char)wc;
-+            }
-+            if (lc != a[i]) break;
-+            if (!lc) return (HMODULE)entry->DllBase;
-+        }
-+    }
-+    return NULL;
-+}
-+
-+ULONG arm64ec_sync_bound_iat_slots(void)
-+{
-+    PEB *peb = RtlGetCurrentPeb();
-+    LIST_ENTRY *link;
-+    ULONG modules = 0, slots = 0, bound = 0, synced = 0, rebound = 0;
-+
-+    /* Unconditional entry marker. ml1225 emitted nothing at all and that was
-+     * ambiguous: "the function never ran" and "it returned at the ldr NULL
-+     * check" look identical from the log. */
-+    ERR( "[iat-sync] enter: ldr=%p unix=%p\n",
-+         peb->LdrData, __wine_unixlib_handle );
-+
-+    if (!peb->LdrData)
-+    {
-+        ERR( "[iat-sync] no LdrData yet, nothing to sync\n" );
-+        return 0;
-+    }
-+
-+    for (link = peb->LdrData->InLoadOrderModuleList.Flink;
-+         link != &peb->LdrData->InLoadOrderModuleList; link = link->Flink)
-+    {
-+        LDR_DATA_TABLE_ENTRY *entry = CONTAINING_RECORD( link, LDR_DATA_TABLE_ENTRY,
-+                                                        InLoadOrderLinks );
-+        void *module = entry->DllBase;
-+        IMAGE_ARM64EC_METADATA *meta;
-+        IMAGE_IMPORT_DESCRIPTOR *desc;
-+        ULONG mslots = 0, msynced = 0, munbound = 0, size;
-+        int have_gcla = 0;
-+        ULONG_PTR gcla = 0;
-+
-+        if (!module) continue;
-+        /* Only hybrid images care: a pure x64 importer must keep the x64
-+         * thunk its own loader wrote, and an aarch64 module has no EC map. */
-+        if (!(meta = arm64ec_get_module_metadata( module ))) continue;
-+        if (!(desc = RtlImageDirectoryEntryToData( module, TRUE,
-+                                                   IMAGE_DIRECTORY_ENTRY_IMPORT, &size )))
-+            continue;
-+
-+        for (; desc->Name; desc++)
-+        {
-+            const char *dll = get_rva( module, desc->Name );
-+            HMODULE provider = find_loaded_module_ansi( dll );
-+            IMAGE_THUNK_DATA *ilt, *iat;
-+
-+            ilt = get_rva( module, desc->OriginalFirstThunk
-+                                   ? desc->OriginalFirstThunk : desc->FirstThunk );
-+            iat = get_rva( module, desc->FirstThunk );
-+
-+            for (; ilt->u1.AddressOfData; ilt++, iat++)
-+            {
-+                struct ios_sync_pe_write_params params = { iat, sizeof(void *), 0 };
-+                IMAGE_ARM64EC_METADATA *pmeta;
-+                void *proc;
-+
-+                mslots++;
-+                /* Is the PE view bound? A bound slot holds a VA, and every VA
-+                 * in this process is above 4 GB: PE images load near
-+                 * 0x71fe..., the JIT pool near 0x153..., FEX's arena at
-+                 * 0x7c00.... An UNBOUND slot still holds its hint/name RVA
-+                 * from the file -- kernel32's GetCommandLineA slot reads
-+                 * 0x63fc8 -- which is under 4 GB and is NOT a target. Testing
-+                 * `>= 0x10000` here instead would have classified that RVA as
-+                 * bound and copied it into the pool, recreating the exact
-+                 * failure this function exists to prevent. */
-+                if (iat->u1.Function >= 0x100000000ULL)
-+                {
-+                    /* Already bound in the PE view: this is the case that only
-+                     * needs carrying across to the pool. */
-+                    if (__wine_unixlib_handle)
-+                    {
-+                        WINE_UNIX_CALL( unix_ios_sync_pe_write, &params );
-+                        if (params.synced) msynced++;
-+                    }
-+                    continue;
-+                }
-+
-+                /* Still an rva: the loader never bound it here either. Resolve
-+                 * it from the provider's export directory. RtlFindExported-
-+                 * RoutineByName does not attach the module, unlike
-+                 * LdrGetProcedureAddress, so this cannot nest the walk we are
-+                 * about to run. */
-+                munbound++;
-+                /* Leave the main image alone. fo's imports are handled by the
-+                 * dedicated x64 data-import path (ml1245, "[x64-data-imp]
-+                 * importer pe=... IAT window ..."), which walks the exe's IAT
-+                 * window on its own terms. Rebinding those slots here would
-+                 * race that pass for no gain: the call this function exists to
-+                 * fix is a DLL-to-DLL import inside ucrtbase/kernel32. */
-+                if (module == RtlGetCurrentPeb()->ImageBaseAddress) continue;
-+                if (!provider || IMAGE_SNAP_BY_ORDINAL( ilt->u1.Ordinal )) continue;
-+                {
-+                    IMAGE_IMPORT_BY_NAME *by_name =
-+                        get_rva( module, (DWORD)ilt->u1.AddressOfData );
-+                    proc = RtlFindExportedRoutineByName( provider,
-+                                                         (const char *)by_name->Name );
-+                    if (!proc) continue;
-+                    if ((pmeta = arm64ec_get_module_metadata( provider )))
-+                        proc = arm64ec_redirect_ptr( provider, proc, pmeta );
-+                    if (!strcmp( (const char *)by_name->Name, "GetCommandLineA" ))
-+                    {
-+                        have_gcla = 1;
-+                        gcla = (ULONG_PTR)proc;
-+                    }
-+                    {
-+                        void *base = iat;
-+                        SIZE_T range = sizeof(void *);
-+                        DWORD old;
-+                        if (!NtProtectVirtualMemory( NtCurrentProcess(), &base, &range,
-+                                                    PAGE_READWRITE, &old ))
-+                        {
-+                            iat->u1.Function = (ULONG_PTR)proc;
-+                            NtProtectVirtualMemory( NtCurrentProcess(), &base, &range,
-+                                                   old, &old );
-+                            rebound++;
-+                            params.address = iat;
-+                            params.synced = 0;
-+                            if (__wine_unixlib_handle)
-+                            {
-+                                WINE_UNIX_CALL( unix_ios_sync_pe_write, &params );
-+                                if (params.synced) msynced++;
-+                            }
-+                        }
-+                    }
-+                }
-+            }
-+        }
-+
-+        modules++;
-+        slots += mslots;
-+        bound += mslots - munbound;
-+        synced += msynced;
-+        ERR( "[iat-sync] %s: %lu slot(s), %lu already bound, %lu unbound, %lu synced to pool\n",
-+             debugstr_w( entry->BaseDllName.Buffer ), (unsigned long)mslots,
-+             (unsigned long)(mslots - munbound), (unsigned long)munbound,
-+             (unsigned long)msynced );
-+        if (have_gcla)
-+            ERR( "[iat-sync]   %s GetCommandLineA -> %p\n",
-+                 debugstr_w( entry->BaseDllName.Buffer ), (void *)gcla );
-+    }
-+
-+    ERR( "[iat-sync] done: %lu hybrid module(s), %lu slot(s), %lu bound, %lu rebound, %lu synced\n",
-+         (unsigned long)modules, (unsigned long)slots, (unsigned long)bound,
-+         (unsigned long)rebound, (unsigned long)synced );
-+    return synced;
-+}
-+
- /*******************************************************************
-  *         syscalls
-  */
 -- 
 2.54.0 (Apple Git-156)
 
