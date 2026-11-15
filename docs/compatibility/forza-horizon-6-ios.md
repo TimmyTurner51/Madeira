@@ -325,6 +325,89 @@ If the chain is empty, the next step is Wine's `RtlAddVectoredExceptionHandler`
 path on ARM64EC. If it is populated and declining, the handler machinery is
 exonerated and the environment is the whole question.
 
+### Relocation is refuted; the fault is a deliberate `#UD` trap
+
+`exe-window-mb = 192` fixed the refusal. The window is now
+`[0x140000000,0x14c000000)` and the image maps at its preferred base:
+
+```
+ml977: executable window [0x140000000,0x14c000000) is reserved
+Load module forzahorizon6.exe (forzahorizon6.exe-7352369b5ed8f54b): 140000000
+Invalid instruction in entry block: 14537099C
+```
+
+So relocation was not the cause. The fault moved from `0x7069B7099C` (pool copy)
+to `0x14537099C` (the image itself) and stayed at RVA `0x537099C` — the same RVA
+in every run at every base, which is what a deliberate trap looks like.
+
+**The five bytes are invalid in the file, not just in memory.** `EA E9 6B E6 14`
+sits at `0x537099C`, and `EA` is `JMP FAR`, invalid in 64-bit mode. `.pdata`
+confirms `0x537099C` genuinely is a function start (not a misaligned entry), and
+5 bytes later a textbook MSVC prologue begins (`mov [rsp+0x10],rdi; push rbp;
+mov rbp,rsp`) followed by an `/GS` cookie load.
+
+That is not one damaged function. Of 414,805 `.pdata` function starts, **4,538
+begin with `EA`** and 247 distinct 5-byte prefixes cover all of them — `EAC704BED2`
+alone accounts for 2,693. Short, repeated, and structured: the protection
+encrypts function prologues and expects its own handler to catch the `#UD`,
+decrypt the prologue and resume.
+
+### The handler that should decrypt is not there
+
+`[veh-chain]` answers the question the log could not: at the moment the `#UD`
+lands, the exception chain holds **exactly one handler**, and it is not a
+decryptor.
+
+```
+[veh-chain] ml1251 #1 code=c000001d addr=000000014537099C tid=00e8
+[veh-chain] ml1251   #1 handler=00000001453CD858
+[veh-chain] ml1251 handler 00000001453CD858 -> 0 (CONTINUE_SEARCH: declined)
+[ud-decrypt] EC handler declined at 000000014537099C: BYTES UNCHANGED (eae96be61448897c)
+```
+
+Static analysis of that handler (it is a `jmp` thunk to `0x1453D9270`) shows
+what it is: it reads `Dr7` and `Dr0`–`Dr3`, decodes the exception code with
+`code = 2*(record->code ^ 0xF58AD36680AB1CF9)`, and compares against the two
+values that decode to `0x80000003` (`STATUS_BREAKPOINT`) and `0x80000004`
+(`STATUS_SINGLE_STEP`). It is a hardware-breakpoint harness. Declining a `#UD`
+is correct behaviour for it, so the chain is not malfunctioning — it is simply
+missing the handler that matters.
+
+Two things follow, and they need opposite work:
+
+- the decryptor was never registered — a loader or import problem, ours;
+- it was registered and removed — a lifetime problem.
+
+`BYTES UNCHANGED` also rules out the other half: the protection never wrote to
+`.text` at all. No `VirtualProtect`/`NtProtectVirtualMemory` call in the whole
+session touches the image range, so there is no decryption pass that ran and
+failed. `[veh-add]` (0007) watches registrations, because a handler added and
+taken away again is invisible in the chain at dispatch time.
+
+### The Android reference config, for comparison
+
+The DroidDeck package for the same title documents the environment that does
+reach the menu, and its troubleshooting table has no entry for `#UD` or invalid
+instructions at all. It relies on `FEX_SMCCHECKS=full`, `FEX_HIDEHYPERVISORBIT=1`,
+`FEX_MULTIBLOCK=1` and a set of FH6-specific FEX options. Measured against this
+tree:
+
+| Option | Android | This tree |
+|---|---|---|
+| `FEX_FH6_FASTUD` | `1` | absent |
+| `FEX_FH6_UDINPROC` | `0` | absent |
+| `FEX_POOL_CLONE` | `1` | absent |
+| `FEX_SKIP_SRA_FLUSH` | `0` | absent |
+| `FEX_FH6_STATS` | `0` | absent |
+| `FEX_SMCCHECKS` | `full` | present |
+| `FEX_DYNAMICL1CACHE` | `0` | present |
+
+`FEX_FH6_FASTUD=1` raises `#UD` through the syscall handler instead of the host
+signal path, which matters here because this port's host signal path is the part
+that has needed the most repair. It does not by itself explain a declined
+verdict — the handler ran either way — but it is part of the configuration known
+to work, and this tree cannot express it.
+
 ## Conclusion
 
 Three blockers have been retired. The ARM64EC import-slot mis-route is not

@@ -1,0 +1,62 @@
+--- a/dlls/ntdll/exception.c
++++ b/dlls/ntdll/exception.c
+@@ -111,6 +111,41 @@
+         RtlEnterCriticalSection( &vectored_handlers_section );
+         if (first) InsertHeadList( handler_list, &handler->entry );
+         else InsertTailList( handler_list, &handler->entry );
++#ifdef __arm64ec__
++        /* iOS-Madeira ml1252: WHO registers an exception handler, and from where?
++         *
++         * [veh-chain] (ml1251) showed the chain holds exactly one handler when
++         * the #UD lands -- a Dr0-Dr3/Dr7 single-step harness that declines. So
++         * either the protected title's decryptor was never registered, or it was
++         * registered and removed, and those need opposite work: a loader/import
++         * problem versus a lifetime problem.
++         *
++         * The only way to tell them apart is to watch registrations rather than
++         * the chain, because a handler that was added and taken away again leaves
++         * no trace in the chain at dispatch time. Logged here, with the calling
++         * module resolved from the return address, so the report names the
++         * component that did it instead of an opaque code address.
++         *
++         * Runs inside the critical section with no allocation; the blamed module
++         * is resolved by RtlPcToFileHeader, which only walks the loader list. */
++        {
++            static LONG add_n;
++            LONG n = InterlockedIncrement( &add_n );
++            if (n <= 24)
++            {
++                void *module = NULL;
++                UNICODE_STRING *name = NULL;
++                LDR_DATA_TABLE_ENTRY *entry = NULL;
++                RtlPcToFileHeader( handler->func, &module );
++                if (module && !LdrFindEntryForAddress( module, &entry ) && entry)
++                    name = &entry->BaseDllName;
++                ERR( "[veh-add] ml1252 #%ld func=%p module=%p %s order=%s\n", n, handler->func,
++                     module,
++                     name && name->Buffer ? debugstr_wn( name->Buffer, name->Length / sizeof(WCHAR) ) : "?",
++                     first ? "first" : "last" );
++            }
++        }
++#endif
+         RtlLeaveCriticalSection( &vectored_handlers_section );
+     }
+     return handler;
+@@ -135,6 +170,17 @@
+             break;
+         }
+     }
++#ifdef __arm64ec__
++    /* ml1252: a removal is what makes "registered then gone" look identical to
++     * "never registered" in the chain. Name the one that declined the #UD, so a
++     * vanishing decryptor is visible rather than inferred. */
++    if (ret && handler_list == &vectored_exception_handlers)
++    {
++        static LONG rem_n;
++        if (InterlockedIncrement( &rem_n ) <= 24)
++            ERR( "[veh-add] ml1252 REMOVED handler from the chain (remove #%ld)\n", rem_n );
++    }
++#endif
+     RtlLeaveCriticalSection( &vectored_handlers_section );
+     if (ret) RtlFreeHeap( GetProcessHeap(), 0, handler );
+     return ret;
