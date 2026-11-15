@@ -68,9 +68,41 @@ FFSCHK = strip_comments(FFSCHK or '')
 # --- the thunk path owns and unwinds a 32-byte frame -------------------------
 check('stp x17, x4, [sp, #-32]!' in THUNK,
       'ios_thunk_slot pushes a 32-byte frame (slot value + x64 R10)')
-check(THUNK.count('add sp, sp, #32') == 2,
-      'the thunk path unwinds 32 bytes on both exits (found %d)'
-      % THUNK.count('add sp, sp, #32'))
+
+# The frame is pushed once, so every exit from it must unwind exactly once and may
+# not fall through into another unwind. An earlier version asserted the count was 2,
+# which broke when ml1222 added a third legitimate exit (the native-bypass route at
+# `95:`), so state the invariant instead of a number: one push, one unwind per exit,
+# and no exit that unwinds twice.
+UNWINDS = [m.start() for m in re.finditer(r'add sp, sp, #32', THUNK)]
+check(len(UNWINDS) >= 2,
+      'the thunk path has at least two exits (found %d)' % len(UNWINDS))
+check(THUNK.count('stp x17, x4, [sp, #-32]!') == 1,
+      'the thunk path pushes its frame exactly once (found %d)'
+      % THUNK.count('stp x17, x4, [sp, #-32]!'))
+
+_lines = THUNK.splitlines()
+_off = 0
+_starts = []
+for _ln in _lines:
+    _starts.append(_off)
+    _off += len(_ln) + 1
+for _u in UNWINDS:
+    _li = max(i for i, s in enumerate(_starts) if s <= _u)
+    # From this unwind to the next terminal branch: the exit must leave, and it must
+    # not reach a second unwind on the way.
+    _term = None
+    for _nxt in _lines[_li + 1:_li + 6]:
+        if 'add sp, sp, #32' in _nxt:
+            _term = 'second unwind before branching out'
+            break
+        if re.match(r'^\s*(?:b|br)\b', _nxt):
+            _term = 'branches out'
+            break
+    check(_term == 'branches out',
+          'each thunk unwind is a terminal exit (line %d: %s)'
+          % (_li + 1, _term or 'ran off the end without branching out'))
+
 check('ldr x4, [sp, #8]' in THUNK,
       'the thunk path restores x4 (x64 R10), which the bitmap test uses as scratch')
 check('ldp x4, x9, [sp], #16' not in THUNK,
