@@ -24,7 +24,7 @@ index 73ee54eda..992de0793 100644
      static uint64_t CBLastCount = 0;
      static uint32_t CBReports = 0;
 diff --git a/Source/Windows/ARM64EC/Module.S b/Source/Windows/ARM64EC/Module.S
-index fcb72a925..6c7d106c3 100644
+index fcb72a925..ee5175459 100644
 --- a/Source/Windows/ARM64EC/Module.S
 +++ b/Source/Windows/ARM64EC/Module.S
 @@ -77,6 +77,37 @@
@@ -41,7 +41,7 @@ index fcb72a925..6c7d106c3 100644
 +// instead of the bound target. The PE view is where the bind actually happened,
 +// so it is the copy to trust. Same entry layout and same scratch rules as
 +// IOS_PE_TO_POOL_TO; leaves \reg alone when no entry contains it.
-+.macro IOS_POOL_TO_PE_TO reg, a, b, c, d
++.macro IOS_POOL_TO_PE_TO reg, a, b, c, d, fail
 +  adrp \a, IosAliasEntries
 +  add \a, \a, #:lo12:IosAliasEntries
 +  adrp \b, IosAliasCount
@@ -50,7 +50,7 @@ index fcb72a925..6c7d106c3 100644
 +  add \b, \a, \b, lsl #5          // cursor, one past the last entry
 +98:
 +  cmp \b, \a
-+  b.eq 99f                        // walked everything: not a known pool address
++  b.eq \fail                      // walked everything: not a known pool address
 +  sub \b, \b, #32
 +  ldr \c, [\b, #8]                // Entry.JitBase
 +  sub \c, \reg, \c                // offset (wraps when \reg < JitBase)
@@ -65,15 +65,55 @@ index fcb72a925..6c7d106c3 100644
  // Read by RetToEntryThunk below; ARM64EC/Module.cpp sets it at process init.
  .data
  .balign 8
-@@ -198,6 +229,7 @@ ios_thunk_bare:
+@@ -198,6 +229,47 @@ ios_thunk_bare:
    add x17, x9, x16
    add x17, x17, #6
  ios_thunk_slot:
++  // ml1209: the displacement this thunk's jmp carries is a LINK-TIME constant
++  // that belongs to the file, and the pool copy of it has been observed to
++  // differ. kernel32+0x35a70 is `48 8d a4 24 00 00 00 00 ff 25 <rel32>`: the
++  // file's rel32 is 0x1abd2, landing on rva 0x50650 in .rdata, which really is
++  // GetCommandLineA's IAT slot; the pool copy's rel32 is 0x11402, landing on
++  // rva 0x46e80 -- past the end of .hexpthk (va 0x40000 + 0x1cc0) and before
++  // .rdata (va 0x50000), i.e. the uninitialised gap, which reads as 0xcc
++  // filler. Following the pool copy therefore reads a constant that was never
++  // a target. Recompute the slot from the PE copy, the copy the linker wrote,
++  // and only then map it back into the pool to read.
++  //
++  // The pool-derived slot is kept on the stack as a fallback so that an image
++  // the alias table does not know behaves exactly as before. sp stays
++  // 16-aligned through the push/pop on every path.
++  str x17, [sp, #-16]!             // the pool-derived slot, as a fallback
++  mov x16, x9
++  IOS_POOL_TO_PE_TO x16, x10, x11, x12, x17, 89f
++  cmp x16, x9
++  b.eq 89f                         // unknown image: keep the pool-derived slot
++  ldr w10, [x16]
++  movz w11, #0x8d48
++  movk w11, #0x24a4, lsl #16       // hotpatched prologue 48 8d a4 24?
++  cmp w10, w11
++  b.ne 88f
++  ldursw x10, [x16, #10]           // yes: rel32 at +10, rip+14
++  add x17, x16, x10
++  add x17, x17, #14
++  b 87f
++88:
++  ldursw x10, [x16, #2]            // bare: rel32 at +2, rip+6
++  add x17, x16, x10
++  add x17, x17, #6
++87:
++  IOS_PE_TO_POOL_TO x17, x10, x11, x12, x16, 86f   // read the value from the pool copy
++86:
++  add sp, sp, #16                  // taken: drop the fallback
++  b 85f
++89:
++  ldr x17, [sp], #16               // fallback: the pool-derived slot
++85:
 +  mov x16, x17                     // ml1207: keep the slot address itself
    ldr x17, [x17]                   // the pointer the jmp loads
    // ml1136: the slot rarely holds the native body. loader.c's
    // arm64ec_iat_is_exported_x64 keeps the x64-VISIBLE 14-byte fast-forward stub
-@@ -239,6 +271,29 @@ ios_thunk_slot:
+@@ -239,6 +311,30 @@ ios_thunk_slot:
    // Frame: [sp+0]=slot value, [sp+8]=x4 (x64 R10), [sp+16]=x23, [sp+24]=hop budget.
    stp x17, x4, [sp, #-32]!         // keep sp 16-aligned; save slot value + R10
    stp x23, xzr, [sp, #16]
@@ -91,7 +131,8 @@ index fcb72a925..6c7d106c3 100644
 +  b.eq 91f
 +  cbnz x17, 92f
 +91:
-+  IOS_POOL_TO_PE_TO x16, x10, x11, x12, x23
++  IOS_POOL_TO_PE_TO x16, x10, x11, x12, x23, 93f
++93:
 +  ldr x17, [x16]
 +  str x17, [sp]                    // keep [sp] = the value actually in use
 +  adrp x23, IosFfsBypassLog
