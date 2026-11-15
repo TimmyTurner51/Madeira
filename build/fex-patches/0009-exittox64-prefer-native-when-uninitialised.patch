@@ -1,0 +1,60 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Madeira <madeira@example.invalid>
+Date: Sun, 15 Nov 2026 00:47:00 -0600
+Subject: [PATCH] ExitToX64: prefer the followed native body over emulation that
+ cannot exist
+
+Signed-off-by: Madeira <madeira@example.invalid>
+---
+--- a/Source/Windows/ARM64EC/Module.S	2026-11-15 00:47:31
++++ b/Source/Windows/ARM64EC/Module.S	2026-11-15 00:47:31
+@@ -501,6 +501,47 @@
+   add sp, sp, #32
+   br x17
+ ios_thunk_reject:
++  // ml1220: a rejection is not always the right answer.
++  //
++  // Reaching here means the bitmap says "not ARM64EC", and the normal response
++  // is to emulate, which is correct for a genuine x64 jmp target. But this site
++  // is also reached during process_attach's DllMain walk, where NO thread has a
++  // CpuStateFrame yet: enter_jit then reads an all-zero CPU area and executes
++  // `br x16` with x16 = 0, which is a guaranteed c0000005 at pc=0 -- exactly the
++  // crash that has survived builds 24..33 of this investigation. Emulating is
++  // not merely suboptimal there, it cannot work at all.
++  //
++  // Two conditions together make a native branch the only sound answer:
++  //   * at least one FFS stub was actually followed ([sp+24] != the initial 4),
++  //     so x17 is a target this code derived itself by walking a hybrid image's
++  //     .hexpthk stub. Such a stub's jmp target is that image's native ARM64EC
++  //     body BY CONSTRUCTION -- .hexpthk is the x64-visible face of native code,
++  //     which is why ucrtbase reaches it through an exit thunk in the first
++  //     place. The only thing the bitmap can still be wrong about is its own
++  //     marking, and an unmarked page is not evidence that the code is x64.
++  //   * DispatcherLoopTopEnterEC is NULL, i.e. FEX has not initialised this
++  //     thread, so the emulation branch would dereference NULL.
++  // If FEX is live the bitmap keeps its authority and nothing changes; if no
++  // stub was followed, x17 may be an arbitrary slot value and nothing changes.
++  ldr x23, [sp, #24]               // hop budget, 4 when nothing was followed
++  cmp x23, #4
++  b.eq 94f
++  IOS_LOAD_TEB x16
++  ldr x16, [x16, #0x1788]          // TEB->ChpeV2CpuAreaInfo
++  cbz x16, 94f
++  ldr x16, [x16, #0x40]            // ->EmulatorData[2] == DispatcherLoopTopEnterEC
++  cbnz x16, 94f                    // FEX is initialised: honour the bitmap
++  adrp x16, IosFfsBypassLog
++  add x16, x16, #:lo12:IosFfsBypassLog
++  ldr x23, [x16]
++  add x23, x23, #1
++  str x23, [x16]                   // [0] = bypass count (counted as a bypass)
++  str x17, [x16, #8]               // [1] = last target taken natively
++  ldr x4, [sp, #8]                 // restore x64 R10
++  ldr x23, [sp, #16]               // restore x64 nonvolatile x23
++  add sp, sp, #32
++  br x17
++94:
+   // Rejected into emulation. Unwind this frame and join the shared counter at
+   // ios_ffs_reject_count -- NOT ios_ffs_reject, whose ldp pairs with the push in
+   // ios_ffs_check and would corrupt sp by 16 bytes here.
+-- 
+2.51.0
