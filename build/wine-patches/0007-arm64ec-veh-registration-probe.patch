@@ -1,6 +1,6 @@
 --- a/dlls/ntdll/exception.c
 +++ b/dlls/ntdll/exception.c
-@@ -111,6 +111,41 @@
+@@ -111,6 +111,54 @@ static VECTORED_HANDLER *add_vectored_handler( LIST_ENTRY *handler_list, ULONG f
          RtlEnterCriticalSection( &vectored_handlers_section );
          if (first) InsertHeadList( handler_list, &handler->entry );
          else InsertTailList( handler_list, &handler->entry );
@@ -29,10 +29,23 @@
 +                void *module = NULL;
 +                UNICODE_STRING *name = NULL;
 +                LDR_DATA_TABLE_ENTRY *entry = NULL;
-+                RtlPcToFileHeader( handler->func, &module );
++                /* ml1254: resolve the CALLER's pointer, not the stored one.
++                 *
++                 * The probe used to pass handler->func, which is
++                 * RtlEncodePointer( func ) -- a value XORed with a per-process
++                 * cookie -- so RtlPcToFileHeader could never match it and every
++                 * registration in every run printed `module=...0 ?`. The log
++                 * from 11:17 and 11:37 therefore named no module at all, which
++                 * is the one thing this probe exists to say: WHO registers an
++                 * exception handler and from where.
++                 *
++                 * The stored value stays encoded -- that is the ABI's own
++                 * encoding, not ours to change -- and only the report uses the
++                 * raw pointer the caller supplied. */
++                RtlPcToFileHeader( func, &module );
 +                if (module && !LdrFindEntryForAddress( module, &entry ) && entry)
 +                    name = &entry->BaseDllName;
-+                ERR( "[veh-add] ml1252 #%ld func=%p module=%p %s order=%s\n", n, handler->func,
++                ERR( "[veh-add] ml1254 #%ld func=%p module=%p %s order=%s\n", n, func,
 +                     module,
 +                     name && name->Buffer ? debugstr_wn( name->Buffer, name->Length / sizeof(WCHAR) ) : "?",
 +                     first ? "first" : "last" );
@@ -42,19 +55,55 @@
          RtlLeaveCriticalSection( &vectored_handlers_section );
      }
      return handler;
-@@ -135,6 +170,17 @@
+@@ -121,6 +169,7 @@ static ULONG remove_vectored_handler( LIST_ENTRY *handler_list, VECTORED_HANDLER
+ {
+     PLIST_ENTRY mark, entry;
+     ULONG ret = FALSE;
++    void *removed_func = NULL;
+ 
+     RtlEnterCriticalSection( &vectored_handlers_section );
+     mark = handler_list;
+@@ -129,12 +178,44 @@ static ULONG remove_vectored_handler( LIST_ENTRY *handler_list, VECTORED_HANDLER
+         VECTORED_HANDLER *curr_handler = CONTAINING_RECORD( entry, VECTORED_HANDLER, entry );
+         if (curr_handler == handler)
+         {
++            /* ml1254: capture the identity before ReleaseEntryList/free can make
++             * this handler unreadable, and report the DECODED pointer -- the
++             * stored one is RtlEncodePointer( func ), so the old line named a
++             * function nobody could attribute to a module. */
++            removed_func = RtlDecodePointer( curr_handler->func );
+             if (!--*curr_handler->count) RemoveEntryList( entry );
+-            else handler = NULL;  /* don't free it yet */
++            /* `handler` stays set only when the count reached zero: the caller
++             * frees it in that case and must not in the other. */
++            else handler = NULL;
+             ret = TRUE;
              break;
          }
      }
 +#ifdef __arm64ec__
 +    /* ml1252: a removal is what makes "registered then gone" look identical to
 +     * "never registered" in the chain. Name the one that declined the #UD, so a
-+     * vanishing decryptor is visible rather than inferred. */
-+    if (ret && handler_list == &vectored_exception_handlers)
++     * vanishing decryptor is visible rather than inferred. ml1254 adds the
++     * function and its module, which is what makes the two cases tell apart:
++     * one registration of a Dr0-Dr7 harness is the anti-debug code, a second
++     * registration that is then removed is a decryptor's lifetime. */
++    if (ret && handler_list == &vectored_exception_handlers && removed_func)
 +    {
 +        static LONG rem_n;
 +        if (InterlockedIncrement( &rem_n ) <= 24)
-+            ERR( "[veh-add] ml1252 REMOVED handler from the chain (remove #%ld)\n", rem_n );
++        {
++            void *module = NULL;
++            UNICODE_STRING *name = NULL;
++            LDR_DATA_TABLE_ENTRY *mentry = NULL;
++            RtlPcToFileHeader( removed_func, &module );
++            if (module && !LdrFindEntryForAddress( module, &mentry ) && mentry)
++                name = &mentry->BaseDllName;
++            ERR( "[veh-add] ml1254 REMOVED func=%p module=%p %s (remove #%ld)\n",
++                 removed_func, module,
++                 name && name->Buffer ? debugstr_wn( name->Buffer, name->Length / sizeof(WCHAR) ) : "?",
++                 rem_n );
++        }
 +    }
 +#endif
      RtlLeaveCriticalSection( &vectored_handlers_section );

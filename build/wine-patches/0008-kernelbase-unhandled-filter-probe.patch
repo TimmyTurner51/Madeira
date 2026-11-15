@@ -1,0 +1,119 @@
+--- a/dlls/kernelbase/debug.c
++++ b/dlls/kernelbase/debug.c
+@@ -447,13 +447,62 @@ void WINAPI DECLSPEC_HOTPATCH RaiseFailFastException( EXCEPTION_RECORD *record,
+     for (;;) NtRaiseException( record, context, FALSE );
+ }
+ 
++/* ml1255: "<module path>" for an address, for the [uef] probes. Uses only
++ * APIs this file already calls, so it works before the loader has finished. */
++static const char *uef_where( void *addr, char *buf, size_t buflen )
++{
++    void *module = NULL;
++    WCHAR name[MAX_PATH];
++    DWORD len;
++
++    if (!addr) return "null";
++    RtlPcToFileHeader( addr, &module );
++    if (!module) return "no-module";
++    len = GetModuleFileNameW( module, name, MAX_PATH );
++    if (!len || len >= MAX_PATH) return "?";
++    if (!WideCharToMultiByte( CP_ACP, 0, name, len, buf, buflen, NULL, NULL )) return "?";
++    buf[buflen - 1] = 0;
++    return buf;
++}
++
+ /***********************************************************************
+  *           SetUnhandledExceptionFilter   (kernelbase.@)
+  */
+ LPTOP_LEVEL_EXCEPTION_FILTER WINAPI DECLSPEC_HOTPATCH SetUnhandledExceptionFilter(
+     LPTOP_LEVEL_EXCEPTION_FILTER filter )
+ {
+-    return InterlockedExchangePointer( (void **)&top_filter, filter );
++    LPTOP_LEVEL_EXCEPTION_FILTER prev = InterlockedExchangePointer( (void **)&top_filter, filter );
++
++    /* iOS-Madeira ml1255: name the OTHER registration site.
++     *
++     * [veh-add] watches RtlAddVectoredExceptionHandler, and in the Forza runs it
++     * shows exactly one handler -- the Dr0-Dr7 anti-debug harness. A decrypt-on-
++     * fault filter would not appear there at all, because this is where it would
++     * register: SetUnhandledExceptionFilter, not a vectored handler. So "no
++     * decryptor registered" was only true of one of the two chains, and the
++     * unhandled filter is the one whose verdict the run actually reaches
++     * (UnhandledExceptionFilter is called by the frame walk and declines).
++     *
++     * Logged with the setting module resolved, so the log says whether the game
++     * installs a filter before its first encrypted function runs, and what it
++     * replaced. Capped: a CRT start installs one, but a crash-reporter may
++     * reinstall per thread. */
++    {
++        static LONG set_n;
++        if (InterlockedIncrement( &set_n ) <= 8)
++        {
++            char cbuf[160], fbuf[160];
++
++            /* Who called, and where does the filter itself live? The second is
++             * the one that decides whether the game installed a handler of its
++             * own: a filter inside forzahorizon6.exe is the guest's, one inside
++             * ntdll/kernelbase is Wine's own crash plumbing. */
++            ERR( "[uef] ml1255 set #%ld: filter=%p (%s) replaces %p, called from %s\n",
++                 set_n, (void *)filter, uef_where( (void *)filter, fbuf, sizeof(fbuf) ),
++                 prev, uef_where( __builtin_return_address( 0 ), cbuf, sizeof(cbuf) ) );
++        }
++    }
++    return prev;
+ }
+ 
+ 
+@@ -753,6 +802,27 @@ LONG WINAPI UnhandledExceptionFilter( EXCEPTION_POINTERS *epointers )
+     const EXCEPTION_RECORD *rec = epointers->ExceptionRecord;
+     BOOL nested;
+ 
++    /* iOS-Madeira ml1255: the verdict, stated instead of inferred.
++     *
++     * Forza's #UD reaches this function (the frame walk's last handler is the
++     * exe's import thunk for it) and the process then dies. From the outside
++     * that looks the same whether (a) no guest filter was ever installed, (b) a
++     * guest filter was installed and returned CONTINUE_SEARCH, or (c) Wine never
++     * consulted it because BeingDebugged was set. Those need different work, and
++     * the log said nothing about which one happened -- so print it. */
++    {
++        static LONG uef_n;
++        if (InterlockedIncrement( &uef_n ) <= 16)
++        {
++            nested = rec->ExceptionFlags & EXCEPTION_NESTED_CALL;
++            ERR( "[uef] ml1255 verdict: code=%08lx addr=%p BeingDebugged=%d top_filter=%p "
++                 "nested=%d err_mode=%04x\n",
++                 rec->ExceptionCode, rec->ExceptionAddress,
++                 (int)NtCurrentTeb()->Peb->BeingDebugged, (void *)top_filter,
++                 (int)nested, (unsigned)GetErrorMode() );
++        }
++    }
++
+     if (rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && rec->NumberParameters >= 2)
+     {
+         switch (rec->ExceptionInformation[0])
+@@ -776,8 +846,24 @@ LONG WINAPI UnhandledExceptionFilter( EXCEPTION_POINTERS *epointers )
+         if (top_filter && !nested)
+         {
+             LONG ret = top_filter( epointers );
++            /* ml1255: the guest filter's actual answer. CONTINUE_SEARCH here is
++             * the difference between "installed and declined" and "never
++             * installed", and only this line can tell them apart. */
++            {
++                static LONG f_n;
++                if (InterlockedIncrement( &f_n ) <= 16)
++                    ERR( "[uef] ml1255 top_filter=%p returned %ld for code=%08lx\n",
++                         (void *)top_filter, ret, rec->ExceptionCode );
++            }
+             if (ret != EXCEPTION_CONTINUE_SEARCH) return ret;
+         }
++        else
++        {
++            static LONG n_n;
++            if (InterlockedIncrement( &n_n ) <= 16)
++                ERR( "[uef] ml1255 no guest filter consulted: top_filter=%p nested=%d\n",
++                     (void *)top_filter, (int)nested );
++        }
+ 
+         if ((GetErrorMode() & SEM_NOGPFAULTERRORBOX) ||
+             !start_debugger_atomic( epointers ) || !NtCurrentTeb()->Peb->BeingDebugged)

@@ -793,3 +793,63 @@ rather than another inference:
   its `func=` value cannot be attributed to a module. Logging the decoded value and the
   removal path turns "one registration" into "this function, from this module, added and
   not removed".
+
+## 2026-11-15 12:01 — the one handler is the anti-debug harness, and it declines by design
+
+A clean rerun (12:01:54, same 28 build, no `env.FEX_*`) reproduced the state exactly:
+`c000001d` = 10, `[alloc-fail]` = 507, fault at `0x14537099C`. That makes the counts in
+this document a measurement rather than a one-off, and it let the chain entry be
+identified without a rebuild.
+
+The single handler `[veh-chain]` reports, `0x1453CD858`, is `forzahorizon6.exe+0x53CD858`,
+a 5-byte jump to the real body at `+0x53D9270`. Disassembled, that body:
+
+- reads the `ContextRecord` pointer and does `cmp byte ptr [rax + 0x70], sil` — offset
+  `0x70` is `AMD64_Dr7` in the ARM64EC `CONTEXT`, i.e. the debug-register check;
+- loads a lazily-initialised pointer at `+0xab88560`, calls it, stores its return into a
+  flag byte, and branches on that flag before anything else;
+- xors the exception code with the immediate `0xf58ad36680ab1cf9` before testint it, so
+  `c000001d` is not compared in the clear.
+
+So the earlier reading is right and now has a mechanism: this handler is the protection's
+anti-debug and switch harness. It is reached and returns `CONTINUE_SEARCH` because it was
+never meant to decrypt anything — the decryptor is a *different* component that never
+appears in the chain (`[veh-add]` = 1, `[veh-remove]` = 0).
+
+### The staging block is not the problem
+
+Compared with the earlier reading of the 506 failures, the interesting part is the one
+that **succeeds**, and it succeeds immediately before the handler is registered:
+
+```
+[alloc-fail] ml814 #28416 ... hint=0x70512c1000 size=0x1001000 type=0x3000 protect=0x40
+[guest-rwx] #1 0x706d2d0000+0x1010000 prot=rwx — anonymous guest memory, EXEC is FEX bookkeeping; applying rw- instead
+D EC Add SMC interval: 706D2D0000 - 706E2DE000
+[veh-add] ml1252 #1 func=...  order=first
+E EC Invalid instruction in entry block: 14537099C
+```
+
+A 16 MB RWX block is granted and announced to FEX as an SMC interval, the handler is
+installed, and only then is the enciphered entry reached. So the protection's loader does
+get a staging area here; what it does not do is decrypt.
+
+### The debugger is not the reason it declines
+
+Madeira's Mach debugger detaches at `12:01:45.416`, long before the fault, so the `Dr7`
+check cannot be reading a Madeira-induced value. That refutes the one "we broke it"
+hypothesis this shape supported, and it means the declining decision is made on data the
+protection reads about the process, not on the debug registers.
+
+### What the next build measures
+
+Two things are now cheap and decisive, and both are in the build that is compiling
+(`ml1254`/`ml1255`):
+
+- `[veh-add]`/`[veh-add] REMOVED` now report the **decoded** pointer and its module. The
+  old line passed `RtlEncodePointer( func )`, so every registration printed
+  `module=...0 ?` — the one field that would name the harness's own module was always
+  unreadable.
+- `[uef]` reports every `SetUnhandledExceptionFilter` call (filter, its module, its
+  caller), and `UnhandledExceptionFilter`'s verdict: `BeingDebugged`, `top_filter`, and
+  what the filter returned. The unhandled filter is the other chain a decryptor could
+  register on, and nothing has ever looked at it.
