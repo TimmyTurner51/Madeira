@@ -1,0 +1,237 @@
+From: Madeira <noreply@localhost>
+Subject: [PATCH] exittox64: record the dispatch route in IosFfsBypassLog
+
+ml1230-1236 recorded ExitToX64's branch route in cpu_area, treating words
+0x48/0x50/0x54 as spare. They are not: 0x48 is EmulatorData[3],
+DispatcherLoopTopEnterECFillSRA, which BeginSimulation loads and branches
+through (ldr x16,[x17,#0x48]). Storing x9 there on every entry replaced a
+live dispatcher pointer with a guest code address, so the next
+BeginSimulation branched natively into x86-64 bytes and raised
+STATUS_ILLEGAL_INSTRUCTION at forzahorizon6.exe+0x536d6bc. That fault was
+the probe, not the game.
+
+Record the route in Module.S's own IosFfsBypassLog array instead -- plain
+.data that only this file and Core.cpp's reporter touch, so it cannot
+corrupt dispatch. [18] = x9 at entry, [19] = route: 0x44 entry, 0x41
+ios_ffs_check (not a thunk shape), 0x42 ios_ec_entry_miss (bitmap said
+not-EC), 0x43 ios_thunk_slot (shape recognised). Core.cpp prints both on
+change as [ffs-route], so a fault can be attributed to one call.
+
+---
+ FEXCore/Source/Interface/Core/Core.cpp |  19 +++
+ Source/Windows/ARM64EC/Module.S       |  74 ++++++-------
+---
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+index d04288821..af956c7ac 100644
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -1559,6 +1559,28 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
+     }
+   }
+ 
++  /* [ffs-route] names the branch ExitToX64 took on the most recent call, and the
++   * argument it was handed. Reported on change so a fault can be attributed to a
++   * single call: 0x44 entry, 0x41 ios_ffs_check (not a thunk shape), 0x42
++   * ios_ec_entry_miss (bitmap said not-EC), 0x43 ios_thunk_slot (thunk shape
++   * recognised). These live in this array rather than in cpu_area because
++   * cpu_area[0x48] is EmulatorData[3], DispatcherLoopTopEnterECFillSRA -- a live
++   * dispatcher pointer that BeginSimulation branches through, so writing it made
++   * the next BeginSimulation jump into x86-64 bytes. */
++  {
++    static uint64_t RouteLast = 0;
++    static uint32_t RouteReports = 0;
++    const uint64_t Route = (IosFfsBypassLog[19] << 32) ^ IosFfsBypassLog[18];
++    if (Route != RouteLast && RouteReports < 12) {
++      RouteLast = Route;
++      RouteReports++;
++      LogMan::Msg::EFmt("[ffs-route] last route={:#x} (0x44 entry, 0x41 ios_ffs_check, "
++                        "0x42 ec_entry_miss, 0x43 thunk_slot) x9={:#x}",
++                        IosFfsBypassLog[19], IosFfsBypassLog[18]);
++    }
++  }
++
++
+   /* [ffs-follow] proves the 0005 chain actually ran: how many x64 fast-forward
+    * prologues ExitToX64 unwrapped, and the last native target reached. A run
+    * that reaches a hybrid export now shows a non-zero count here, so a repeat of
+diff --git a/Source/Windows/ARM64EC/Module.S b/Source/Windows/ARM64EC/Module.S
+index da9c640ee..67bbb5ce7 100644
+--- a/Source/Windows/ARM64EC/Module.S
++++ b/Source/Windows/ARM64EC/Module.S
+@@ -114,38 +114,7 @@
+ .globl IosRetToJit
+ IosRetToJit:
+   .word 0
+-
+-// ml1230: which route reached enter_jit.
+-//
+-// The 08:10 run proved the ARM64EC target is correct -- thunk slot rva 0x50650
+-// holds 0x153b6c7fc (kernelbase+0x547fc) and the SEGV dump says [EC=1] -- yet
+-// the call still reached enter_jit and branched to NULL. Both paths that
+-// should have prevented that (the bitmap test's EC branch, and ml1222's
+-// "FEX uninitialised + real target -> branch natively" guard) are supposed to
+-// make enter_jit unreachable for this call, so reading the code cannot say
+-// which one let it through. Each route stamps its own byte here and enter_jit
+-// writes the record to stderr once, so one run names the gate instead of
+-// another round of inference.
+-//
+-//   '1' check_target_ec   -- the pre-ExitToX64 dispatch_call bitmap test
+-//   '2' ios_ffs_reject    -- thunk-reject path (guard declined)
+-//   '3' ios_ffs_no_bypass -- no x64 thunk shape matched at all
+-.balign 8
+-.globl IosJitGateMsg
+-IosJitGateMsg:
+-  .ascii "\n[jit-gate] "
+-  .byte 0x30                      // offset 12: the route tag
+-  .byte 0x0a                      // offset 13: newline
+ .text
+-
+-// Stamp the route tag. x16/x17 are IP0/IP1: dead at every call boundary and
+-// unused by the tail of each route below.
+-.macro IOS_SET_GATE imm
+-  adrp x16, IosJitGateMsg
+-  add x16, x16, #:lo12:IosJitGateMsg
+-  mov w17, #\imm
+-  strb w17, [x16, #12]
+-.endm
+ #endif
+ 
+   // __os_arm64x_x64_jump in ARM64EC docs
+@@ -183,9 +152,6 @@ check_target_ec:
+   lsr x17, x9, #12
+   lsr x16, x16, x17
+   tbnz x16, #0, ExitFunctionEC
+-#ifdef FEX_IOS_HOST
+-  IOS_SET_GATE 0x31               // ml1230: dispatch_call bitmap said "not EC"
+-#endif
+   b enter_jit
+ 
+   // __os_arm64x_dispatch_call_no_redirect in ARM64EC docs
+@@ -239,6 +205,28 @@ ExitToX64:
+   // restored to the thunk (emulating the thunk itself is the correct x64 behaviour).
+   // Scratch x16/x17 only until ios_thunk_slot, which spills x4/x9 before using
+   // x4/x23 as well.
++  //
++  // ml1237: per-call route probe, recorded in Module.S's own IosFfsBypassLog
++  // array and NEVER in cpu_area.
++  //
++  // ml1234-1236 wrote this into cpu_area[0x48]/[0x50]/[0x54] on the assumption
++  // those words were spare. They are not: 0x48 is EmulatorData[3],
++  // DispatcherLoopTopEnterECFillSRA, which BeginSimulation loads and branches
++  // through (`ldr x16,[x17,#0x48]`). Storing x9 there on every ExitToX64 entry
++  // replaced a live dispatcher pointer with a guest code address, so the next
++  // BeginSimulation branched natively into x86-64 bytes and raised
++  // STATUS_ILLEGAL_INSTRUCTION at forzahorizon6.exe+0x536d6bc. That fault was
++  // the probe, not the game.
++  //
++  // IosFfsBypassLog is a plain .data array that only this file and Core.cpp's
++  // reporter touch, so it cannot corrupt dispatch. [18] = x9 at entry,
++  // [19] = route (0x44 entry, 0x41 ios_ffs_check, 0x42 ios_ec_entry_miss,
++  // 0x43 ios_thunk_slot); the reporter prints both on change.
++  adrp x16, IosFfsBypassLog
++  add x16, x16, #:lo12:IosFfsBypassLog
++  str x9, [x16, #144]              // [18] = the argument this call was handed
++  mov w17, #0x44
++  str w17, [x16, #152]             // [19] = route
+   ldrh w16, [x9]
+   movz w17, #0x25ff
+   cmp w16, w17
+@@ -263,6 +251,11 @@ ios_thunk_bare:
+   add x17, x9, x16
+   add x17, x17, #6
+ ios_thunk_slot:
++  // ml1237: route tag -- a thunk shape WAS recognised.
++  adrp x16, IosFfsBypassLog
++  add x16, x16, #:lo12:IosFfsBypassLog
++  mov w17, #0x43
++  str w17, [x16, #152]             // [19] = route
+   // ml1209: the displacement this thunk's jmp carries is a LINK-TIME constant
+   // that belongs to the file, and the pool copy of it has been observed to
+   // differ. kernel32+0x35a70 is `48 8d a4 24 00 00 00 00 ff 25 <rel32>`: the
+@@ -665,10 +658,23 @@ ios_ec_entry:
+   ldp x4, x23, [sp], #16
+   br x17                         // native ARM64EC: x0-x8 and lr untouched
+ ios_ec_entry_miss:
++  // ml1237: route tag -- the EC bitmap refused this target. Safe array, not
++  // cpu_area (see ExitToX64's note).
++  adrp x16, IosFfsBypassLog
++  add x16, x16, #:lo12:IosFfsBypassLog
++  mov w17, #0x42
++  str w17, [x16, #152]             // [19] = route
+   ldp x4, x23, [sp], #16
+   b ios_ffs_no_bypass            // not EC: emulate, exactly as before
+ 
+ ios_ffs_check:
++  // ml1237: route tag, in the safe array (see ExitToX64's note -- cpu_area[0x48]
++  // is EmulatorData[3], a live dispatcher pointer, and writing it caused the
++  // STATUS_ILLEGAL_INSTRUCTION at forzahorizon6.exe+0x536d6bc).
++  adrp x16, IosFfsBypassLog
++  add x16, x16, #:lo12:IosFfsBypassLog
++  mov w17, #0x41
++  str w17, [x16, #152]             // [19] = route
+   ldr x16, [x9]
+   movz x17, #0x8b48
+   movk x17, #0x48c4, lsl #16
+@@ -741,7 +747,6 @@ ios_ffs_xlate_done:
+   str x17, [x16, #8]     // [1] = last EC target taken natively
+   br x17                 // PE VA; the Mach exec-fault redirect maps it to the pool copy
+ ios_ffs_reject:
+-  IOS_SET_GATE 0x32               // ml1230: thunk reject (ml1222 guard declined)
+   // Pattern matched but the (PE-space) target is not EC per the bitmap: fall
+   // through to normal emulation -- correct for genuine x64 jmp targets -- but
+   // COUNT it, so a run with zero bypasses is distinguishable from one where the
+@@ -755,54 +760,12 @@ ios_ffs_reject_count:
+   str x23, [x16, #16]    // [2] = matched-but-rejected count
+   str x17, [x16, #24]    // [3] = last rejected (PE-space) target
+ ios_ffs_no_bypass:
+-  // ml1230: default route tag, but never overwrite an earlier stamp -- the
+-  // reject path arrives here too and '2' is the more specific answer.
+-  adrp x16, IosJitGateMsg
+-  add x16, x16, #:lo12:IosJitGateMsg
+-  ldrb w17, [x16, #12]
+-  cbnz w17, 77f
+-  IOS_SET_GATE 0x33               // no x64 thunk shape matched
+-77:
+   IOS_XP_COUNT 2112, x16, x17   // ml1131: EC->x64 call (callback) emulated
+ #endif
+   str lr, [sp, #-8]! // Push return address to stack, this will be popped by the x86 RET instr.
+ 
+ enter_jit:
+ #ifdef FEX_IOS_HOST
+-  // ml1231: publish the route that got here, before anything else runs.
+-  //
+-  // Raw Darwin write(2) through svc #0x80: fd 2 at the unix layer is the
+-  // madeira-log.txt that ntdll-unix already writes to, so this needs no CRT,
+-  // no import table and no TEB. x0-x5 are RCX/RDX/R8/R9 and the ARM64EC
+-  // variadic descriptor, so they are spilled rather than assumed dead.
+-  //
+-  // ml1231 fixes an alignment fault that made the FIRST build of this fault
+-  // here instead of reporting: enter_jit is entered with sp at 8 mod 16 (the
+-  // `str x30,[sp,#-8]!` just above pushes one register), and `stp ...,[sp,#-n]!`
+-  // with SP as the writeback base requires 16-byte alignment -- the SEGV log
+-  // showed BUS_ADRALN on this very instruction, a9bd07e0 at enter_jit+0.
+-  // Plain 8-byte str/ldr and a `sub sp` (which has no alignment requirement)
+-  // work whatever alignof(sp-16) is, and the frame is restored exactly.
+-  sub sp, sp, #0x40
+-  str x0, [sp]
+-  str x1, [sp, #8]
+-  str x2, [sp, #16]
+-  str x3, [sp, #24]
+-  str x4, [sp, #32]
+-  str x5, [sp, #40]
+-  adrp x1, IosJitGateMsg
+-  add x1, x1, #:lo12:IosJitGateMsg
+-  mov x0, #2                      // fd 2
+-  mov x2, #14                     // "\n[jit-gate] X\n"
+-  mov w16, #4                     // syscall 4 == write
+-  svc #0x80
+-  ldr x0, [sp]
+-  ldr x1, [sp, #8]
+-  ldr x2, [sp, #16]
+-  ldr x3, [sp, #24]
+-  ldr x4, [sp, #32]
+-  ldr x5, [sp, #40]
+-  add sp, sp, #0x40
+   IOS_LOAD_TEB x17
+   ldr x17, [x17, #0x1788] // TEB->ChpeV2CpuAreaInfo
+ #else
