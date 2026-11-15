@@ -7957,7 +7957,7 @@ dispatch_guest_fault:
                             const uint64_t *ec_map = ios_arm64ec_bitmap_base();
                             uint64_t x9 = state.__x[9];
                             uint64_t x9_mod = 0, x9_va = ios_jit_reverse_translate( x9, &x9_mod );
-                            unsigned char bytes[8];
+                            unsigned char bytes[14];
                             mach_vm_size_t got_b = 0;
                             int ec_bit = -1;
 
@@ -7972,17 +7972,29 @@ dispatch_guest_fault:
                                 (unsigned long long)x9_va,
                                 x9_mod ? ios_pe_module_name(x9_mod) : "(no module)",
                                 (unsigned long long)(x9_va && x9_mod ? x9_va - x9_mod : 0));
+                            /* ml1235: read all FOURTEEN bytes, not eight. The
+                             * shape test ExitToX64 runs reads +0..+3, +4..+7 and
+                             * the halfword at +8; the old 8-byte read stopped one
+                             * byte short of the `ff 25`, so the only field it
+                             * could not compare was the one that decides the
+                             * route. This is the POOL copy (x9 is a pool VA). */
                             if (mach_vm_read_overwrite(mach_task_self(),
                                     (mach_vm_address_t)x9, sizeof(bytes),
-                                    (mach_vm_address_t)bytes, &got_b) == KERN_SUCCESS && got_b == 8)
+                                    (mach_vm_address_t)bytes, &got_b) == KERN_SUCCESS && got_b == sizeof(bytes))
                                 dprintf(STDERR_FILENO,
                                     "[x9-probe] bytes: %02x %02x %02x %02x %02x %02x %02x %02x"
-                                    " -> %s\n",
+                                    " | %02x %02x %02x %02x %02x %02x -> %s\n",
                                     bytes[0], bytes[1], bytes[2], bytes[3],
                                     bytes[4], bytes[5], bytes[6], bytes[7],
+                                    bytes[8], bytes[9], bytes[10], bytes[11],
+                                    bytes[12], bytes[13],
                                     (bytes[0] == 0xff && bytes[1] == 0x25) ? "bare jmp *IAT thunk"
                                     : (bytes[0] == 0x48 && bytes[1] == 0x8d && bytes[2] == 0xa4
-                                       && bytes[3] == 0x24) ? "hotpatched IAT thunk"
+                                       && bytes[3] == 0x24 && !bytes[4] && !bytes[5] && !bytes[6]
+                                       && !bytes[7]) ?
+                                        ((bytes[8] == 0xff && bytes[9] == 0x25)
+                                            ? "hotpatched IAT thunk (full match)"
+                                            : "HOTPATCH PROLOGUE, WRONG BYTES AT +8")
                                     : (bytes[0] == 0x48 && bytes[1] == 0x8b && bytes[2] == 0xc4)
                                         ? "x64 FFS fast-forward"
                                     : "AArch64 code (not an x64 thunk)");

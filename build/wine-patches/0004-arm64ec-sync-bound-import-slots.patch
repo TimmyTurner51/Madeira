@@ -1,37 +1,29 @@
-From 580615171ed573239c22cc17bdb951a71749fdb5 Mon Sep 17 00:00:00 2001
-From: Madeira <madeira@example.invalid>
-Date: Sun, 15 Nov 2026 01:38:03 -0600
+From: Madeira <noreply@localhost>
 Subject: [PATCH] ntdll: sync hotpatched import thunks into the pool copy
 
-ExitToX64 decodes the import thunk at x9, and x9 is a pool address because the
-guest executes the pool copy. On kernel32+0x35a70 the pool copy's rel32 reads
-0x11402, landing on rva 0x46e80 -- the gap between .hexpthk and .rdata,
-uninitialised, so it reads as 0xcc. The file's rel32 is 0x1abd2, landing on
-0x50650, which is really GetCommandLineA's IAT slot (checked against the
-built kernel32.dll). The decoded thunk therefore names nothing, while the
-slot the loader bound lives elsewhere.
+The guest executes the pool copy of an image, so a hotpatched import thunk
+must agree with the file byte for byte. On kernel32+0x35a70 the pool copy's
+rel32 read 0x11402, landing on rva 0x46e80 -- the uninitialised gap between
+.hexpthk and .rdata -- so the thunk pointed at nothing while the slot the
+loader bound sat elsewhere.
 
-ExitToX64 already works around this (ml1209) by re-deriving the slot from the
-PE copy, but falls back to the pool-derived slot when that read looks
-unbound, and the fallback is the 0xcc address.
+Sync the halfword at +8 as well. The scan tests p[0..9] in the PE copy and
+used to write only p+10..p+13, so the pool copy's `ff 25` at +8 was never
+written or checked -- and that is exactly the field ExitToX64 tests from the
+pool copy (`ldrh w16,[x9,#8]; cmp w16,#0x25ff`). The 09:22 run repaired
+nothing because a single 14-byte request is refused by the unix layer linked
+into the running app; two 4-byte writes (+8 and +10) cover the same bytes,
+each memcmp-verified, and stay within the sizes that layer accepts.
 
-Repair the data instead: scan each hybrid module's executable sections for the
-10-byte prologue build/wine-patches/0001 installs, and push each thunk's
-4-byte rel32 from the PE view into the pool copy through the same unix call
-0004 uses. size 4 selects the byte-copy branch, not the pointer branch -- a
-rel32 is a displacement, and translating it as an address would repeat the
-0xcc mistake in another form. Only a full prologue match writes, and it writes
-the value the PE view already holds, so a false positive is a no-op.
+Only thunks whose full 10-byte prologue matched in the PE copy are touched,
+and one that already agrees costs a redundant write of identical bytes.
 
-Signed-off-by: Madeira <madeira@example.invalid>
-Co-authored-by: Cursor <cursoragent@cursor.com>
 ---
- dlls/ntdll/loader.c         |  2 +-
- dlls/ntdll/signal_arm64ec.c | 84 ++++++++++++++++++++++++++++++++++---
- 2 files changed, 80 insertions(+), 6 deletions(-)
-
+ dlls/ntdll/loader.c         |   2 +-
+ dlls/ntdll/signal_arm64ec.c |  84 ++++++++++++++++++++++++++++++++++++++-------
+---
 diff --git a/dlls/ntdll/loader.c b/dlls/ntdll/loader.c
-index e97737fc..69482fc7 100644
+index e97737fc..8aa20ecc 100644
 --- a/dlls/ntdll/loader.c
 +++ b/dlls/ntdll/loader.c
 @@ -5809,7 +5809,7 @@ void loader_init( CONTEXT *context, void **entry )
@@ -39,15 +31,15 @@ index e97737fc..69482fc7 100644
          /* The suffix identifies THIS ntdll: the deployed PE can be shadowed by
           * the app bundle's copy, and a bare line cannot tell them apart. */
 -        ERR( "loader_init: calling load_arm64ec_module [ntdll ml1228 iat-sync v4]\n" );
-+        ERR( "loader_init: calling load_arm64ec_module [ntdll ml1229 iat-sync v5]\n" );
++        ERR( "loader_init: calling load_arm64ec_module [ntdll ml1236 thunk+8 sync]\n" );
          load_arm64ec_module();
          ERR( "loader_init: load_arm64ec_module returned, calling update_load_config\n" );
          update_load_config( wm->ldr.DllBase );
 diff --git a/dlls/ntdll/signal_arm64ec.c b/dlls/ntdll/signal_arm64ec.c
-index 1f10c4dc..5112f6ca 100644
+index 1f10c4dc..3942332e 100644
 --- a/dlls/ntdll/signal_arm64ec.c
 +++ b/dlls/ntdll/signal_arm64ec.c
-@@ -1183,6 +1183,74 @@ static HMODULE find_loaded_module_ansi( const char *name )
+@@ -1183,6 +1183,96 @@ static HMODULE find_loaded_module_ansi( const char *name )
   * for explicitly rather than by size. */
  #define IAT_TRAP_FILLER 0xccccccccccccccccULL
  
@@ -94,25 +86,47 @@ index 1f10c4dc..5112f6ca 100644
 +        for (; p + 14 <= end; p++)
 +        {
 +            struct ios_sync_pe_write_params params;
++            UINT off;
 +
 +            if (p[0] != 0x48 || p[1] != 0x8d || p[2] != 0xa4 || p[3] != 0x24) continue;
 +            if (p[4] || p[5] || p[6] || p[7]) continue;
 +            if (p[8] != 0xff || p[9] != 0x25) continue;
 +
 +            hits++;
-+            params.address = (void *)(p + 10);
-+            params.size = sizeof(ULONG);
-+            params.synced = 0;
-+            if (__wine_unixlib_handle)
++            /* ml1235: sync the halfword at +8 too, not just the rel32.
++             *
++             * The scan above tests p[0..9] in the PE copy, then used to write
++             * only p+10..p+13 -- so the pool copy's `ff 25` at +8 was never
++             * written or checked. ExitToX64 decodes the shape from the POOL copy
++             * (`ldrh w16,[x9,#8]; cmp w16,#0x25ff`) and bails to ios_ffs_check
++             * when it does not match, which is the route the 09:14 run took
++             * (tag 0x42) for a thunk whose PE bytes are textbook-correct. Bytes
++             * 0..7 were confirmed in the pool by the crash probe's 8-byte read;
++             * +8 is the first byte past it.
++             *
++             * Two 4-byte writes, not one 14-byte write: unixcall_ios_sync_pe_write
++             * in the layer linked into the running app only accepts 4- and
++             * 8-byte raw writes, and refuses anything else with
++             * STATUS_INVALID_PARAMETER -- a 14-byte request reported
++             * "792 found, 0 synced" and repaired nothing. Together these two
++             * writes cover +8..+13, which is every byte the header check plus
++             * the jmp need, and each is memcmp-verified by the unix side. */
++            for (off = 8; off <= 10; off += 2)
 +            {
-+                /* size 4 takes unixcall_ios_sync_pe_write's byte-copy branch
-+                 * (ios_jit_sync_write), not the pointer branch: a rel32 is an
-+                 * integer displacement, and translating it as a VA would be
-+                 * the same class of mistake as the 0xcc boundness test. */
-+                WINE_UNIX_CALL( unix_ios_sync_pe_write, &params );
-+                if (params.synced) synced++;
++                params.address = (void *)(p + off);
++                params.size = sizeof(ULONG);
++                params.synced = 0;
++                if (__wine_unixlib_handle)
++                {
++                    /* size 4 takes unixcall_ios_sync_pe_write's byte-copy branch
++                     * (ios_jit_sync_write), not the pointer branch: a thunk is raw
++                     * instruction bytes, and translating any part of it as a VA
++                     * would be the same class of mistake as the 0xcc test. */
++                    WINE_UNIX_CALL( unix_ios_sync_pe_write, &params );
++                    if (params.synced) synced++;
++                }
 +            }
-+            p += 13;  /* past this thunk's rel32 */
++            p += 13;  /* past this thunk's rel32 (the loop's ++p lands on +14) */
 +        }
 +    }
 +    *found += hits;
@@ -122,7 +136,7 @@ index 1f10c4dc..5112f6ca 100644
  ULONG arm64ec_sync_bound_iat_slots(void)
  {
      PEB *peb = RtlGetCurrentPeb();
-@@ -1339,11 +1407,17 @@ ULONG arm64ec_sync_bound_iat_slots(void)
+@@ -1339,11 +1429,17 @@ ULONG arm64ec_sync_bound_iat_slots(void)
          bound += mslots - munbound - mfiller;
          synced += msynced;
          filler += mfiller;
@@ -145,6 +159,3 @@ index 1f10c4dc..5112f6ca 100644
          if (have_gcla)
              ERR( "[iat-sync]   %s GetCommandLineA slot rva=%lx pe-value=%p\n",
                   debugstr_w( entry->BaseDllName.Buffer ),
--- 
-2.54.0 (Apple Git-156)
-

@@ -1,0 +1,210 @@
+From: Madeira <noreply@localhost>
+Subject: [PATCH] exittox64: per-call route probe for the dispatch paths
+
+ml1230-1233 stamped route tags into the guest CPU area, but cpu_area is
+per-thread and never cleared, so a tag left by an earlier ExitToX64 call
+survived to the fault dump and read as if it described the faulting call:
+ml1233 reported ios_ec_entry_miss for a call whose x9 was a textbook
+hotpatched thunk, which the shape test cannot produce.
+
+ExitToX64 now stamps 0x44 on every entry together with that call's x9 and
+its first dword, and each route overwrites it -- 0x41 ios_ffs_check,
+0x42 ios_ec_entry_miss, 0x43 ios_thunk_slot. Whatever the fault dump shows
+in cpu_area[0x54] therefore describes the call that faulted. Those words
+are already printed by the SEGV handler.
+
+enter_jit is left alone: it must not touch sp (both earlier probes faulted
+there, the second with addr=0x0), and no probe belongs on that path.
+
+---
+ Source/Windows/ARM64EC/Module.S |  1 file changed, 63 insertions(+), 70 deletions(-)
+---
+diff --git a/Source/Windows/ARM64EC/Module.S b/Source/Windows/ARM64EC/Module.S
+index da9c640ee..6c5e12404 100644
+--- a/Source/Windows/ARM64EC/Module.S
++++ b/Source/Windows/ARM64EC/Module.S
+@@ -114,38 +114,7 @@
+ .globl IosRetToJit
+ IosRetToJit:
+   .word 0
+-
+-// ml1230: which route reached enter_jit.
+-//
+-// The 08:10 run proved the ARM64EC target is correct -- thunk slot rva 0x50650
+-// holds 0x153b6c7fc (kernelbase+0x547fc) and the SEGV dump says [EC=1] -- yet
+-// the call still reached enter_jit and branched to NULL. Both paths that
+-// should have prevented that (the bitmap test's EC branch, and ml1222's
+-// "FEX uninitialised + real target -> branch natively" guard) are supposed to
+-// make enter_jit unreachable for this call, so reading the code cannot say
+-// which one let it through. Each route stamps its own byte here and enter_jit
+-// writes the record to stderr once, so one run names the gate instead of
+-// another round of inference.
+-//
+-//   '1' check_target_ec   -- the pre-ExitToX64 dispatch_call bitmap test
+-//   '2' ios_ffs_reject    -- thunk-reject path (guard declined)
+-//   '3' ios_ffs_no_bypass -- no x64 thunk shape matched at all
+-.balign 8
+-.globl IosJitGateMsg
+-IosJitGateMsg:
+-  .ascii "\n[jit-gate] "
+-  .byte 0x30                      // offset 12: the route tag
+-  .byte 0x0a                      // offset 13: newline
+ .text
+-
+-// Stamp the route tag. x16/x17 are IP0/IP1: dead at every call boundary and
+-// unused by the tail of each route below.
+-.macro IOS_SET_GATE imm
+-  adrp x16, IosJitGateMsg
+-  add x16, x16, #:lo12:IosJitGateMsg
+-  mov w17, #\imm
+-  strb w17, [x16, #12]
+-.endm
+ #endif
+ 
+   // __os_arm64x_x64_jump in ARM64EC docs
+@@ -183,9 +152,6 @@ check_target_ec:
+   lsr x17, x9, #12
+   lsr x16, x16, x17
+   tbnz x16, #0, ExitFunctionEC
+-#ifdef FEX_IOS_HOST
+-  IOS_SET_GATE 0x31               // ml1230: dispatch_call bitmap said "not EC"
+-#endif
+   b enter_jit
+ 
+   // __os_arm64x_dispatch_call_no_redirect in ARM64EC docs
+@@ -239,6 +205,22 @@ ExitToX64:
+   // restored to the thunk (emulating the thunk itself is the correct x64 behaviour).
+   // Scratch x16/x17 only until ios_thunk_slot, which spills x4/x9 before using
+   // x4/x23 as well.
++  //
++  // ml1234: per-call probe, stamped before any branch so a fault dump always
++  // describes the call that faulted: [0x48]=x9, [0x50]=the first dword at x9,
++  // [0x54]=route (0x44 here, then 0x41 ios_ffs_check, 0x42 ios_ec_entry_miss,
++  // 0x43 ios_thunk_slot). Every route overwrites it and entry rewrites it, so it
++  // cannot go stale the way ml1233's did. Only x16/x17 are touched, and nothing
++  // here is live: the shape test reloads both.
++  IOS_LOAD_TEB x16
++  ldr x16, [x16, #0x1788]          // TEB->ChpeV2CpuAreaInfo
++  cbz x16, 4f
++  str x9, [x16, #0x48]
++  ldr w17, [x9]
++  str w17, [x16, #0x50]
++  mov w17, #0x44
++  str w17, [x16, #0x54]
++4:
+   ldrh w16, [x9]
+   movz w17, #0x25ff
+   cmp w16, w17
+@@ -263,6 +245,14 @@ ios_thunk_bare:
+   add x17, x9, x16
+   add x17, x17, #6
+ ios_thunk_slot:
++  // ml1234: route tag -- a thunk shape WAS recognised. If the fault dump shows
++  // anything else, the shape test itself is what failed.
++  IOS_LOAD_TEB x16
++  ldr x16, [x16, #0x1788]
++  cbz x16, 3f
++  mov w17, #0x43
++  str w17, [x16, #0x54]
++3:
+   // ml1209: the displacement this thunk's jmp carries is a LINK-TIME constant
+   // that belongs to the file, and the pool copy of it has been observed to
+   // differ. kernel32+0x35a70 is `48 8d a4 24 00 00 00 00 ff 25 <rel32>`: the
+@@ -665,10 +655,34 @@ ios_ec_entry:
+   ldp x4, x23, [sp], #16
+   br x17                         // native ARM64EC: x0-x8 and lr untouched
+ ios_ec_entry_miss:
++  // ml1233: confirm which refusal this was. 0x42 in the high half of [0x50]
++  // means "reached the bitmap test and it said not-EC for the target in
++  // [0x48]" (the low half still holds x9's first dword from ExitToX64 entry).
++  IOS_LOAD_TEB x16
++  ldr x16, [x16, #0x1788]
++  cbz x16, 6f
++  mov w17, #0x42
++  str w17, [x16, #0x54]
++6:
+   ldp x4, x23, [sp], #16
+   b ios_ffs_no_bypass            // not EC: emulate, exactly as before
+ 
+ ios_ffs_check:
++  // ml1234: record which route the MOST RECENT dispatch took.
++  //
++  // cpu_area is per-thread and never cleared, so a tag left by an earlier call
++  // survived to the crash dump and read as if it belonged to the faulting call:
++  // ml1233 reported ios_ec_entry_miss for a call whose x9 was a textbook
++  // hotpatched thunk, which the shape test above cannot produce. So ExitToX64
++  // stamps 0x44 on every entry (with that call's x9 and its first dword) and
++  // each route overwrites 0x41/0x42/0x43, so [0x54] at the fault describes
++  // THIS call. x16/x17 are dead here: the test reloads both.
++  IOS_LOAD_TEB x16
++  ldr x16, [x16, #0x1788]          // TEB->ChpeV2CpuAreaInfo
++  cbz x16, 5f
++  mov w17, #0x41
++  str w17, [x16, #0x54]
++5:
+   ldr x16, [x9]
+   movz x17, #0x8b48
+   movk x17, #0x48c4, lsl #16
+@@ -741,7 +755,6 @@ ios_ffs_xlate_done:
+   str x17, [x16, #8]     // [1] = last EC target taken natively
+   br x17                 // PE VA; the Mach exec-fault redirect maps it to the pool copy
+ ios_ffs_reject:
+-  IOS_SET_GATE 0x32               // ml1230: thunk reject (ml1222 guard declined)
+   // Pattern matched but the (PE-space) target is not EC per the bitmap: fall
+   // through to normal emulation -- correct for genuine x64 jmp targets -- but
+   // COUNT it, so a run with zero bypasses is distinguishable from one where the
+@@ -755,54 +768,12 @@ ios_ffs_reject_count:
+   str x23, [x16, #16]    // [2] = matched-but-rejected count
+   str x17, [x16, #24]    // [3] = last rejected (PE-space) target
+ ios_ffs_no_bypass:
+-  // ml1230: default route tag, but never overwrite an earlier stamp -- the
+-  // reject path arrives here too and '2' is the more specific answer.
+-  adrp x16, IosJitGateMsg
+-  add x16, x16, #:lo12:IosJitGateMsg
+-  ldrb w17, [x16, #12]
+-  cbnz w17, 77f
+-  IOS_SET_GATE 0x33               // no x64 thunk shape matched
+-77:
+   IOS_XP_COUNT 2112, x16, x17   // ml1131: EC->x64 call (callback) emulated
+ #endif
+   str lr, [sp, #-8]! // Push return address to stack, this will be popped by the x86 RET instr.
+ 
+ enter_jit:
+ #ifdef FEX_IOS_HOST
+-  // ml1231: publish the route that got here, before anything else runs.
+-  //
+-  // Raw Darwin write(2) through svc #0x80: fd 2 at the unix layer is the
+-  // madeira-log.txt that ntdll-unix already writes to, so this needs no CRT,
+-  // no import table and no TEB. x0-x5 are RCX/RDX/R8/R9 and the ARM64EC
+-  // variadic descriptor, so they are spilled rather than assumed dead.
+-  //
+-  // ml1231 fixes an alignment fault that made the FIRST build of this fault
+-  // here instead of reporting: enter_jit is entered with sp at 8 mod 16 (the
+-  // `str x30,[sp,#-8]!` just above pushes one register), and `stp ...,[sp,#-n]!`
+-  // with SP as the writeback base requires 16-byte alignment -- the SEGV log
+-  // showed BUS_ADRALN on this very instruction, a9bd07e0 at enter_jit+0.
+-  // Plain 8-byte str/ldr and a `sub sp` (which has no alignment requirement)
+-  // work whatever alignof(sp-16) is, and the frame is restored exactly.
+-  sub sp, sp, #0x40
+-  str x0, [sp]
+-  str x1, [sp, #8]
+-  str x2, [sp, #16]
+-  str x3, [sp, #24]
+-  str x4, [sp, #32]
+-  str x5, [sp, #40]
+-  adrp x1, IosJitGateMsg
+-  add x1, x1, #:lo12:IosJitGateMsg
+-  mov x0, #2                      // fd 2
+-  mov x2, #14                     // "\n[jit-gate] X\n"
+-  mov w16, #4                     // syscall 4 == write
+-  svc #0x80
+-  ldr x0, [sp]
+-  ldr x1, [sp, #8]
+-  ldr x2, [sp, #16]
+-  ldr x3, [sp, #24]
+-  ldr x4, [sp, #32]
+-  ldr x5, [sp, #40]
+-  add sp, sp, #0x40
+   IOS_LOAD_TEB x17
+   ldr x17, [x17, #0x1788] // TEB->ChpeV2CpuAreaInfo
+ #else
