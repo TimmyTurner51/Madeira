@@ -1076,3 +1076,42 @@ ml1267 skips the post-notify restore (hooks already restored post-unix)
 so the SMC interval Denuvo armed stays. Look for Add SMC on ntdll `.data`
 **without** a following `[iOS-xrem]` of the same range, then either a
 decrypt VEH or no `#UD`.
+
+## 2026-11-15 17:05 — pair 560 MB, C 16 KB short; libxess never loads
+
+ml1267 did not run. The child died `NtTerminateProcess exit_code=0xc0000135`
+while importing `libxess.dll` / `MSVCP140.dll`. No ntdll `.data` protect, no
+census-after-protect, no `#UD`.
+
+Holes with the window held: `0x12bf64000+320MB 0x14c000000+253MB
+0x1619a8000+148MB 0x16b600000+330MB`. Pair `A=0x14c000000+240MB
+B=0x16b600000+320MB` = 560 MB (16 MB grain dropped 13+10 MB). The 148 MB run
+between them was held PROT_NONE (179 MB of the 262 MB gap). RX span
+`[0x14c000000,0x17f600000)` 822 MB, hole offsets `[0xf000000,0x1f600000)`.
+
+Region C was 272 MB (`0x12f000000`, margin 48 on the 320 MB run below the
+window). Sequence: 4 KB + 16 MB + 128 MB from C, then the 16 MB freed, then
+
+```
+[pool-low] region C has 0x7ffc000 of 0x11000000 left, not enough for carve
+           0x8000000: it goes to the pool tail
+[jit-pool] tail EC_CODE rx=0x177600000 size=0x8000000 tail_resv=0x8000000
+```
+
+Image room = A 240 + (B 320 − tail 128) = 432 MB. 17:00 reached libxess at
+`used=0x248fe000` (580 MB) of an 816 MB pair. 17:05:
+
+```
+[jit-pool] EXHAUSTED (image …libxess.dll): want=0x4a40000
+           bump=0x2b5c4000/0x33600000 tail_resv=0x8000000
+[pool-capacity] … main_virgin=0x3c000 c_virgin=0x7ff8000 c_image_virgin=0x7bf8000
+```
+
+`c_image_virgin` is ~124 MB, but `MADEIRA_POOL_LOW_IMAGES` caps overflow at
+16 MB, so the 74 MB copy cannot go to C. `env.FEX_*` stays reverted.
+
+GameConfigs (no IPA): `pool-mid=1` takes the 148 MB run; `pool-page-fit=1`
+keeps the 13+10 MB the grain dropped; `pool-low-margin=32` leaves C 288 MB so
+the second 128 MB carve stays in C (`0x8ffc000 > 0x8000000`). Image room
+becomes 240+148+320 = 708 MB with tail_resv=0. Look for `[pool-split] pool-mid`
+and libxess `used=` without EXHAUSTED, then the ml1267 SMC keep.
