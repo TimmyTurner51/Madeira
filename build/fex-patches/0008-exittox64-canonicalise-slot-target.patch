@@ -1,14 +1,14 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Madeira <madeira@example.invalid>
-Date: Sun, 15 Nov 2026 00:15:00 -0600
-Subject: [PATCH] ExitToX64: canonicalise the import slot target into POOL space
- before the EcCodeBitMap test
+Date: Sun, 15 Nov 2026 00:26:00 -0600
+Subject: [PATCH] ExitToX64: canonicalise the slot target into POOL space, and
+ make the counter dump reachable
 
 Signed-off-by: Madeira <madeira@example.invalid>
 ---
---- a/Source/Windows/ARM64EC/Module.S
-+++ b/Source/Windows/ARM64EC/Module.S
-@@ -323,6 +323,19 @@
+--- a/Source/Windows/ARM64EC/Module.S	2026-11-15 00:26:50
++++ b/Source/Windows/ARM64EC/Module.S	2026-11-15 00:26:50
+@@ -323,6 +323,25 @@
    mov x16, x17                     // ml1207: keep the slot address itself
    ldr x17, [x17]                   // the pointer the jmp loads
  84:
@@ -23,10 +23,159 @@ Signed-off-by: Madeira <madeira@example.invalid>
 +  // no-op on a pool address (it exits early when reg>>15 < 0x40000) and leaves
 +  // reg untouched when no alias entry contains it, so calling it here cannot
 +  // regress the plain pool path.
++  adrp x11, IosFfsBypassLog
++  add x11, x11, #:lo12:IosFfsBypassLog
++  str x17, [x11, #144]             // [18] = target before canonicalisation
 +  IOS_PE_TO_POOL_TO x17, x10, x11, x12, x23, 82f
 +82:
++  adrp x11, IosFfsBypassLog
++  add x11, x11, #:lo12:IosFfsBypassLog
++  str x17, [x11, #152]             // [19] = target the bitmap test will see
    // ml1136: the slot rarely holds the native body. loader.c's
    // arm64ec_iat_is_exported_x64 keeps the x64-VISIBLE 14-byte fast-forward stub
    // of a hybrid export (in the importer's .hexpthk) so x64 callers and hook
+diff -u -r a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+--- a/Source/Windows/ARM64EC/Module.cpp	2026-11-15 00:26:50
++++ b/Source/Windows/ARM64EC/Module.cpp	2026-11-15 00:26:50
+@@ -1391,6 +1391,98 @@
+   }
+ }
+ 
++/* ml1216: the ONLY channel that provably reaches madeira-log.txt from a PE
++ * module is ntdll's __wine_dbg_output -- it is what Wine's own ERR() uses, and
++ * every 0024:err: line in the log is proof it lands. Two things this file was
++ * relying on before are dead ends:
++ *
++ *   - WriteFile( PEB->hStdError ): measured dead. None of this file's strings
++ *     ([FEX-iOS], DispatcherPatch, ThreadInit() done) has ever appeared in a
++ *     log, and the [fex-arena] lines that looked like evidence actually come
++ *     from build/ntdll-unix/virtual_ios.c's dprintf(2).
++ *   - Logging.cpp resolves __wine_dbg_output and then never calls it, because
++ *     its FEX_IOS_HOST branch returns through IosLogWrite (same dead WriteFile).
++ *
++ * So resolve __wine_dbg_output here and call it directly. Cached: the resolver
++ * runs once, and every later call is a plain indirect branch. */
++/* ml1217: emit through a raw Darwin write(2) syscall.
++ *
++ * __wine_dbg_output does not resolve through GetProcAddress here -- Logging.cpp
++ * says so in a comment and ml1216 measured it: ResetToConsistentState relocated
++ * (rva 0x114c3c -> 0x113d50, matching the log's rtcs base+offset), so the dump
++ * ran, and still nothing printed. WriteFile to PEB stderr is equally dead.
++ *
++ * A direct syscall needs no CRT table, no import and no TEB: fd 2 is inherited
++ * from the unix side, which is exactly how dprintf(2) in build/ntdll-unix
++ * reaches the log. Falling back to WriteFile keeps a host that denies the
++ * syscall from going silent. */
++static void IosFfsEmit(const char* s) {
++    int len = 0;
++    while (s[len]) ++len;
++    long rc;
++    register long x0 __asm__("x0") = 2;                 /* stderr */
++    register long x1 __asm__("x1") = (long)(intptr_t)s;
++    register long x2 __asm__("x2") = len;
++    register long x16 __asm__("x16") = 4;               /* Darwin SYS_write */
++    __asm__ volatile("svc #0x80"
++                     : "+r"(x0), "+r"(x16)
++                     : "r"(x1), "r"(x2)
++                     : "memory", "cc");
++    rc = x0;
++    if (rc == len) return;
++    auto Teb = NtCurrentTeb();
++    if (!Teb || !Teb->ProcessEnvironmentBlock) return;
++    auto Params = reinterpret_cast<RTL_USER_PROCESS_PARAMETERS64*>(
++        Teb->ProcessEnvironmentBlock->ProcessParameters);
++    if (!Params) return;
++    HANDLE h = reinterpret_cast<HANDLE>(Params->hStdError);
++    if (!h) return;
++    ULONG written = 0;
++    WriteFile(h, s, static_cast<DWORD>(len), &written, nullptr);
++}
++
++/* ml1215: dump ExitToX64's dispatch counters from inside FEX.
++ *
++ * The counters in Module.S were unreadable three times over: FEX's own reporters
++ * go through LogMan (messages never reach madeira-log.txt here), the ProcessTerm
++ * dump never runs because an unhandled exception tears the pseudo-process down
++ * without it, and the ntdll-side dump cannot ship at all -- a .wcp component
++ * replaces files in the PREFIX, but ntdll is loaded from the app bundle.
++ *
++ * ntdll does call THIS function on the faulting exception, which is proven
++ * rather than assumed: ResetToConsistentState is at rva 0x114c3c in this DLL and
++ * the log's rtcs=0x153611C3C is exactly pool base 0x1534fd000 + 0x114c3c. */
++static void IosFfsDumpOnce(const char* why) {
++    static volatile int Dumped = 0;
++    if (__atomic_exchange_n(const_cast<int*>(&Dumped), 1, __ATOMIC_ACQ_REL) != 0) return;
++    char buf[96 + 20 * 24];
++    int n = 0;
++    for (const char* p = "[ffs-log] "; *p; ++p) buf[n++] = *p;
++    for (const char* p = why; *p; ++p) buf[n++] = *p;
++    buf[n++] = '\n';
++    buf[n] = 0;
++    IosFfsEmit(buf);
++    static const char kLabels[20][10] = {
++      "bypass", "bypLast", "reject", "rejLast", "ecEnt", "ecEntLst",
++      "slot",   "slotLast", "follow", "folLast", "slotCopy", "peread",
++      "pereadOK", "rvaGuard", "peSlot", "peValue", "peRel32", "peDerive",
++      "preCanon", "postCanon",
++    };
++    n = 0;
++    for (const char* p = "[ffs-log] "; *p; ++p) buf[n++] = *p;
++    const char hexd[] = "0123456789abcdef";
++    for (int i = 0; i < 20; ++i) {
++        for (const char* p = kLabels[i]; *p; ++p) buf[n++] = *p;
++        buf[n++] = '=';
++        buf[n++] = '0';
++        buf[n++] = 'x';
++        for (int j = 60; j >= 0; j -= 4) buf[n++] = hexd[(IosFfsBypassLog[i] >> j) & 0xf];
++        buf[n++] = (i == 19) ? '\n' : ' ';
++    }
++    buf[n] = 0;
++    IosFfsEmit(buf);
++}
++
+ class ScopedCallbackDisable {
+ private:
+   bool Prev;
+@@ -1410,6 +1502,9 @@
+ // Returns true if exception dispatch should be halted and the execution context restored to NativeContext
+ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* Exception, CONTEXT* GuestContext, ARM64_NT_CONTEXT* NativeContext) {
+   auto Thread = CPUArea.ThreadState();
++  /* ml1215: the one hook that provably runs on the faulting exception and can
++   * reach the log. Records the dispatch counters before anything else here. */
++  IosFfsDumpOnce("fault");
+   FEXCORE_PROFILE_ACCUMULATION(Thread, AccumulatedSignalTime);
+   /* ml1039: an access violation is only diagnosable with its DATA address. "Address" is the faulting PC; the
+    * operand lives in ExceptionInformation[0]=read/write/execute and [1]=address, and leaving them out cost a
+@@ -1653,6 +1748,16 @@
+ 
+ NTSTATUS ResetToConsistentState(EXCEPTION_RECORD* Exception, CONTEXT* GuestContext, ARM64_NT_CONTEXT* NativeContext) {
+   bool Cont {};
++  /* ml1219: dump the ExitToX64 counters HERE, not in ResetToConsistentStateImpl.
++   *
++   * Impl is only reached when the thread has FEX state, and the fault this dump
++   * exists to explain is precisely the one where it does not: the null-state
++   * bail below returns STATUS_SUCCESS first, so ml1215's IosFfsDumpOnce at the
++   * top of Impl never ran in any ml1215..ml1218 session -- which is why every
++   * run since has been silent about [12]/[13]/[14]/[15] even though the write
++   * path itself is sound. Reached here, the same svc reaches fd 2 exactly like
++   * the ntdll dprintf calls that do appear in the log. */
++  IosFfsDumpOnce("rtcs");
+   if (Exception->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
+     const auto FaultAddress = static_cast<uint64_t>(Exception->ExceptionInformation[1]);
+ 
+diff -u -r a/Source/Windows/ARM64EC/libarm64ecfex_ios.def b/Source/Windows/ARM64EC/libarm64ecfex_ios.def
+--- a/Source/Windows/ARM64EC/libarm64ecfex_ios.def	2026-11-15 00:26:50
++++ b/Source/Windows/ARM64EC/libarm64ecfex_ios.def	2026-11-15 00:26:50
+@@ -44,5 +44,10 @@
+   ios_fex_band_end DATA
+   ; ml1131: transition probe counters (Module.S), read by ntdll-unix's [xp-api] sampler.
+   IosXpFex DATA
++  ; ml1214: ExitToX64 dispatch counters (Module.S), read by ntdll's [ffs-log] dump at
++  ; the faulting exception -- FEX's own reporters go through LogMan, which never
++  ; reaches madeira-log.txt, and ProcessTerm does not run on an unhandled-exception
++  ; teardown, so this is the only channel that can report them.
++  IosFfsBypassLog DATA
+   ; madeira-bcd: guest branch history v1
+   IosGuestBranchTraceLayout DATA
 -- 
 2.51.0
