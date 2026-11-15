@@ -621,3 +621,78 @@ With the image at its preferred base, `[ud-decrypt]` is the whole verdict:
   suspects are the ARM64EC session itself (an ARM64EC host running pure-x64 guest
   code is not the Proton arrangement) and the platform rewrites of module
   `.text`.
+
+## 2026-11-15 11:37 — the Android FEX preset is not a superset; it re-broke decryption
+
+The run that added the DroidDeck reference environment to the game's own config
+refused to decrypt again, and the two sessions either side of that change are
+identical except for those lines:
+
+| Session | `[game-cfg]` | `c000001d` | Protection |
+|---|---|---|---|
+| `11:04:31` | `env.MADEIRA_EC_HOOK_TRACE=0 exe-window-mb=192 pool=896 pool-low=1 pool-pair=1 pool-split` | **0** | decrypted; the load then died on the `libxess.dll` pool carve |
+| `11:37:38` | the same, plus `env.FEX_SMCCHECKS=full FEX_HIDEHYPERVISORBIT=1 FEX_MULTIBLOCK=1 FEX_TSOENABLED=1 FEX_HALFBARRIERTSOENABLED=1 FEX_VECTORTSOENABLED=0 FEX_MEMCPYSETTSOENABLED=0 FEX_DYNAMICL1CACHE=0 FEX_PROFILESTATS=0 FEX_X87REDUCEDPRECISION=1` | **10** | `[ud-decrypt] … BYTES UNCHANGED (eae96be61448897c)` |
+
+The environment was verified to reach the process before the fault — FEX parsed
+it, and its own line confirms the values landed rather than being dropped:
+
+```
+[madeira-env] game FEX_SMCCHECKS=full  … FEX_X87REDUCEDPRECISION=1
+I EC FEX: TSO config tso=true halfbar=true vector=false memcpyset=false rev=ml513
+```
+
+so "the preset never got applied" is ruled out. At least one switch in it changes
+FEX in a way the protection reads, and the preset's value was never established:
+the session *without* it is the one that ran for 99 s and executed game code. The
+preset has been removed from `f19a86ea48b779e2.cfg`, with the measurement written
+into the file so it is not re-added on the next comparison against the Android
+build. Madeira's own defaults are what a native x64 machine presents; the
+reference build's options belong to that port.
+
+Two things this does **not** mean: the hypervisor-leaf fix is not implicated (the
+11:04 session is the one that proves the gate works), and nothing here weakens
+what the protection checks. `FEX_HIDEHYPERVISORBIT=1` remains the behaviour FEX
+already used by default on this host.
+
+### Correcting the size of the enciphered set
+
+The record above counts 4,538 functions "beginning with `EA`". `EA` is only one of
+the byte values that cannot start an x64 instruction, so that number undercounts
+what has to be decrypted. Testing every `.pdata` function start against the full
+set of x64-invalid first bytes gives:
+
+```
+.pdata functions: 414805
+unexecutable entry byte: 22758 (5.5%)
+first byte: 0xEA×4538, 0xCE×1625, 0xD6×1623, 0xD5×1599, 0x60×1328, 0x16×1252
+pages containing a bad entry: 10017
+  pages where EVERY function is bad : 229
+  pages where only some are bad     : 9788
+```
+
+5.5 % of functions, scattered over 10,017 pages of which only 229 are fully
+unreadable. That is per-function encipherment, not whole-page encryption, which is
+consistent with the ECB-over-the-prologue reading (and rules out "the section is
+encrypted and gets decrypted in one pass", since either pass would have to touch
+10,017 pages). It also sets the bar for any future claim that decryption
+partially happened: it must show plaintext at some of these 22,758 entries.
+
+### No protector in the import table, and no TLS callback of its own
+
+Two mechanisms that could have decrypted the image before the entry point are
+absent, so the decryptor has to live in the exe's own plaintext code and run from
+there:
+
+- the import table is 38 DLLs — Microsoft CRT, PlayFab, DirectX, AMD, Bink, XeSS,
+  Steam — with no vendor DLL among them;
+- the TLS directory has exactly two callbacks, `0x5a658c0` and `0x5a65e98`, and
+  both are the CRT's own (`cmp edx,2 / jne`, `mov rax,rsp`), in the same
+  `0x5a65xxx` block as the entry `0x5a66394`.
+
+All three references to `SetUnhandledExceptionFilter` are at `0x5a664f3`,
+`0x5a668f4` and `0x5a669c8` — after the entry `0x5a66394`, in the CRT's `__scrt`
+path — so the filter is installed late in CRT startup rather than by the loader.
+Whether that code had run by the time of the fault is not established, and the
+frame walk does reach an `UnhandledExceptionFilter` import thunk at `0x5eaa3b8`,
+so the filter path was exercised; what the log cannot show is whether a *guest*
+filter had been registered by then.
