@@ -1,0 +1,47 @@
+diff --git a/FEXCore/Source/Interface/Core/Frontend.cpp b/FEXCore/Source/Interface/Core/Frontend.cpp
+index cc7ef7be3..aea035dfb 100644
+--- a/FEXCore/Source/Interface/Core/Frontend.cpp
++++ b/FEXCore/Source/Interface/Core/Frontend.cpp
+@@ -1644,6 +1644,29 @@ void Decoder::DecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thre
+                             BlockIt->BlockStatus == DecodedBlockStatus::UNIMPLEMENTED_INST ? "Unimplemented" :
+                                                                                              "PartialDecode",
+                             OpAddress);
++          /* Madeira ml1238: the address alone does not say whether the guest is
++           * executing real code, a data page, or code the image never shipped in
++           * decodable form. Dump the bytes actually being decoded plus the block
++           * entry, so the next report can be read without re-pulling the image.
++           * Bounded to 8 lines: this is a fatal path and must not flood. */
++          if (BlockIt->BlockStatus == DecodedBlockStatus::INVALID_INST) {
++            static uint32_t Dumps = 0;
++            if (Dumps < 8) {
++              ++Dumps;
++              constexpr int NumBytes = 16;
++              const char *HexDigits = "0123456789abcdef";
++              const uint8_t *P = &InstStream.AdjustedInstStream[0];
++              char Bytes[NumBytes * 3 + 1];
++              for (int i = 0; i < NumBytes; ++i) {
++                Bytes[i * 3 + 0] = HexDigits[P[i] >> 4];
++                Bytes[i * 3 + 1] = HexDigits[P[i] & 0xf];
++                Bytes[i * 3 + 2] = (i == NumBytes - 1) ? '\0' : ' ';
++              }
++              Bytes[NumBytes * 3] = '\0';
++              LogMan::Msg::EFmt("[entry-invalid] op={:X} entry={:X} decoded={} bytes={}",
++                                OpAddress, BlockIt->Entry, DecodedSize, Bytes);
++            }
++          }
+         }
+         break;
+       }
+diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+index 008ef4b29..f3630c7c9 100644
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -1076,7 +1076,7 @@ NTSTATUS ProcessInit() {
+  * __DATE__/__TIME__ below is compiler-generated and therefore the
+  * authoritative identity; if the two disagree, the tag is wrong, not the
+  * build. */
+-#define MADEIRA_REV "ml908"
++#define MADEIRA_REV "ml1237"
+   LogMan::Msg::EFmt("[build-id] xtajit64 rev=" MADEIRA_REV " compiled " __DATE__ " " __TIME__);
+ #ifdef FEX_IOS_HOST
+   /* ml751: flush the VA band selector's beacons.

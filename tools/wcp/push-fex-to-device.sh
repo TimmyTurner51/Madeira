@@ -59,9 +59,15 @@ iosdev app-put "$DLL" "$REMOTE" >/dev/null
 #   /…/Data/Application/<container>/Documents/Applications/<appid>/arm64ec-windows/<dll>
 # where <container> is the container the running session reports, and it is NOT
 # always the LiveContainer appDataContainer that MAD points at. On 2026-11-15
-# this script still wrote to "$MAD/Applications/…", which does not exist, so
-# every push printed "SKIPPED" and the session kept loading the old bundle DLL
-# (build-id rev=ml908, compiled 00:26) for nine revisions of FEX work.
+# this script wrote to "$MAD/Applications/…", which does not exist, so pushes
+# printed "SKIPPED" and the bundle copy was left alone.
+#
+# Do NOT treat the log's `rev=mlNNN` as proof of what is loaded. MADEIRA_REV is
+# a hand-maintained string in Module.cpp, so it reads "ml908" in builds that
+# contain far newer code. On 2026-11-15 that string was taken as evidence that
+# nine revisions had never been deployed, when in fact the build was current
+# ([ffs-route], which only ml1237 can emit, was printing). The only trustworthy
+# signal is the __DATE__/__TIME__ next to it plus behaviour new code can prove.
 #
 # Push to every plausible container instead of guessing one: a duplicate copy
 # holding the same bytes is harmless, a missing one silently reverts a session.
