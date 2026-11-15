@@ -66,6 +66,7 @@ iosdev app-put "$DLL" "$REMOTE" >/dev/null
 # Push to every plausible container instead of guessing one: a duplicate copy
 # holding the same bytes is harmless, a missing one silently reverts a session.
 APP_REL="Documents/Applications/com.willfaust.madeora.app/arm64ec-windows/xtajit64.dll"
+WANT_SHA="$(shasum -a 256 "$DLL" | cut -d' ' -f1)"
 BUNDLE_WROTE=0
 for BUNDLE in \
     "Documents/Data/Application/BD038598-DE0F-4AA5-B8F3-6AC778939190/$APP_REL" \
@@ -73,8 +74,17 @@ for BUNDLE in \
     "Documents/Data/Application/BD038598-DE0F-4AA5-B8F3-6AC778939190/Documents/Applications/com.willfaust.madeora.app/Frameworks/arm64ec-windows/xtajit64.dll"
 do
     if iosdev app-put "$DLL" "$BUNDLE" >/dev/null 2>&1; then
-        echo "bundle $BUNDLE  (a copy the session may load)"
-        BUNDLE_WROTE=$((BUNDLE_WROTE + 1))
+        # A successful app-put only means the write was accepted. Read the file
+        # back and compare hashes: on 2026-11-15 nine FEX revisions were built,
+        # "pushed", and never loaded, and nothing in the output said so.
+        BACK="$TMP/readback.dll"
+        if iosdev app-get "$BUNDLE" "$BACK" >/dev/null 2>&1 &&
+           [ "$(shasum -a 256 "$BACK" | cut -d' ' -f1)" = "$WANT_SHA" ]; then
+            echo "bundle $BUNDLE  (verified, this is a copy the session may load)"
+            BUNDLE_WROTE=$((BUNDLE_WROTE + 1))
+        else
+            echo "bundle $BUNDLE  WRITTEN BUT READ-BACK MISMATCH -- do not trust this run" >&2
+        fi
     fi
 done
 if [ "$BUNDLE_WROTE" -eq 0 ]; then
