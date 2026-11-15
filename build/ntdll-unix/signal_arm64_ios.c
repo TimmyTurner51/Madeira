@@ -8058,6 +8058,62 @@ dispatch_guest_fault:
                                             (unsigned long long)sv_pe,
                                             sv_mod ? ios_pe_module_name(sv_mod) : "no-module",
                                             (unsigned long long)(sv_pe && sv_mod ? sv_pe - sv_mod : 0));
+                                        /* ml1208: the SAME slot in the PE view, and the
+                                         * thunk's own jmp displacement in both copies.
+                                         *
+                                         * loader.c binds imports by storing through a PE
+                                         * VA, so the pool copy of an IAT slot can still
+                                         * hold whatever the image mapped. Reading only
+                                         * the pool copy cannot tell "never bound" from
+                                         * "bound somewhere else", and a displacement
+                                         * that differs between the copies means the
+                                         * thunk itself was rewritten, not the slot. */
+                                        {
+                                            uint64_t pe_slot_mod = 0;
+                                            uint64_t pe_slot = ios_jit_reverse_translate(
+                                                slot_addr, &pe_slot_mod );
+                                            uint64_t pe_slot_val = 0;
+                                            mach_vm_size_t got_p = 0;
+                                            if (pe_slot && pe_slot != slot_addr &&
+                                                mach_vm_read_overwrite(mach_task_self(),
+                                                    (mach_vm_address_t)pe_slot, 8,
+                                                    (mach_vm_address_t)&pe_slot_val,
+                                                    &got_p) == KERN_SUCCESS && got_p == 8)
+                                                dprintf(STDERR_FILENO,
+                                                    "[x9-probe] same slot in PE view 0x%llx = 0x%llx"
+                                                    " (pool 0x%llx) %s\n",
+                                                    (unsigned long long)pe_slot,
+                                                    (unsigned long long)pe_slot_val,
+                                                    (unsigned long long)slot_val,
+                                                    pe_slot_val == slot_val
+                                                        ? "copies AGREE"
+                                                        : "copies DIFFER -- pool never saw the bind");
+                                        }
+                                        {
+                                            uint64_t t_mod = 0, t_pe = ios_jit_reverse_translate(
+                                                x9, &t_mod );
+                                            int32_t prel = 0, frel = 0;
+                                            mach_vm_size_t g = 0;
+                                            if (t_pe && t_pe != x9 &&
+                                                mach_vm_read_overwrite(mach_task_self(),
+                                                    (mach_vm_address_t)(t_pe + 10), 4,
+                                                    (mach_vm_address_t)&prel,
+                                                    &g) == KERN_SUCCESS && g == 4 &&
+                                                mach_vm_read_overwrite(mach_task_self(),
+                                                    (mach_vm_address_t)(x9 + 10), 4,
+                                                    (mach_vm_address_t)&frel,
+                                                    &g) == KERN_SUCCESS && g == 4)
+                                                dprintf(STDERR_FILENO,
+                                                    "[x9-probe] thunk jmp rel32: PE 0x%x -> rva 0x%llx |"
+                                                    " pool 0x%x -> rva 0x%llx %s\n",
+                                                    prel,
+                                                    (unsigned long long)((t_pe + 14 + (int64_t)prel) - t_mod),
+                                                    frel,
+                                                    (unsigned long long)((x9 + 14 + (int64_t)frel) - (x9 - (t_pe - t_mod))),
+                                                    prel == frel
+                                                        ? "(same)"
+                                                        : "REWRITTEN in the pool copy");
+                                        }
                                     }
                                     else
                                         dprintf(STDERR_FILENO,
