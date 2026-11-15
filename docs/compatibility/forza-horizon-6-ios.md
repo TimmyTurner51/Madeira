@@ -1115,3 +1115,22 @@ keeps the 13+10 MB the grain dropped; `pool-low-margin=32` leaves C 288 MB so
 the second 128 MB carve stays in C (`0x8ffc000 > 0x8000000`). Image room
 becomes 240+148+320 = 708 MB with tail_resv=0. Look for `[pool-split] pool-mid`
 and libxess `used=` without EXHAUSTED, then the ml1267 SMC keep.
+
+## 2026-11-15 17:10 — libxess fits; restore loop never ends
+
+Cfg applied (`pool-mid=1 pool-page-fit=1 pool-low-margin=32`). Pair
+`A=0x14c000000+562MB B=0x16fa0c000+261MB` = 824 MB, 7 MB hole, C 334 MB,
+`tail_resv=0`. `libxess.dll` loaded at `used=0x2070a000/0x34000000`. Child
+CHPE, `nr=50`, ntdll `.data` EXEC skip all held. unix-hits=0.
+
+Then `00e8` stuck in `syscall_protect_preserving_ntdll_data` at
+`ntdll.dll+0x5e744` (`str x10,[x27]; cbz x8, loop`). ml1267 inlined
+`ios_restore_fex_hooks` and clang dropped the 21-iteration bound, so the
+RX-pool stores ran off the end of ntdll `.data` (fault-class 7.3M hits
+walking `0x163198000`+, `wine-x18-exc` hot). No `restore via=post-unix`, no
+Add SMC, no `#UD`. 17:00's non-inlined restore completed in one step.
+
+ml1268: `DECLSPEC_NOINLINE` plus a local `n = 21` so the loop cannot run
+away. Unstripped ntdll overlay. Look for `restore via=post-unix … n=21`,
+Add SMC on `71F3372000-71F3374000` without `[iOS-xrem] via=protect`, then
+either a decrypt VEH or no `#UD`.
