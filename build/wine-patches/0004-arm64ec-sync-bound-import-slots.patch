@@ -1,144 +1,104 @@
-From b0a7bf9db4286982fd362c32a076c7146f6e1019 Mon Sep 17 00:00:00 2001
+From b838dc06ef732d5ea074f38dcddaa35727b5435a Mon Sep 17 00:00:00 2001
 From: Madeira <madeira@example.invalid>
-Date: Sun, 15 Nov 2026 01:28:01 -0600
-Subject: [PATCH] ntdll: trap filler is not a bound import slot
+Date: Sun, 15 Nov 2026 01:33:14 -0600
+Subject: [PATCH] ntdll: report the GetCommandLineA slot rva and its PE value
 
-The 01:20 run finally executed this function and reported every kernel32
-slot "already bound" -- 932 bound, 0 unbound, 0 rebound -- and then faulted
-with `thunk -> slot = 0xcccccccccccccccc`. The boundness test was
+The unix-side [x9-probe] computes the slot address as x9+14+rel and
+reported 0x153a96e80 (rva 0x46e80) for the kernel32 thunk that ucrtbase's
+exit uses, but that thunk's own `ff 25` displacement encodes rva 0x50650
+(pool 0x153aa0650). Both cannot be the same slot, and the difference decides
+whether the pool copy really kept 0xcc after the sync or the probe simply
+read the wrong address.
 
-    iat->u1.Function >= 0x100000000ULL
-
-which separates a real VA from a hint/name RVA, but the loader also fills
-unresolved slots with the 0xcc trap pattern, and 0xcccccccccccccccc is a
-64-bit value far above 4 GB. Filler therefore classified as "already bound"
-and the sync copied it into the pool verbatim: the function reproduced the
-exact fault it exists to prevent, and the "0 unbound" counters were the only
-symptom.
-
-Test filler explicitly and send it down the resolve path, where
-RtlFindExportedRoutineByName + arm64ec_redirect_ptr install a real target
-and the sync carries that across. Report the filler count separately so a
-module that needed resolution is distinguishable from one already in order,
-and bump the identity banner to ml1227 / iat-sync v3.
+Capture the name match on every slot rather than only on the resolve path,
+which never triggers here because nothing is unbound, and print the slot's
+rva together with the value the PE view holds. That is the PE-side truth the
+probe can be compared against.
 
 Signed-off-by: Madeira <madeira@example.invalid>
 Co-authored-by: Cursor <cursoragent@cursor.com>
 ---
  dlls/ntdll/loader.c         |  2 +-
- dlls/ntdll/signal_arm64ec.c | 45 +++++++++++++++++++++++++------------
- 2 files changed, 32 insertions(+), 15 deletions(-)
+ dlls/ntdll/signal_arm64ec.c | 32 ++++++++++++++++++++++++--------
+ 2 files changed, 25 insertions(+), 9 deletions(-)
 
 diff --git a/dlls/ntdll/loader.c b/dlls/ntdll/loader.c
-index b68c0017..1e678b6a 100644
+index 1e678b6a..e97737fc 100644
 --- a/dlls/ntdll/loader.c
 +++ b/dlls/ntdll/loader.c
 @@ -5809,7 +5809,7 @@ void loader_init( CONTEXT *context, void **entry )
          ERR( "loader_init: [iOS] early locale_init done (casemap wired before arm64ec module)\n" );
          /* The suffix identifies THIS ntdll: the deployed PE can be shadowed by
           * the app bundle's copy, and a bare line cannot tell them apart. */
--        ERR( "loader_init: calling load_arm64ec_module [ntdll ml1226 iat-sync v2]\n" );
-+        ERR( "loader_init: calling load_arm64ec_module [ntdll ml1227 iat-sync v3]\n" );
+-        ERR( "loader_init: calling load_arm64ec_module [ntdll ml1227 iat-sync v3]\n" );
++        ERR( "loader_init: calling load_arm64ec_module [ntdll ml1228 iat-sync v4]\n" );
          load_arm64ec_module();
          ERR( "loader_init: load_arm64ec_module returned, calling update_load_config\n" );
          update_load_config( wm->ldr.DllBase );
 diff --git a/dlls/ntdll/signal_arm64ec.c b/dlls/ntdll/signal_arm64ec.c
-index 05f58c60..04416099 100644
+index 04416099..1f10c4dc 100644
 --- a/dlls/ntdll/signal_arm64ec.c
 +++ b/dlls/ntdll/signal_arm64ec.c
-@@ -1178,11 +1178,16 @@ static HMODULE find_loaded_module_ansi( const char *name )
-     return NULL;
- }
- 
-+/* The loader's probe filler for an import slot it has not resolved yet. It is
-+ * NOT a pointer, and it is numerically larger than any VA, so it must be tested
-+ * for explicitly rather than by size. */
-+#define IAT_TRAP_FILLER 0xccccccccccccccccULL
-+
- ULONG arm64ec_sync_bound_iat_slots(void)
- {
-     PEB *peb = RtlGetCurrentPeb();
-     LIST_ENTRY *link;
--    ULONG modules = 0, slots = 0, bound = 0, synced = 0, rebound = 0;
-+    ULONG modules = 0, slots = 0, bound = 0, synced = 0, rebound = 0, filler = 0;
- 
-     /* Unconditional entry marker. ml1225 emitted nothing at all and that was
-      * ambiguous: "the function never ran" and "it returned at the ldr NULL
-@@ -1204,7 +1209,7 @@ ULONG arm64ec_sync_bound_iat_slots(void)
-         void *module = entry->DllBase;
-         IMAGE_ARM64EC_METADATA *meta;
+@@ -1211,7 +1211,7 @@ ULONG arm64ec_sync_bound_iat_slots(void)
          IMAGE_IMPORT_DESCRIPTOR *desc;
--        ULONG mslots = 0, msynced = 0, munbound = 0, size;
-+        ULONG mslots = 0, msynced = 0, munbound = 0, mfiller = 0, size;
+         ULONG mslots = 0, msynced = 0, munbound = 0, mfiller = 0, size;
          int have_gcla = 0;
-         ULONG_PTR gcla = 0;
+-        ULONG_PTR gcla = 0;
++        ULONG_PTR gcla = 0, gcla_rva = 0;
  
-@@ -1236,13 +1241,20 @@ ULONG arm64ec_sync_bound_iat_slots(void)
+         if (!module) continue;
+         /* Only hybrid images care: a pure x64 importer must keep the x64
+@@ -1238,6 +1238,26 @@ ULONG arm64ec_sync_bound_iat_slots(void)
+                 void *proc;
+ 
+                 mslots++;
++                /* Record the GetCommandLineA slot whatever happens to it.
++                 * The unix-side [x9-probe] that reads this slot from the pool
++                 * computes its address as x9+14+rel and reported 0x153a96e80
++                 * (rva 0x46e80) for a thunk whose own `ff 25` displacement
++                 * encodes rva 0x50650 (pool 0x153aa0650). Two different slots
++                 * cannot both be right, so log the PE-side truth here: the
++                 * slot's rva and the value the PE view holds. Comparing that
++                 * against the probe tells us whether the pool really kept
++                 * 0xcc, or whether the probe read somewhere else entirely. */
++                if (!IMAGE_SNAP_BY_ORDINAL( ilt->u1.Ordinal ))
++                {
++                    IMAGE_IMPORT_BY_NAME *gn =
++                        get_rva( module, (DWORD)ilt->u1.AddressOfData );
++                    if (!strcmp( (const char *)gn->Name, "GetCommandLineA" ))
++                    {
++                        have_gcla = 1;
++                        gcla = (ULONG_PTR)iat->u1.Function;
++                        gcla_rva = (ULONG_PTR)iat - (ULONG_PTR)module;
++                    }
++                }
                  /* Is the PE view bound? A bound slot holds a VA, and every VA
                   * in this process is above 4 GB: PE images load near
                   * 0x71fe..., the JIT pool near 0x153..., FEX's arena at
--                 * 0x7c00.... An UNBOUND slot still holds its hint/name RVA
-+                 * 0x7c00.... An UNBOUND slot holds either its hint/name RVA
-                  * from the file -- kernel32's GetCommandLineA slot reads
--                 * 0x63fc8 -- which is under 4 GB and is NOT a target. Testing
--                 * `>= 0x10000` here instead would have classified that RVA as
--                 * bound and copied it into the pool, recreating the exact
--                 * failure this function exists to prevent. */
--                if (iat->u1.Function >= 0x100000000ULL)
-+                 * 0x63fc8, under 4 GB -- or the 0xcc trap filler.
-+                 *
-+                 * The filler is the trap this test fell into first. It is
-+                 * 0xcccccccccccccccc, a 64-bit value far above 4 GB, so a bare
-+                 * `>= 0x100000000` test calls it "already bound" and copies it
-+                 * into the pool verbatim. The 01:20 run reported "932
-+                 * already bound, 0 unbound" for kernel32 and then faulted with
-+                 * `thunk -> slot = 0xcccccccccccccccc`: the sync had carried
-+                 * the filler across instead of resolving over it. Filler is
-+                 * never a target, so it takes the resolve path. */
-+                if (iat->u1.Function >= 0x100000000ULL &&
-+                    iat->u1.Function != IAT_TRAP_FILLER)
-                 {
-                     /* Already bound in the PE view: this is the case that only
-                      * needs carrying across to the pool. */
-@@ -1254,6 +1266,8 @@ ULONG arm64ec_sync_bound_iat_slots(void)
-                     continue;
-                 }
- 
-+                if (iat->u1.Function == IAT_TRAP_FILLER) filler++;
-+
-                 /* Still an rva: the loader never bound it here either. Resolve
-                  * it from the provider's export directory. RtlFindExported-
-                  * RoutineByName does not attach the module, unlike
-@@ -1307,20 +1321,23 @@ ULONG arm64ec_sync_bound_iat_slots(void)
- 
-         modules++;
-         slots += mslots;
--        bound += mslots - munbound;
-+        bound += mslots - munbound - mfiller;
-         synced += msynced;
--        ERR( "[iat-sync] %s: %lu slot(s), %lu already bound, %lu unbound, %lu synced to pool\n",
-+        filler += mfiller;
-+        ERR( "[iat-sync] %s: %lu slot(s), %lu already bound, %lu unbound, "
-+             "%lu trap filler, %lu synced to pool\n",
-              debugstr_w( entry->BaseDllName.Buffer ), (unsigned long)mslots,
--             (unsigned long)(mslots - munbound), (unsigned long)munbound,
--             (unsigned long)msynced );
-+             (unsigned long)(mslots - munbound - mfiller), (unsigned long)munbound,
-+             (unsigned long)mfiller, (unsigned long)msynced );
+@@ -1290,11 +1310,6 @@ ULONG arm64ec_sync_bound_iat_slots(void)
+                     if (!proc) continue;
+                     if ((pmeta = arm64ec_get_module_metadata( provider )))
+                         proc = arm64ec_redirect_ptr( provider, proc, pmeta );
+-                    if (!strcmp( (const char *)by_name->Name, "GetCommandLineA" ))
+-                    {
+-                        have_gcla = 1;
+-                        gcla = (ULONG_PTR)proc;
+-                    }
+                     {
+                         void *base = iat;
+                         SIZE_T range = sizeof(void *);
+@@ -1330,8 +1345,9 @@ ULONG arm64ec_sync_bound_iat_slots(void)
+              (unsigned long)(mslots - munbound - mfiller), (unsigned long)munbound,
+              (unsigned long)mfiller, (unsigned long)msynced );
          if (have_gcla)
-             ERR( "[iat-sync]   %s GetCommandLineA -> %p\n",
-                  debugstr_w( entry->BaseDllName.Buffer ), (void *)gcla );
+-            ERR( "[iat-sync]   %s GetCommandLineA -> %p\n",
+-                 debugstr_w( entry->BaseDllName.Buffer ), (void *)gcla );
++            ERR( "[iat-sync]   %s GetCommandLineA slot rva=%lx pe-value=%p\n",
++                 debugstr_w( entry->BaseDllName.Buffer ),
++                 (unsigned long)gcla_rva, (void *)gcla );
      }
  
--    ERR( "[iat-sync] done: %lu hybrid module(s), %lu slot(s), %lu bound, %lu rebound, %lu synced\n",
-+    ERR( "[iat-sync] done: %lu hybrid module(s), %lu slot(s), %lu bound, "
-+         "%lu trap filler, %lu rebound, %lu synced\n",
-          (unsigned long)modules, (unsigned long)slots, (unsigned long)bound,
--         (unsigned long)rebound, (unsigned long)synced );
-+         (unsigned long)filler, (unsigned long)rebound, (unsigned long)synced );
-     return synced;
- }
- 
+     ERR( "[iat-sync] done: %lu hybrid module(s), %lu slot(s), %lu bound, "
 -- 
 2.54.0 (Apple Git-156)
 
