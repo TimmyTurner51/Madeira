@@ -102,6 +102,23 @@ for dll in "${DLLS[@]}"; do
         */aarch64-windows/*|*/arm64-windows/*) token='${aarch64}' ;;
         *) token='${system32}' ;;
     esac
+    # 2026-11-15: a ${system32} overlay of ARM64EC kernelbase made ARM64
+    # wineboot load it as kernel32's import (c000007b, session died in 0.8s).
+    # system32 is the first search path for every process, including the 0xaa64
+    # host. ARM64EC copies of the boot DLLs belong in sysx64 (the EC farm);
+    # ntdll is loaded from the bundle, so it needs no prefix link at all.
+    case "$(printf '%s' "$base" | tr '[:upper:]' '[:lower:]')" in
+        ntdll.dll) token="" ;;
+        kernelbase.dll|kernel32.dll) token='${sysx64}' ;;
+    esac
+    # ntdll: skip the prefix link entirely (empty token).
+    if [ -z "$token" ]; then
+        if iosdev app-put "$dll" "Documents/Applications/com.willfaust.madeora.app/arm64ec-windows/$base" >/dev/null 2>&1; then
+            printf '%-34s %s  -> app bundle arm64ec-windows/%s (the copy that loads; no prefix link)\n' \
+                "$base" "$(shasum -a 256 "$dll" | cut -c1-16)" "$base"
+        fi
+        continue
+    fi
     iosdev app-put "$dll" "$DEST/$base" >/dev/null
     REMOTE_DLLS+=("$base|$token")
     printf '%-34s %s  -> %s/%s\n' "$base" "$(shasum -a 256 "$dll" | cut -c1-16)" "$token" "$base"
@@ -143,11 +160,23 @@ if entry is None:
     }
     components.append(entry)
 
-# Replace the layout wholesale: the component folder holds exactly what was just
-# pushed, and a stale entry would leave a link pointing at a removed file.
-entry["layout"] = [{"source": "files/arm64ec-windows/" + name, "dest": token + "/" + name}
-                   for name, token in pairs]
-entry["fileCount"] = len(pairs)
+# Merge into the existing layout. Replacing it wholesale is how an
+# ntdll+kernelbase push on 2026-11-15 dropped every other Wine overlay and
+# put ARM64EC kernelbase on system32, which ARM64 wineboot then loaded
+# (c000007b). A dest of "" means "bundle only, no prefix link".
+layout = [x for x in (entry.get("layout") or []) if isinstance(x, dict)]
+by_dest = {x.get("dest"): i for i, x in enumerate(layout) if x.get("dest")}
+for name, token in pairs:
+    if not token:
+        continue
+    item = {"source": "files/arm64ec-windows/" + name, "dest": token + "/" + name}
+    if item["dest"] in by_dest:
+        layout[by_dest[item["dest"]]] = item
+    else:
+        by_dest[item["dest"]] = len(layout)
+        layout.append(item)
+entry["layout"] = layout
+entry["fileCount"] = len(layout)
 entry["enabled"] = True
 if version:
     entry["versionName"] = version
