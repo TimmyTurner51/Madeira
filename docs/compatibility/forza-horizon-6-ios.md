@@ -580,16 +580,19 @@ buffer. One buffer could never fit, so both fell through into the pool and perma
 consumed 256 MB of image room.
 
 `pool-low-margin = 48` gives region C 160 MB — one 128 MB buffer plus the 16 MB one, with
-`0x58` MB of the run still free. The tail then reserves 128 MB instead of 256, `pool_limit`
-rises to `0x2B818000`, and `libxess`'s 74 MB lands above the hole at `0x1f818000`, ending
-at `0x24358000` — under the limit with 4.7 MB to spare. The 16 images still to load after
-`libxess` total only ~16 MB and fit the 59 MB below the hole.
+58 MB of the run still free. The tail then reserves 128 MB instead of 256, `pool_limit`
+rises to `0x2B818000`, and `libxess`'s 74 MB lands above the hole at
+`0x1f818000..0x24258000` — 117.75 MB under the limit. (The observed failure was 10.25 MB
+short of `0x23818000`, not the 12.5 MB first estimated: the extent is `0x1f818000 +
+0x4a40000` = `0x24258000`, and `tests/host/check-fh6-pool-geometry.py` pins every value
+here by running the allocator's own helpers.)
 
 A 96 MB big-image slot (`MADEIRA_POOL_BIG_SLOT_MB`) looks like the obvious answer and is
-*not* safe here: it widens the effective hole to `0x25818000`, which pushes the second
-128 MB tail carve down to `[0x0C818000, 0x14818000)` — inside the head's forward path,
-where the bump check only tests `pool_limit` and the holes and would run straight into a
-live code buffer.
+*not* safe here: it widens the effective hole to `0x25818000`, and the second 128 MB tail
+carve then moves from `0x23818000` down to `0x17000000` — below a head cursor already at
+`0x1b768000`, inside the region the bump is walking through. The bump check tests only
+`pool_limit` and the holes, so it would run into a live code buffer. That test asserts this
+too, so a future change cannot quietly reintroduce it.
 
 ## Conclusion
 
