@@ -231,29 +231,96 @@ mechanism alone covers the 638 MB; together there is margin.
 Nothing about this touches the game: it is the same exe, unmodified, launched by
 Valve's client, and the pool is Madeira's own execution substrate.
 
+## 2026-11-15 10:40 — the game loads and executes, and refuses to decrypt
+
+With the pool sized correctly the load succeeds and the game runs its own code:
+it installs SEH, creates threads, executes at RVAs `0x9E629C` and `0x5BFD6F6`,
+and calls into `0x537099C`. The `[ud-decrypt]` probe added in `c46ce86` then
+answers the question it was built for:
+
+```
+[ud-decrypt] EC handler declined at 0000007069B7099C: BYTES UNCHANGED
+             (eae96be61448897c) -- the protection never decrypted this function
+```
+
+Two runs reproduce it byte for byte, so it is deterministic and not a race. The
+bytes are the shape already documented above: five scrambled bytes, then a real
+prologue from `+5` (`48 89 7c 24 10` `mov [rsp+10h],rdi`, `55` `48 8b ec`, …),
+matching the `prolog_size` of 32 that `.pdata` gives for this function. So the
+exception is raised exactly where it should be, at the encrypted prefix, and the
+protection is reached and declines.
+
+That separates the two causes the probe was designed to distinguish. The
+protection is not failing after a successful decrypt; it is deciding not to
+decrypt.
+
+### The remaining infidelity: the image is not at its preferred base
+
+```
+ml985: preferred base 0x140000000+0x70000 REFUSED status=0xc0000018
+[main-exe] NOT_AT_BASE (relocated) — continuing normally
+Load module forzahorizon6.exe: 7064800000
+```
+
+The executable window that Madeira reserves at `0x140000000` is 128 MB, but this
+image's `SizeOfImage` is `0xb3c0000` (180 MB), so it does not fit and the loader
+relocates it to `0x7064800000`. Every other platform this title runs on — the
+DroidDeck Proton/ARM64EC build included — loads it at `0x140000000`. A
+self-decrypting protection that is otherwise content to run relocated is a
+weaker assumption than it looks: its decryptor and its integrity values are
+derived from the image it was built as, and this build has never been asked to
+run anywhere else.
+
+`exe-window-mb` exists for exactly this and is read from the game's own config,
+so it needs no rebuild:
+
+```
+exe-window-mb = 192      # 0x140000000 + 192MB = 0x14C000000, ends below the 0x180000000 ceiling
+```
+
+`pool-low` was dropped at the same time. Region C fragmented: it was carved to
+160 MB (224 MB in the previous launch), FEX asked for 128 MB buffers, and the
+log records `region C has 0xffc000 of 0xa000000 left, not enough for carve
+0x8000000`. Inside an 864 MB pool the image copies take 366 MB, leaving over
+490 MB for the tail, so a dedicated low region buys nothing and costs
+contiguity. The pool becomes 810 MB with the wider window, still far above the
+638 MB that failed.
+
+### Why the auto-widening did not fire
+
+`StikJITHelper.fixedBaseWindowMB` measures the game's exe before the pool is
+placed, but only widens for an image whose relocations are stripped
+(`characteristics & 1` or an empty relocation directory). This exe reports
+`chars=0x22` — relocatable — so it is skipped even though it is authored for
+`0x140000000`. Widening for every large relocatable image would shrink the hole
+above the window for every other game, which is the failure `ml1037` was written
+to avoid, so the per-game key stays the mechanism and the auto path stays
+conservative.
+
 ## Conclusion
 
-Two blockers have been retired by measurement rather than inference. The ARM64EC
-import-slot mis-route is not present in a current run: no `c0000005` at `pc=0`,
-and the iat-sync pass binds every slot it is asked to. And the licence gate is
-real but is now satisfied: with Valve's client authenticated in the session, the
-client itself starts the game.
+Three blockers have been retired. The ARM64EC import-slot mis-route is not
+present in a current run. The licence gate is real and is now satisfied: with
+Valve's client authenticated, the client itself starts the game. And the pool is
+no longer a limit, once sized for a Dock session that has already spent 186 MB
+on Valve's own image copies.
 
-What is left is capacity, and it is the third distinct thing this session has
-uncovered: a Dock launch's compact 512 MB pool cannot hold the Steam client's
-186 MB of image copies, FEX's 272 MB of code buffers and the game's 180 MB image
-copy at once. The fix is sizing, not emulation.
-
-`[ud-decrypt]` stays in the tree because it is still the only way to tell a
-protection verdict from a later failure, and the game has not yet reached its
-first instruction in a Dock session.
+The live blocker is the protection's decision, and it is now measured rather than
+inferred: it is reached, it is asked to decrypt `forzahorizon6.exe+0x537099C`,
+and it leaves the bytes untouched. The only structural difference from every
+platform this title is known to run on is that the image is loaded 5.4 GB away
+from the base it was built for.
 
 Nothing here requires modifying the game, and doing so is excluded: the
 protection is meant to run exactly as shipped.
 
 ## Next measurement
 
-With the pool raised, the first question is whether the game now reaches its
-encrypted entry and what `[ud-decrypt]` says about it — `DECRYPTED` means the
-protection accepted this environment, `BYTES UNCHANGED` means it still declined
-and the remaining difference is something other than Steam authentication.
+With the image at its preferred base, `[ud-decrypt]` is the whole verdict:
+
+- `DECRYPTED` — the protection accepted the environment and wrote plaintext; the
+  next blocker is whatever executes afterwards.
+- `BYTES UNCHANGED` — relocation was not the objection either, and the remaining
+  suspects are the ARM64EC session itself (an ARM64EC host running pure-x64 guest
+  code is not the Proton arrangement) and the platform rewrites of module
+  `.text`.
