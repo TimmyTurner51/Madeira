@@ -1,152 +1,94 @@
 diff --git a/dlls/ntdll/signal_arm64ec.c b/dlls/ntdll/signal_arm64ec.c
-index 9ed09f7e..d5647738 100644
+index d5647738..5e10d2fb 100644
 --- a/dlls/ntdll/signal_arm64ec.c
 +++ b/dlls/ntdll/signal_arm64ec.c
-@@ -613,7 +613,34 @@ NTSTATUS arm64ec_process_init_dispatchers( HMODULE module )
-      * crashes inside arm64x_check_call. */
-     RtlGetCurrentPeb()->WerRegistrationData = arm64x_check_call;
- 
-+    /* The slot ucrtbase's $iexit_thunk$cdecl$* blocks branch through:
-+     *
-+     *     adrp x8, page ; ldr x16,[x8,#0x898] ; blr x16 ; mov x0, x8
-+     *
-+     * All four thunks in ucrtbase share that one slot and an identical body, so
-+     * the per-call callee cannot be in the slot -- it arrives in x9. FEX's
-+     * ExitToX64 is written for exactly that: it decodes x9 as an x64 import
-+     * thunk (bare `ff 25 rel32` or the hotpatched `48 8d a4 24 00 00 00 00 ff 25`
-+     * form that build/wine-patches/0001 emits for Forza's anti-tamper), follows
-+     * the jmp to its IAT slot, and branches natively when the resolved target is
-+     * EC code or falls through to emulation for genuine x64. Its comment credits
-+     * ucrtbase's TlsAlloc exit thunk as the first case it fixed, so this is the
-+     * implementation that made TlsAlloc work -- overwriting the slot with
-+     * arm64x_check_call (builds 20-21) or a hand-rolled shim (build 22) removed
-+     * the fix instead of adding to it.
-+     *
-+     * ExitToX64 is at 0x1184e4 in xtajit64.dll's .text, a coff-arm64ec module,
-+     * so it is native AArch64 and a legal blr target. The previous reading here
-+     * ("machine 0x8664, .text is x64") described a different DLL: .hexpthk being
-+     * only 0x160 bytes is normal for ARM64EC, not evidence of an x64 .text. */
-     __os_arm64x_dispatch_call_no_redirect = RtlFindExportedRoutineByName( module, "ExitToX64" );
-+    {
-+        void *no_redirect = __os_arm64x_dispatch_call_no_redirect;
-+        ERR( "arm64ec_process_init_dispatchers: no_redirect slot -> ExitToX64 %p\n", no_redirect );
-+        if (!no_redirect)
-+            ERR( "arm64ec_process_init_dispatchers: ExitToX64 MISSING; ucrtbase's "
-+                 "exit thunks will blr a null slot\n" );
-+    }
-     __os_arm64x_dispatch_fptr = RtlFindExportedRoutineByName( module, "DispatchJump" );
-     __os_arm64x_dispatch_ret = RtlFindExportedRoutineByName( module, "RetToEntryThunk" );
- 
-@@ -965,7 +992,31 @@ static void update_hybrid_pointer( void *module, const IMAGE_SECTION_HEADER *sec
-         ERR( "rva %x outside of section %s (%lx-%lx)\n", rva,
-              sec->Name, sec->VirtualAddress, sec->VirtualAddress + sec->Misc.VirtualSize );
-     else
--        *(void **)get_rva( module, rva ) = ptr;
-+    {
-+        void *dest = get_rva( module, rva );
-+
-+        *(void **)dest = ptr;
-+        /* The guest executes the pool copy of this image, and nothing syncs a
-+         * plain PE store into it. ucrtbase's
-+         * __os_arm64x_dispatch_call_no_redirect (rva e3898) therefore stayed 0
-+         * in the copy the code reads, so its exception dispatch did
-+         * `adrp x8,page; ldr x16,[x8,#0x898]; blr x16` -> pc=0, lr=0x90f1c.
-+         * Push the store through the same verified unix call the loader uses
-+         * for its TLS index. */
-+        {
-+            struct ios_sync_pe_write_params params = { dest, sizeof(void *), 0 };
-+            static int said;
-+            NTSTATUS sync = __wine_unixlib_handle
-+                ? WINE_UNIX_CALL( unix_ios_sync_pe_write, &params )
-+                : STATUS_PROCEDURE_NOT_FOUND;   /* too early: no unix side yet */
-+            if (said++ < 32)
-+                ERR( "hybrid-slot rva=%x <- %p sync=%lx copied=%lu\n",
-+                     rva, ptr, sync, params.synced );
-+            /* A failure here leaves the pool copy stale (the old bug), which is
-+             * no worse than before, so report it and carry on rather than take
-+             * the process down for a diagnostic slot. */
-+        }
-+    }
+@@ -984,8 +984,14 @@ IMAGE_ARM64EC_METADATA *arm64ec_get_module_metadata( HMODULE module )
  }
  
- /*******************************************************************
-@@ -980,6 +1031,15 @@ void arm64ec_update_hybrid_metadata( void *module, IMAGE_NT_HEADERS *nt,
-     /* assume that all pointers are in the same section */
-     ERR( "arm64ec_update_hybrid_metadata: module=%p dispatch_call_rva=%lx check_call=%p\n",
-          module, (unsigned long)metadata->__os_arm64x_dispatch_call, arm64x_check_call );
-+    /* The dispatcher globals must be non-NULL before they are written into a
-+     * slot: a NULL here becomes `blr x16` -> pc=0 in every module that gets
-+     * this metadata (build 15 died at ucrtbase+0x90f18 exactly that way). */
-+    if (!__os_arm64x_dispatch_call_no_redirect || !__os_arm64x_dispatch_fptr ||
-+        !__os_arm64x_dispatch_ret)
-+        ERR( "arm64ec_update_hybrid_metadata: NULL dispatcher global(s) "
-+             "ExitToX64=%p DispatchJump=%p RetToEntryThunk=%p\n",
-+             __os_arm64x_dispatch_call_no_redirect, __os_arm64x_dispatch_fptr,
-+             __os_arm64x_dispatch_ret );
  
-     for (i = 0; i < nt->FileHeader.NumberOfSections; i++, sec++)
-     {
-@@ -4921,12 +4981,38 @@ static void __attribute__((naked)) arm64x_check_call(void)
-          ".Ljmp:\n\t"
-          "ldrb w16, [x11]\n\t"
-          "cmp w16, #0xff\n\t"
--         "b.ne .Lexit\n\t"
-+         "b.ne .Lhotpatch\n\t"
-          "ldrb w16, [x11, #1]\n\t"
-          "cmp w16, #0x25\n\t"               /* ff 25 jmp *xxx(%rip) */
-          "b.ne .Lexit\n\t"
-          "ldr w9, [x11, #2]\n\t"
-          "add x16, x11, #6\n\t"             /* address after jump */
-+         "b .Lfollow\n\t"
-+         /* iOS-Madeira: Wine's x64 import thunks now carry the 8-byte hotpatch prologue
-+          * that native Windows and x86_64 Wine emit (48 8d a4 24 00 00 00 00) ahead of
-+          * the same ff 25 (build/wine-patches/0001). Forza Horizon 6's anti-tamper
-+          * requires that prologue, so the bare-thunk test above no longer matches them.
-+          * Without this, every such call falls to .Lexit -- "not a special sequence" --
-+          * and is routed to the x64 exit thunk, which enters the JIT with no
-+          * CpuStateFrame (x28 == 0) and faults at pc 0. Accept the hotpatched form and
-+          * follow it exactly as the bare one: TlsAlloc from ucrtbase's exit thunk was
-+          * the first to hit this. */
-+         ".Lhotpatch:\n\t"
-+         "ldr w16, [x11]\n\t"               /* 48 8d a4 24 */
-+         "ldr w17, .Lhotpatch_seq\n\t"
-+         "cmp w16, w17\n\t"
-+         "b.ne .Lexit\n\t"
-+         "ldr w16, [x11, #4]\n\t"           /* 00 00 00 00 padding */
-+         "cbnz w16, .Lexit\n\t"
-+         "ldrb w16, [x11, #8]\n\t"
-+         "cmp w16, #0xff\n\t"
-+         "b.ne .Lexit\n\t"
-+         "ldrb w16, [x11, #9]\n\t"
-+         "cmp w16, #0x25\n\t"               /* ff 25 jmp *xxx(%rip) */
-+         "b.ne .Lexit\n\t"
-+         "ldr w9, [x11, #10]\n\t"
-+         "add x16, x11, #14\n\t"            /* address after the hotpatched jump */
-+         ".Lfollow:\n\t"
-          "ldr x11, [x16, w9, sxtw]\n\t"
-          "b \"#arm64x_check_call\"\n"       /* restart checks with jump destination */
-          /* not a special sequence, call the exit thunk */
-@@ -4945,6 +5031,10 @@ static void __attribute__((naked)) arm64x_check_call(void)
-          ".byte 0xe9\n\t"                   /* jmp  arm_code */
-          ".byte 0, 0, 0, 0, 0, 0\n"
- 
-+         /* First word of the hotpatched import thunk (48 8d a4 24 = lea rsp,[rsp+0]). */
-+         ".Lhotpatch_seq:\n\t"
-+         ".word 0x24a48d48\n\t"
++static UINT watch_rva;   /* the dispatcher slot the crash reads through */
 +
-          ".Lsyscall_seq:\n\t"
-          ".byte 0x4c, 0x8b, 0xd1\n\t"       /* mov  %rcx,%r10 */
-          ".byte 0xb8, 0, 0, 0, 0\n\t"       /* mov  $xxx,%eax */
-diff --git a/dlls/ntdll/unixlib.h b/dlls/ntdll/unixlib.h
-index 6641dddb..251446ee 100644
---- a/dlls/ntdll/unixlib.h
-+++ b/dlls/ntdll/unixlib.h
-@@ -140,7 +140,7 @@ struct ios_get_fex_arena_params
- struct ios_sync_pe_write_params
+ static void update_hybrid_pointer( void *module, const IMAGE_SECTION_HEADER *sec, UINT rva, void *ptr )
  {
-     void *address;       /* IN: address in the original PE image */
--    ULONG size;          /* IN: bounded to a single DWORD for TLS indices */
-+    ULONG size;          /* IN: 4 for TLS indices, 8 for pointer slots */
-     ULONG synced;        /* OUT: 1 if a JIT-pool copy existed and was updated */
- };
++    /* Set by arm64ec_update_hybrid_metadata to the one slot the 2026-11-14
++     * crash reads through (ucrtbase's __os_arm64x_dispatch_call_no_redirect).
++     * That slot is reported on every write, success or not: sampling it hid
++     * the re-patch pass, which is the write that actually matters. */
+     if (!rva) return;
  
+     if (rva < sec->VirtualAddress || rva >= sec->VirtualAddress + sec->Misc.VirtualSize)
+@@ -995,6 +1001,11 @@ static void update_hybrid_pointer( void *module, const IMAGE_SECTION_HEADER *sec
+     {
+         void *dest = get_rva( module, rva );
+ 
++        NTSTATUS sync;
++        ULONG copied = 0;
++        static int said;
++        int loud = (rva == watch_rva);
++
+         *(void **)dest = ptr;
+         /* The guest executes the pool copy of this image, and nothing syncs a
+          * plain PE store into it. ucrtbase's
+@@ -1005,17 +1016,44 @@ static void update_hybrid_pointer( void *module, const IMAGE_SECTION_HEADER *sec
+          * for its TLS index. */
+         {
+             struct ios_sync_pe_write_params params = { dest, sizeof(void *), 0 };
+-            static int said;
+-            NTSTATUS sync = __wine_unixlib_handle
++
++            sync = __wine_unixlib_handle
+                 ? WINE_UNIX_CALL( unix_ios_sync_pe_write, &params )
+                 : STATUS_PROCEDURE_NOT_FOUND;   /* too early: no unix side yet */
+-            if (said++ < 32)
+-                ERR( "hybrid-slot rva=%x <- %p sync=%lx copied=%lu\n",
+-                     rva, ptr, sync, params.synced );
+-            /* A failure here leaves the pool copy stale (the old bug), which is
+-             * no worse than before, so report it and carry on rather than take
+-             * the process down for a diagnostic slot. */
++            copied = params.synced;
++
++            /* The android-era unix layer only knows the four-byte TLS-index
++             * request and refuses a pointer slot outright (c000000d), which
++             * leaves the pool copy at its on-disk zero and hands the guest a
++             * null branch target. It still copies raw bytes for a four-byte
++             * request, and every dispatcher written here is already a JIT-pool
++             * address on iOS (ExitToX64 and arm64x_check_call both live in the
++             * pool), so two halves reproduce the same eight bytes. Only take
++             * that road when the wide request was refused: a unix layer that
++             * understands it also translates the value to the pool alias, which
++             * a raw half-write cannot do. */
++            if (sync == STATUS_INVALID_PARAMETER)
++            {
++                unsigned int half;
++
++                sync = STATUS_SUCCESS;
++                for (half = 0; half < sizeof(void *); half += sizeof(ULONG))
++                {
++                    struct ios_sync_pe_write_params p4 =
++                        { (char *)dest + half, sizeof(ULONG), 0 };
++                    NTSTATUS st = WINE_UNIX_CALL( unix_ios_sync_pe_write, &p4 );
++                    if (st) { sync = st; break; }
++                    copied += p4.synced;
++                }
++            }
+         }
++
++        /* Always name a failure, and always name the watched slot; sample the
++         * rest so a healthy run stays short. A silent zero at the watched slot
++         * is the bug this whole block exists for. */
++        if (sync || (ptr && !copied) || loud || said++ < 24)
++            ERR( "hybrid-slot rva=%x <- %p sync=%lx copied=%lu%s\n",
++                 rva, ptr, sync, copied, loud ? " (watched)" : "" );
+     }
+ }
+ 
+@@ -1051,6 +1089,9 @@ void arm64ec_update_hybrid_metadata( void *module, IMAGE_NT_HEADERS *nt,
+ 
+             NtProtectVirtualMemory( NtCurrentProcess(), &base, &size, PAGE_READWRITE, &protect_old );
+ 
++            /* Arm the always-on report for the slot the crash reads through. */
++            watch_rva = metadata->__os_arm64x_dispatch_call_no_redirect;
++
+ #define SET_FUNC(func,val) update_hybrid_pointer( module, sec, metadata->func, val )
+             SET_FUNC( __os_arm64x_dispatch_call, arm64x_check_call );
+             SET_FUNC( __os_arm64x_dispatch_call_no_redirect, __os_arm64x_dispatch_call_no_redirect );

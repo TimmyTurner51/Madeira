@@ -7716,7 +7716,8 @@ dispatch_guest_fault:
                              * from BOTH the pool COPY and the PE mapping. pool==0 && PE!=0 => the
                              * pool copy's .data was never relocated/synced (same class as the NLS
                              * casemap bug); both==0 => the static-init that populates it never ran. */
-                            if (cnt <= 3 && va && (uintptr_t)state.__x[11] == 0 &&
+                            if (cnt <= 3 && va && ((uintptr_t)state.__x[11] == 0 ||
+                                                   (uintptr_t)state.__x[16] == 0) &&
                                 (uintptr_t)state.__lr >= 0x100000000ULL)
                             {
                                 uint64_t lr_rva = va - mod;
