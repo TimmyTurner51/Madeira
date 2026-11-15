@@ -956,3 +956,14 @@ ml1259 still performs the guest `NtProtect` (Denuvo is allowed to change
 ntdll's protection) but does not tell FEX that a PE **data** section is
 now executable. Look for `[exec-data] SUPPRESSED` on that ntdll `.data`
 protect, then more `[ec-syscall]` after it.
+
+## 2026-11-15 15:54 — FEX notify skip fired; unix protect still zeros the page
+
+`[exec-data] SUPPRESSED via=cur-pre` on `ntdll.dll` rva `d2000` prot=40,
+then `[exec-req]` succeeded, then the same `x11=0` crash at
+`pBeginSimulation` (`rva 0xd2ea0` still 0 in PE and pool). Twelve
+syscalls had already used that pointer, so the live pool page was good
+until `syscall_NtProtectVirtualMemory` itself. ml1260 snapshots the live
+ARM64 page around `pBeginSimulation` and writes it back after the
+protect. Look for `[exec-data] save ... pBeginSimulation=` non-NULL and
+`restore pBeginSimulation=` the same value.

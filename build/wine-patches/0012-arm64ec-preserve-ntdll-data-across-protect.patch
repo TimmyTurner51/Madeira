@@ -1,0 +1,70 @@
+diff --git a/dlls/ntdll/signal_arm64ec.c b/dlls/ntdll/signal_arm64ec.c
+index c3e9a011..e7f4a220 100644
+--- a/dlls/ntdll/signal_arm64ec.c
++++ b/dlls/ntdll/signal_arm64ec.c
+@@ -23,6 +23,7 @@
+ #include <stdlib.h>
+ #include <stdarg.h>
+ #include <setjmp.h>
++#include <string.h>
+ 
+ #include "ntstatus.h"
+ #include "windef.h"
+@@ -2743,6 +2744,40 @@ static BOOL ios_protect_notify_suppressed( const char *via, void *addr, SIZE_T s
+         || ios_data_exec_suppressed( via, addr, size, prot );
+ }
+ 
++/* 15:54: skipping the FEX notify was not enough. syscall_NtProtect of
++ * ntdll .data still replaced the live pool page (file zeros), so
++ * pBeginSimulation at rva 0xd2ea0 was 0 on the next dispatch_emulation.
++ * Snapshot the live ARM64 page (these C statics are pool-relocated) and
++ * write it back after the protect. The guest still sees RWX. */
++static NTSTATUS syscall_protect_preserving_ntdll_data(
++    HANDLE process, PVOID *addr_ptr, SIZE_T *size_ptr, ULONG new_prot, ULONG *old_prot )
++{
++    BYTE snap[0x2000];
++    BYTE *page = (BYTE *)((ULONG_PTR)&pBeginSimulation & ~0xfffUL);
++    void *begin = pBeginSimulation;
++    SIZE_T n = *size_ptr;
++    BOOL preserve = ios_data_exec_suppressed( "save", *addr_ptr, n, new_prot );
++    NTSTATUS st;
++
++    if (preserve)
++    {
++        if (n > sizeof(snap)) n = sizeof(snap);
++        memcpy( snap, page, n );
++        ERR( "[exec-data] save n=%lu live=%p pBeginSimulation=%p\n",
++             (unsigned long)n, page, begin );
++    }
++    st = syscall_NtProtectVirtualMemory( process, addr_ptr, size_ptr, new_prot, old_prot );
++    if (preserve)
++    {
++        memcpy( page, snap, n );
++        if (!pBeginSimulation && begin) pBeginSimulation = begin;
++        ERR( "[exec-data] restore pBeginSimulation=%p saved=%p status=%08x\n",
++             pBeginSimulation, begin, (unsigned)st );
++    }
++    return st;
++}
++
+ NTSTATUS SYSCALL_API NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *size_ptr,
+                                              ULONG new_prot, ULONG *old_prot )
+ {
+@@ -2820,7 +2855,7 @@ NTSTATUS SYSCALL_API NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SI
+         {
+             void *req_addr = *addr_ptr;
+             SIZE_T req_size = *size_ptr;
+-            NTSTATUS st = syscall_NtProtectVirtualMemory( process, addr_ptr, size_ptr, new_prot, old_prot );
++            NTSTATUS st = syscall_protect_preserving_ntdll_data( process, addr_ptr, size_ptr, new_prot, old_prot );
+ 
+             execreq_n++;
+             ERR( "[exec-req] #%d addr=%p size=%p new_prot=%lx -> status=%08x%s%s\n",
+@@ -2841,7 +2876,7 @@ NTSTATUS SYSCALL_API NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SI
+         }
+     }
+ 
+-    status = syscall_NtProtectVirtualMemory( process, addr_ptr, size_ptr, new_prot, old_prot );
++    status = syscall_protect_preserving_ntdll_data( process, addr_ptr, size_ptr, new_prot, old_prot );
+ 
+     if (!is_current) send_cross_process_notification( process, CrossProcessPostVirtualProtect,
+                                                       *addr_ptr, *size_ptr, 2, new_prot, status );
