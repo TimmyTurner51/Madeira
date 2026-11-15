@@ -1488,8 +1488,37 @@ enum StikJITHelper {
         let runs = freeRuns(lowFloor, exeWindow.base, minSize: 64 << 20)
         let desc = runs.map { String(format: "0x%lx+%luMB", Int($0.base), Int($0.size >> 20)) }.joined(separator: " ")
         // The margin a run keeps at its bottom: none when a lower run alone holds it.
+        //
+        // The margin must not starve the region it protects. Region C exists so
+        // FEX's code buffers are carved HERE rather than out of the image pool, so
+        // a C too small to hold one of those carves cannot do its job: the carve
+        // falls through to the pool tail and permanently consumes image room that
+        // the process needs for its own images. The pool tail's own cap
+        // (ios_pool_code_cap, build/ntdll-unix/virtual_ios.c) grants up to 128 MB
+        // per carve, plus the 16 MB small one, so C wants 160 MB to serve both.
+        //
+        // Forza Horizon 6, 2026-11-15: a 218 MB run with the default 128 MB margin
+        // left C 80 MB, so two 128 MB carves went to the pool tail (256 MB). The
+        // head then reached 0x1b768000 with an 8 MB stack hole at 0x1f000000 and a
+        // pool_limit of 0x23818000, and libxess.dll's 74 MB -- a STATIC import of
+        // the exe -- needed an extent of 0x24258000: 10.25 MB short, the game died
+        // with STATUS_DLL_NOT_FOUND. Sizing C to 160 MB places it with 117.75 MB to
+        // spare. See tests/host/check-fh6-pool-geometry.py for the arithmetic,
+        // checked against the allocator's own helpers.
+        //
+        // So: when the configured margin would leave the chosen run under the
+        // useful size, and the run can give that size, the margin yields to it. The
+        // leftover is still kept as margin, rounded down to the region granule, so a
+        // bigger run still leaves room for the children's relocatable exes. A run
+        // too small to hold 160 MB keeps exactly its old behaviour.
+        let minUseful: vm_address_t = 160 << 20
+        let grain: vm_address_t = pageFit ? 0x4000 : 16 << 20
         let ownMargin = { (r: (base: vm_address_t, size: vm_address_t)) -> vm_address_t in
-            runs.contains(where: { $0.base < r.base && $0.size >= margin }) ? 0 : margin
+            if runs.contains(where: { $0.base < r.base && $0.size >= margin }) { return 0 }
+            if r.size >= minUseful && r.size - margin < minUseful {
+                return (r.size - minUseful) & ~(grain - 1)
+            }
+            return margin
         }
         let fits = runs.map { r -> (run: (base: vm_address_t, size: vm_address_t), keep: vm_address_t, size: vm_address_t) in
             let keep = ownMargin(r)
@@ -1528,13 +1557,15 @@ enum StikJITHelper {
                 + "released (kr=%d); code buffers stay in the pool", Int(c), Int(best.base), dkr), level: .error)
             return nil
         }
+        let keepMB = (pick?.keep ?? 0) >> 20
+        let yielded = (pick?.keep ?? 0) != margin ? ", margin yielded to keep region C useful" : ""
         LogStore.shared.log(String(format: "[pool-low] region C 0x%lx+%luMB (free runs below the window: %@; %luMB of the "
             + "run left free for the low images, pool-low-margin = %ld%@)%@",
-            Int(c), Int(size >> 20), desc, Int((best.size - size) >> 20), marginMB,
-            (pick?.keep == 0 && margin > 0 ? ", held by a lower run" : "") as String,
+            Int(c), Int(size >> 20), desc, Int(keepMB), marginMB,
+            ((pick?.keep == 0 && margin > 0 ? ", held by a lower run" : "") + yielded) as String,
             c == target ? "" : String(format: " -- not at the run's top 0x%lx, a plug failed", Int(target))))
         if pageFit {
-            LogStore.shared.log("[pool-low] page-fit C=\(size >> 10)KB; run remainder=\((best.size - size) >> 10)KB, pool-low-margin=\(margin >> 10)KB")
+            LogStore.shared.log("[pool-low] page-fit C=\(size >> 10)KB; run remainder=\((pick?.keep ?? 0) >> 10)KB, pool-low-margin=\(margin >> 10)KB")
         }
         return (c, size)
     }
