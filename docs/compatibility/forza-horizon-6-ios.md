@@ -34,18 +34,9 @@ Wine. The run logs `Passing through exception`, then
 filter. Nothing in the exception path drops the `#UD`; the protection decides
 not to act on it.
 
-## Why it is declined: this prefix has never been signed in to Steam
+## Why it is declined: the launch never asks Steam for a licence
 
-| Check | Result on the device prefix |
-|---|---|
-| `.../Steam/config/loginusers.vdf` | absent |
-| `.../Steam/config/ssfn*` | absent |
-| `.../Steam/steamclient64.dll` | present, SHA-256 `71b391fe…ecf640` |
-| `.../Steam/steamapps/appmanifest_2483190.acf` | present |
-
-A Steam prefix with an app manifest and a client but no `loginusers.vdf` has
-never completed a sign-in, so it has never held a ticket Steam can present to a
-game. The launch path in use is direct:
+The launch path in use starts the executable itself:
 
 ```
 [steam-start] app=2483190 direct source=steam args=0 folder=program
@@ -55,9 +46,28 @@ game. The launch path in use is direct:
 That is `LibraryEntry.steamStart == "game"` (`SteamDirectStart.mode`), which
 `SteamGames.swift` documents as the mode for "games that do not need Steam
 (DRM-free ones)". It publishes `SteamAppId`/`SteamGameId`/`SteamAppPath` and
-starts the executable itself. `steam_api64.dll` does load, but a title whose
-protection asks Valve for the licence cannot be satisfied that way, which is
-consistent with the protection decrypting some pages and then refusing the rest.
+runs the exe. `steam_api64.dll` does load, but no Steam client process exists in
+that session, so there is nothing for the client to authenticate against and no
+ticket for the protection to accept. This holds regardless of whether the prefix
+has ever been signed in: in this mode the licence question is never asked.
+
+Supporting detail from the prefix — it holds the app manifest and the client but
+no stored sign-in:
+
+| Check | Result |
+|---|---|
+| `.../Steam/config/loginusers.vdf` | absent |
+| `.../Steam/config/ssfn*` | absent |
+| `.../Steam/steamclient64.dll` | present, SHA-256 `71b391fe…ecf640` |
+| `.../Steam/steamapps/appmanifest_2483190.acf` | present |
+
+`loginusers.vdf` is written by the full client UI, which Dock deliberately does
+not run, so its absence alone does not prove no sign-in ever happened. What is
+missing is any evidence of a Dock session at all: no retained Madeira log
+contains `dockhost`, `steam-host` or `steam-signin`. Dock is also the only path
+that populates the client's licence cache (an online logon precedes any offline
+logon, and the client caches the answer itself), so the licence question has
+never been put to Valve in this prefix.
 
 ## The faithful path already exists in this tree
 
@@ -84,8 +94,8 @@ running — never by spawning the executable.
 ## Conclusion
 
 The remaining blocker is not an ARM64EC import slot or a JIT-pool fault. It is
-that this title has never been given a Steam licence in this prefix, so its
-protection stops decrypting. Two things are needed, in this order:
+that the launch path never presents a Steam licence, so the protection stops
+decrypting. Two things are needed, in this order:
 
 1. Sign in to Steam in Madeira once, so the prefix has a client session.
 2. Start the game through the Steam client (Madeira Dock, i.e. **Start with:
