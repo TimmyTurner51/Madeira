@@ -553,12 +553,43 @@ has already bumped to `0x1b768000`:
 | **requested** | **74 MB** |
 
 So 126 MB is genuinely free and still unusable: the hole splits it into 59 + 67, and
-`pool_limit` is `jit_pool_size - ios_jit_tail_reserved` where the tail's live reservation
-is the full 256 MB cap (measured peak 112 MB). Seven megabytes short, on a span that is
-84 % committed (439 MB head + 256 MB tail of 824 MB). This is a capacity problem, not a
-correctness one, and it needs either a larger span (the geometry comes from the app's
-`WINE_IOS_JIT_RX`/`RW`/`SIZE`/`HOLE` region request) or a head that can borrow the tail's
-unused reservation.
+`pool_limit` is `jit_pool_size - ios_jit_tail_reserved`.
+
+### The tail took 256 MB because region C was too small to do its job
+
+The interesting part is *why* the tail reservation reached its full 256 MB cap. Two
+128 MB FEX code buffers were carved into the main pool:
+
+```
+[jit-pool] tail EC_CODE rx=0x177818000 size=0x8000000 tail_resv=0x8000000  head_used=0x9534000
+[jit-pool] tail EC_CODE rx=0x16f818000 size=0x8000000 tail_resv=0x10000000 head_used=0xba44000
+```
+
+(`0x177818000` and `0x16f818000` are pool offsets `0x2B818000` and `0x23818000`.) Region C
+— which exists precisely so code buffers *don't* come out of the image pool — served only
+`0x4000` + 16 MB, and then reported
+
+```
+[pool-low] region C has 0x3ffc000 of 0x5000000 left, not enough for carve 0x8000000:
+           it goes to the pool tail (freed C carves are still reused first)
+```
+
+Region C was 80 MB (`pool-low-margin = 128` left only `218 - 128 = 90` MB of the free run
+below the window, rounded down to 80 MB) while `ios_pool_code_cap` permits a **128 MB**
+buffer. One buffer could never fit, so both fell through into the pool and permanently
+consumed 256 MB of image room.
+
+`pool-low-margin = 48` gives region C 160 MB — one 128 MB buffer plus the 16 MB one, with
+`0x58` MB of the run still free. The tail then reserves 128 MB instead of 256, `pool_limit`
+rises to `0x2B818000`, and `libxess`'s 74 MB lands above the hole at `0x1f818000`, ending
+at `0x24358000` — under the limit with 4.7 MB to spare. The 16 images still to load after
+`libxess` total only ~16 MB and fit the 59 MB below the hole.
+
+A 96 MB big-image slot (`MADEIRA_POOL_BIG_SLOT_MB`) looks like the obvious answer and is
+*not* safe here: it widens the effective hole to `0x25818000`, which pushes the second
+128 MB tail carve down to `[0x0C818000, 0x14818000)` — inside the head's forward path,
+where the bump check only tests `pool_limit` and the holes and would run straight into a
+live code buffer.
 
 ## Conclusion
 
