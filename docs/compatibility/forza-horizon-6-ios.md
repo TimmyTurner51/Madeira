@@ -696,3 +696,36 @@ Whether that code had run by the time of the fault is not established, and the
 frame walk does reach an `UnhandledExceptionFilter` import thunk at `0x5eaa3b8`,
 so the filter path was exercised; what the log cannot show is whether a *guest*
 filter had been registered by then.
+
+## Known defect, not yet exercised: the x64-stub test is blind to the hotpatch shape
+
+`build/wine-patches/0001` gives every x64 import thunk the hotpatch prologue
+(`48 8d a4 24 00 00 00 00` then `ff 25 rel32`). `arm64x_check_call` was taught
+that shape (`.Lhotpatch`), and `sync_hotpatched_thunks` exists to keep the pool
+copy of those thunks in step with the file. Two functions that also parse these
+stubs were not taught it, and the mismatch is the described shape of a mis-routed
+EC import slot:
+
+- `arm64ec_iat_slot_is_x64_export` (`wine/dlls/ntdll/arm64ec_x64_export_iat.c`)
+  recognises a stub only when `image[rva] == 0xff && image[rva+1] == 0x25`. With
+  the hotpatch prologue the export's first byte is `0x48`, so the test misses it
+  and returns "not an x64 export stub".
+- `arm64ec_redirect_ptr` decodes `ff 25` at offset 0 and the 14-byte fast-forward
+  at offset 0, then falls through to `xlate_ios_jit(ptr)` — which for a stub that
+  begins with the prologue returns the **pool alias** of x64 bytes.
+
+Together: a slot whose target is an x64 export stub keeps getting redirected to a
+JIT-pool address holding emulated x64 code, which is exactly what an ARM64EC
+caller must never be handed. The run so far does not exercise it — the 11:37
+session logs `[x64-iat]` **zero** times (no slot was ever classified as an x64
+export stub), so there is no measurement to fix against yet.
+
+The 0x90000000 / `ucrtbase.dll+0x90f1c` fault reported against this tree is the
+signature this predicts (`adrp x8; ldr x16,[x8,#0x898]; blr x16` where the slot
+holds a pool address). What is missing is a run that reaches it: the current
+blocker is the `#UD`, and the session that clears the `#UD` is the one to read
+`[x64-iat]` and `[iat-sync]` from. Fixing this without that log would be guessing
+between widening the predicate (keep the stub, ml943's intent) and decoding the
+prologue in `arm64ec_redirect_ptr` (follow through to the real target) — the two
+differ in what the guest executes, and the second changes a hot path that the CEF
+work already found booby-trapped.
