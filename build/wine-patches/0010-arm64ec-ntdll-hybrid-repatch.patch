@@ -1,0 +1,147 @@
+diff --git a/dlls/ntdll/signal_arm64ec.c b/dlls/ntdll/signal_arm64ec.c
+index 22dd5830..b8f1c0e1 100644
+--- a/dlls/ntdll/signal_arm64ec.c
++++ b/dlls/ntdll/signal_arm64ec.c
+@@ -650,6 +650,9 @@ static unsigned int decode_arm64ec_endbr( void *module )
+ }
+ 
+ static void arm64x_check_call(void);
++static void apply_hybrid_metadata( void *module, IMAGE_NT_HEADERS *nt,
++                                   const IMAGE_ARM64EC_METADATA *metadata,
++                                   BOOL do_protect );
+ 
+ /*******************************************************************
+  *         arm64ec_process_init
+@@ -716,14 +719,17 @@ NTSTATUS arm64ec_process_init_dispatchers( HMODULE module )
+      * hybrid pointer slots currently hold 0. Without this re-patch,
+      * kernel32's exit thunks would `blr x16` with x16=0 → branch to NULL.
+      *
+-     * Walk loaded modules and re-patch their hybrid metadata. SKIP ntdll
+-     * itself: re-running arm64ec_update_hybrid_metadata on ntdll's .data
+-     * triggers the iOS NtProtect IAT-sync path (in our virtual_ios.c) which
+-     * over-aggressively rewrites one pointer in ntdll's .data to a JIT-pool
+-     * address, breaking ntdll's own internals immediately after. ntdll's
+-     * slots happen to already be functional (the EC dispatcher slots that
+-     * matter for ntdll are written elsewhere during ntdll's special
+-     * loader-init path, not via arm64ec_update_hybrid_metadata). */
++     * Walk loaded modules and re-patch their hybrid metadata. ntdll used to
++     * be skipped: NtProtect of its .data runs the iOS IAT-sync and rewrote
++     * an unrelated pointer to a JIT-pool address, which broke ntdll. That
++     * skip left the child's private ntdll copy with on-disk zeros in the
++     * CHPE dispatch_call slot (rva 0xd2ea0 on this build). FH6 14:59 then
++     * issued a raw `syscall`; ntdll+0x61ca8 did
++     *   ldr x11,[ntdll+0xd2ea0]; blr check_call
++     * with x11=0, and arm64x_check_call faulted at `ldr x16,[x11]`. Fill
++     * ntdll's slots without NtProtect: .data is already writable, and
++     * update_hybrid_pointer still syncs each eight-byte store into the
++     * pool copy. */
+     {
+         LIST_ENTRY *list = &RtlGetCurrentPeb()->LdrData->InLoadOrderModuleList;
+         LIST_ENTRY *entry;
+@@ -738,12 +744,16 @@ NTSTATUS arm64ec_process_init_dispatchers( HMODULE module )
+             const IMAGE_ARM64EC_METADATA *mod_metadata =
+                 arm64ec_get_module_metadata( mod_entry->DllBase );
+             if (!mod_metadata) continue;
+-            /* Skip ntdll — re-patch breaks it via iOS NtProtect-sync side
+-             * effects, and ntdll doesn't need it anyway. Match by base name. */
++            /* ntdll: fill CHPE slots without NtProtect (see comment above). */
+             if (mod_entry->BaseDllName.Buffer &&
+                 !wcscmp( mod_entry->BaseDllName.Buffer, L"ntdll.dll" ))
+             {
+-                ERR( "arm64ec_process_init_dispatchers: SKIP ntdll re-patch\n" );
++                ERR( "arm64ec_process_init_dispatchers: ntdll re-patch (no NtProtect)\n" );
++                apply_hybrid_metadata( mod_entry->DllBase,
++                                       RtlImageNtHeader( mod_entry->DllBase ),
++                                       (IMAGE_ARM64EC_METADATA *)mod_metadata, FALSE );
+                 continue;
+             }
+             ERR( "arm64ec_process_init_dispatchers: re-patching %s metadata\n",
+@@ -1123,14 +1133,24 @@ static void update_hybrid_pointer( void *module, const IMAGE_SECTION_HEADER *sec
+ }
+ 
+ /*******************************************************************
+- *         arm64ec_update_hybrid_metadata
++ *         apply_hybrid_metadata
++ *
++ * do_protect: NtProtect the section RW around the stores. Required for
++ * typical DLL .rdata/.data that may not be writable. Must stay FALSE for
++ * ntdll — NtProtect of ntdll .data runs the iOS IAT-sync and rewrites a
++ * live pointer. ntdll .data is already writable.
+  */
+-void arm64ec_update_hybrid_metadata( void *module, IMAGE_NT_HEADERS *nt,
+-                                     const IMAGE_ARM64EC_METADATA *metadata )
++static void apply_hybrid_metadata( void *module, IMAGE_NT_HEADERS *nt,
++                                   const IMAGE_ARM64EC_METADATA *metadata,
++                                   BOOL do_protect )
+ {
+     DWORD i, protect_old;
+     const IMAGE_SECTION_HEADER *sec = IMAGE_FIRST_SECTION( nt );
+ 
+     /* assume that all pointers are in the same section */
+-    ERR( "arm64ec_update_hybrid_metadata: module=%p dispatch_call_rva=%lx check_call=%p\n",
+-         module, (unsigned long)metadata->__os_arm64x_dispatch_call, arm64x_check_call );
++    ERR( "arm64ec_update_hybrid_metadata: module=%p dispatch_call_rva=%lx check_call=%p protect=%d\n",
++         module, (unsigned long)metadata->__os_arm64x_dispatch_call, arm64x_check_call, do_protect );
+     /* The dispatcher globals must be non-NULL before they are written into a
+      * slot: a NULL here becomes `blr x16` -> pc=0 in every module that gets
+      * this metadata (build 15 died at ucrtbase+0x90f18 exactly that way). */
+@@ -1152,10 +1172,16 @@ void arm64ec_update_hybrid_metadata( void *module, IMAGE_NT_HEADERS *nt,
+             void *base = get_rva( module, sec->VirtualAddress );
+             SIZE_T size = sec->Misc.VirtualSize;
+ 
+-            NtProtectVirtualMemory( NtCurrentProcess(), &base, &size, PAGE_READWRITE, &protect_old );
++            if (do_protect)
++                NtProtectVirtualMemory( NtCurrentProcess(), &base, &size, PAGE_READWRITE, &protect_old );
+ 
+-            /* Arm the always-on report for the slot the crash reads through. */
+-            watch_rva = metadata->__os_arm64x_dispatch_call_no_redirect;
++            /* Arm the always-on report for the slot the crash reads through.
++             * Other modules: ucrtbase's no_redirect. ntdll: dispatch_call
++             * (rva 0xd2ea0), which 14:59 read as 0. */
++            watch_rva = do_protect ? metadata->__os_arm64x_dispatch_call_no_redirect
++                                   : metadata->__os_arm64x_dispatch_call;
+ 
+ #define SET_FUNC(func,val) update_hybrid_pointer( module, sec, metadata->func, val )
+             SET_FUNC( __os_arm64x_dispatch_call, arm64x_check_call );
+@@ -1174,14 +1200,25 @@ void arm64ec_update_hybrid_metadata( void *module, IMAGE_NT_HEADERS *nt,
+             SET_FUNC( SetX64InformationFunctionPointer, __os_arm64x_set_x64_information );
+ #undef SET_FUNC
+ 
+-            NtProtectVirtualMemory( NtCurrentProcess(), &base, &size, protect_old, &protect_old );
++            if (do_protect)
++                NtProtectVirtualMemory( NtCurrentProcess(), &base, &size, protect_old, &protect_old );
++            else
++                ERR( "ntdll hybrid dispatch_call rva=%lx pe=%p\n",
++                     (unsigned long)metadata->__os_arm64x_dispatch_call,
++                     *(void **)get_rva( module, metadata->__os_arm64x_dispatch_call ) );
+             return;
+         }
+     }
+     ERR( "module %p no section found for %lx\n", module, metadata->__os_arm64x_dispatch_call );
+ }
+ 
++void arm64ec_update_hybrid_metadata( void *module, IMAGE_NT_HEADERS *nt,
++                                     const IMAGE_ARM64EC_METADATA *metadata )
++{
++    apply_hybrid_metadata( module, nt, metadata, TRUE );
++}
++
++
+ /*******************************************************************
+  *         arm64ec_sync_bound_iat_slots
+  *
+@@ -4156,6 +4193,16 @@ __ASM_GLOBAL_FUNC( "#KiUserEmulationDispatcher",
+  */
+ static void dispatch_syscall( ARM64_NT_CONTEXT *context )
+ {
++    static LONG sysn;
++
++    if (sysn < 12 && InterlockedIncrement( &sysn ) <= 12)
++        ERR( "[ec-syscall] #%d nr=%llx pc=%p invoke=%p x0=%p x1=%p\n",
++             (int)sysn, (unsigned long long)context->X8, (void *)(ULONG_PTR)context->Pc,
++             invoke_arm64ec_syscall, (void *)(ULONG_PTR)context->X0,
++             (void *)(ULONG_PTR)context->X1 );
++
+     if (context->X8 < __nb_syscalls)  /* syscall number in rax */
+     {
+         context->X0 = context->X4;  /* get first param from r10 */

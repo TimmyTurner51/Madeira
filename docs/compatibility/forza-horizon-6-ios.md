@@ -909,3 +909,25 @@ ignored. Hiding the named export (same-length rewrite to
 That is not decrypting their functions; it is not advertising a non-Windows
 API. `[uef]` kernelbase is on sysx64 for the same launch, so the unhandled
 filter chain is logged if the flag change is not enough.
+
+## 2026-11-15 14:59 — `#UD` gone; raw `syscall` hits a null ntdll dispatch slot
+
+Hiding `wine_get_unix_file_name` worked. No `c000001d`, no `[ud-decrypt]`.
+The game installed its CRT unhandled filter
+(`forzahorizon6.exe+0x5A669D0`) and then issued a real Windows `syscall`
+(`0F 05` at `0x14551012A`, Wine number `0x50` = `NtProtectVirtualMemory`).
+FEX raises `STATUS_EMULATION_SYSCALL`; Wine's `dispatch_syscall` is the
+honest path.
+
+The process then AVs at `arm64x_check_call` (`ntdll+0x572d4`,
+`ldr x16,[x11]`) with `x11=0`. `[nullfp-probe]` names the load:
+`ntdll+0x61ca8` reads CHPE `dispatch_call` at rva `0xd2ea0`, and both the
+PE view and the child's pool copy are 0. `arm64ec_process_init_dispatchers`
+logged `SKIP ntdll re-patch` — that skip assumed ntdll's slots were filled
+elsewhere. They are not, on a child pseudo-process's private ntdll copy.
+
+ml1258 fills ntdll's CHPE slots the same way as every other ARM64EC module,
+but without `NtProtect` of ntdll `.data` (that protect is what the skip was
+avoiding: iOS IAT-sync rewriting a live ntdll pointer). Look for
+`ntdll re-patch (no NtProtect)` and `ntdll hybrid dispatch_call rva=... pe=`
+non-NULL, then `[ec-syscall]`.
