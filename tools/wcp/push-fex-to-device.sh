@@ -54,12 +54,32 @@ iosdev app-put "$DLL" "$REMOTE" >/dev/null
 # over the prefix. A component pushed without this second copy is a no-op: on
 # 2026-11-15 five FEX pushes in a row all resolved to the old bundle DLL, and
 # the crash stayed byte-identical because none of the patched code ever ran.
-BUNDLE="Documents/Applications/com.willfaust.madeora.app/arm64ec-windows/xtajit64.dll"
-if iosdev app-put "$DLL" "$BUNDLE" >/dev/null 2>&1; then
-    echo "bundle $BUNDLE  (this is the copy the session loads)"
-else
-    echo "bundle copy SKIPPED -- $BUNDLE is missing, so the component link is the" >&2
-    echo "       only path; verify it is really the one loaded before trusting a run" >&2
+# The bundle copy lives in the *host app's own* data container, not in MAD. The
+# path the session logs is
+#   /…/Data/Application/<container>/Documents/Applications/<appid>/arm64ec-windows/<dll>
+# where <container> is the container the running session reports, and it is NOT
+# always the LiveContainer appDataContainer that MAD points at. On 2026-11-15
+# this script still wrote to "$MAD/Applications/…", which does not exist, so
+# every push printed "SKIPPED" and the session kept loading the old bundle DLL
+# (build-id rev=ml908, compiled 00:26) for nine revisions of FEX work.
+#
+# Push to every plausible container instead of guessing one: a duplicate copy
+# holding the same bytes is harmless, a missing one silently reverts a session.
+APP_REL="Documents/Applications/com.willfaust.madeora.app/arm64ec-windows/xtajit64.dll"
+BUNDLE_WROTE=0
+for BUNDLE in \
+    "Documents/Data/Application/BD038598-DE0F-4AA5-B8F3-6AC778939190/$APP_REL" \
+    "$MAD/Applications/com.willfaust.madeora.app/arm64ec-windows/xtajit64.dll" \
+    "Documents/Data/Application/BD038598-DE0F-4AA5-B8F3-6AC778939190/Documents/Applications/com.willfaust.madeora.app/Frameworks/arm64ec-windows/xtajit64.dll"
+do
+    if iosdev app-put "$DLL" "$BUNDLE" >/dev/null 2>&1; then
+        echo "bundle $BUNDLE  (a copy the session may load)"
+        BUNDLE_WROTE=$((BUNDLE_WROTE + 1))
+    fi
+done
+if [ "$BUNDLE_WROTE" -eq 0 ]; then
+    echo "bundle copy SKIPPED -- no known bundle path accepted the file, so the" >&2
+    echo "       component link is the only path; verify with the build-id below" >&2
 fi
 echo "dll    $(shasum -a 256 "$DLL" | cut -c1-64)"
 echo "       $REMOTE"
@@ -97,4 +117,9 @@ cat <<'EOF'
 
 Relaunch Madeira and start the game, then check the module that actually loaded:
     iosdev mad-log | rg '\[build-id\]'
+
+That line prints "rev=<tag> compiled <date>". It MUST match the build you just
+pushed. If it still shows the previous date, the session is loading a bundle
+copy this script did not reach and no patch in that DLL ran -- do not read the
+run's crash as evidence about the new code.
 EOF
