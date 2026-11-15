@@ -51,6 +51,30 @@ resume execution at the faulting address.
 So the question is not "why did Wine lose the exception" but "what did the
 protection decide, and on what evidence".
 
+## The failure is at 4.5 s, before the anti-tamper's own check batch
+
+Timing puts the decline earlier than the documented integrity checks:
+
+| Event | Wall clock | Relative |
+|---|---|---|
+| `[steam-start] app=2483190 direct source=steam` | `10:06:23.389` | t+0.0 s |
+| `Invalid instruction in entry block: 12D3709D0` | — | — |
+| `[exit-report] status=0xc000001d` | `10:06:27.903` | **t+4.5 s** |
+
+`fh6_linux_handoff2.md` records that "FH6's anti-tamper runs a batch of checks
+about 7 seconds after launch". Dying at t+4.5 s means that batch never ran, so
+whatever declined the exception is an earlier gate — the initial licence/DRM
+validation, not the post-startup integrity sweep.
+
+Nothing has been decrypted at that point, and nothing has been asked of Steam:
+the run loads `steam_api64.dll` and resizes it into the pool, and then does
+nothing further with it. No Steam client IPC appears anywhere in the session.
+
+For contrast, in the reference build this same `#UD` is handled and the game
+reaches a real window: compositor logs show the window renamed to
+`Forza Horizon 6` at `08:21:38`, ~57 fps of splash frames, then the documented
+stall. So the `#UD` is survivable; it is the decision around it that differs.
+
 ## Candidate causes, ranked, with what would settle each
 
 ### 1. The launch path never asks Steam for a licence (highest confidence)
@@ -107,20 +131,26 @@ Proton/Android has no reason to modify module code. Madeira on iOS does, because
 ```
 
 That is 744 rewritten instructions in ntdll's own `.text` (the pool copy at
-`0x1533d4000`, i.e. the copy the guest executes and whose addresses
-`GetProcAddress`/the IAT hand out). If the protection hashes code at the
-addresses it is given, it sees those 744 sites differ from the file. On a
-conforming machine every module reports a zero diff — that is exactly what the
-conformance probe's `TextDiff` measures, and what the reference run shows for
-every module:
+`0x1533d4000`, i.e. the copy the guest executes). On a conforming machine every
+module reports a zero diff — that is exactly what the conformance probe's
+`TextDiff` measures, and what the reference run shows for every module:
 
 ```
 module  1 ntdll.dll  … text=75bd0 diff=0 first=ffffffff
 module  2 kernel32.dll … text=32310 diff=0 first=ffffffff
 ```
 
-This is a faithfulness problem, not a game problem: the bytes are ours, not the
-protected image's.
+**This does not apply to the game's own `.text`, which is the section the
+protection is most likely to hash.** The patcher skips any image that is not
+ARM64 and has no `.a64xrm` section (`virtual_ios.c`, "skipping x18 patcher for
+non-ARM64 PE"), and `forzahorizon6.exe` is a pure x64 PE that FEX emulates. The
+lowest patched copy in the run is ntdll at `0x1533d4000`; the exe's copy spans
+`0x148005000`–`0x14E3A1CE3`, untouched. The loader's `DllBase` also points at
+the unmodified PE copy, so a module-integrity check that starts from `DllBase`
+sees the file's own bytes.
+
+This is therefore a real faithfulness divergence from Proton, but a weaker
+suspect for a decline that happens at t+4.5 s, before the integrity sweep runs.
 
 ### How to settle both at once
 
@@ -140,12 +170,22 @@ The `diff` column is the direct test of candidate 2, and the reference values ar
 ## Conclusion
 
 The remaining blocker is not an ARM64EC import slot, nor a JIT-pool fault, nor a
-lost `#UD`. The protection raises its decrypt trigger and then declines it, so
-either it was never given a Steam licence in this session (candidate 1) or it can
-see the platform's own rewrites of module code (candidate 2).
+lost `#UD`. The protection raises its decrypt trigger and declines it **4.5
+seconds in, before its own integrity sweep**, having done no decryption and
+having asked Steam nothing. That points at the initial licence gate.
 
-Candidate 1 has a supported, faithful path in this tree and is being exercised
-next. Candidate 2 would need the `x18` handling to stop modifying the bytes the
-guest is handed, which is a real design constraint for this platform and is not
-something patching the game could fix — and patching the game is excluded
-outright: the protection is meant to run exactly as shipped.
+Candidate 1 has a supported, faithful path in this tree (`dockhost.exe`, verified
+against this prefix's exact `steamclient64.dll`) and is the next thing to
+exercise. Candidate 2 remains a divergence from Proton worth closing for
+faithfulness, but it does not touch the game's own `.text`.
+
+Nothing here requires modifying the game, and doing so is excluded: the
+protection is meant to run exactly as shipped.
+
+## Next measurement
+
+If the licence path still declines, the decisive question is whether the game's
+handler decrypted anything before giving up. The probe to answer it is a 16-byte
+snapshot at `ExceptionAddress` taken when the `#UD` is dispatched and again when
+the handler walk finishes: changed bytes mean the protection decrypted and then
+failed on something else, unchanged bytes mean it never decrypted at all.

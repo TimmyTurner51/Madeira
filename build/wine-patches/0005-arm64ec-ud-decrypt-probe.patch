@@ -1,0 +1,110 @@
+diff --git a/dlls/ntdll/signal_arm64ec.c b/dlls/ntdll/signal_arm64ec.c
+index 3942332e..d4a822c4 100644
+--- a/dlls/ntdll/signal_arm64ec.c
++++ b/dlls/ntdll/signal_arm64ec.c
+@@ -3312,6 +3312,75 @@ static void ios_fatal_probe( const CONTEXT *ctx )
+ }
+ 
+ static void ios_tlswatch_pe_arm( const char *where );
++
++/* iOS-Madeira ml1250: DOES THE PROTECTION DECRYPT BEFORE IT GIVES UP?
++ *
++ * A protected title can carry per-function encrypted prologues whose first
++ * byte is not a valid 64-bit instruction. On a working machine the title's own
++ * exception handler decrypts that function in place and returns
++ * ExceptionContinueExecution. Here the handler is reached and then returns
++ * ExceptionContinueSearch, and Wine unwinds to the unhandled filter.
++ *
++ * Two very different causes look identical in a log: the protection decided not
++ * to decrypt at all (a licence/tamper verdict), or it decrypted and something
++ * else then failed. The bytes at the faulting address separate them, and they
++ * are the only evidence that does: snapshot them at dispatch, and read them
++ * again when a handler declines.
++ *
++ * Reads go through NtReadVirtualMemory, which returns a status instead of
++ * faulting, and this runs inside exception dispatch, so it allocates nothing,
++ * takes no lock and recurses into nothing. */
++static ULONG_PTR ml1250_ud_addr;
++static BYTE ml1250_ud_before[16];
++static LONG ml1250_ud_armed, ml1250_ud_reports;
++
++static void ml1250_ud_snapshot( EXCEPTION_RECORD *rec )
++{
++    SIZE_T got = 0;
++
++    ml1250_ud_armed = 0;
++    ml1250_ud_addr = 0;
++    if (!rec || rec->ExceptionCode != STATUS_ILLEGAL_INSTRUCTION || !rec->ExceptionAddress) return;
++    if (!NT_SUCCESS( NtReadVirtualMemory( NtCurrentProcess(), rec->ExceptionAddress,
++                                          ml1250_ud_before, sizeof(ml1250_ud_before), &got ) )
++        || got != sizeof(ml1250_ud_before)) return;
++    ml1250_ud_addr = (ULONG_PTR)rec->ExceptionAddress;
++    ml1250_ud_armed = 1;
++}
++
++static void ml1250_ud_report( const char *where )
++{
++    BYTE after[16];
++    SIZE_T got = 0;
++    int i, same = 1;
++
++    if (!ml1250_ud_armed) return;
++    ml1250_ud_armed = 0;
++    if (InterlockedIncrement( &ml1250_ud_reports ) > 16) return;
++    if (!NT_SUCCESS( NtReadVirtualMemory( NtCurrentProcess(), (void *)ml1250_ud_addr,
++                                          after, sizeof(after), &got ) )
++        || got != sizeof(after))
++    {
++        ERR( "[ud-decrypt] %s at %p: unreadable afterwards, undecidable\n",
++             where, (void *)ml1250_ud_addr );
++        return;
++    }
++    for (i = 0; i < (int)sizeof(after); i++) if (after[i] != ml1250_ud_before[i]) same = 0;
++    if (same)
++        ERR( "[ud-decrypt] %s at %p: BYTES UNCHANGED (%02x%02x%02x%02x%02x%02x%02x%02x) "
++             "-- the protection never decrypted this function\n",
++             where, (void *)ml1250_ud_addr, ml1250_ud_before[0], ml1250_ud_before[1],
++             ml1250_ud_before[2], ml1250_ud_before[3], ml1250_ud_before[4],
++             ml1250_ud_before[5], ml1250_ud_before[6], ml1250_ud_before[7] );
++    else
++        ERR( "[ud-decrypt] %s at %p: DECRYPTED (%02x%02x%02x%02x%02x%02x%02x%02x -> "
++             "%02x%02x%02x%02x%02x%02x%02x%02x) -- the handler wrote plaintext and still declined\n",
++             where, (void *)ml1250_ud_addr, ml1250_ud_before[0], ml1250_ud_before[1],
++             ml1250_ud_before[2], ml1250_ud_before[3], ml1250_ud_before[4],
++             ml1250_ud_before[5], ml1250_ud_before[6], ml1250_ud_before[7],
++             after[0], after[1], after[2], after[3], after[4], after[5], after[6], after[7] );
++}
++
+ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
+ {
+     if (rec && rec->ExceptionCode == 0x406D1388) ios_tlswatch_pe_arm( "call_seh_handlers entry" );
+@@ -3521,6 +3590,13 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
+         }
+     }
+ 
++    /* ml1250: before the walk, keep the bytes the #UD was raised on. The
++     * handlers are the only thing that could decrypt them, and whether they
++     * changed is the one fact that separates "never decrypted" (a verdict
++     * against us) from "decrypted and still gave up". Independent of the
++     * ml811 probe above, which is itself recursion-guarded. */
++    ml1250_ud_snapshot( rec );
++
+     context.AMD64_Context = *orig_context;
+     context.ContextFlags &= ~0x40; /* Clear xstate flag. */
+ 
+@@ -3918,6 +3994,7 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
+                 if (rec->ExceptionFlags & EXCEPTION_NONCONTINUABLE) return STATUS_NONCONTINUABLE_EXCEPTION;
+                 return STATUS_SUCCESS;
+             case ExceptionContinueSearch:
++                ml1250_ud_report( "EC handler declined" );
+                 break;
+             case ExceptionNestedException:
+                 rec->ExceptionFlags |= EXCEPTION_NESTED_CALL;
+@@ -3947,6 +4024,7 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
+                 if (rec->ExceptionFlags & EXCEPTION_NONCONTINUABLE) return STATUS_NONCONTINUABLE_EXCEPTION;
+                 return STATUS_SUCCESS;
+             case ExceptionContinueSearch:
++                ml1250_ud_report( "TEB handler declined" );
+                 break;
+             case ExceptionNestedException:
+                 rec->ExceptionFlags |= EXCEPTION_NESTED_CALL;
