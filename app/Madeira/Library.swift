@@ -785,6 +785,10 @@ struct LibraryEntry: Codable, Identifiable {
         // game's own choices below, before madeira.cfg's env lines and before the
         // game's config lines, all of which therefore still win.
         //
+        // Read through WCPLaunchEnvironmentStore rather than the model: this
+        // runs on the launch worker, and the model is @MainActor (see the
+        // snapshot's comment in WCPComponents.swift).
+        //
         // It has to be the first statement, ahead of configureLaunch(), because
         // that function RETURNS EARLY for a Steam game started through Madeira
         // Dock -- which is exactly the case a FEX preset package is installed
@@ -797,7 +801,7 @@ struct LibraryEntry: Codable, Identifiable {
         // installed -- which is what the 2026-11-15 11:17 run showed: FEX ran
         // under its own defaults (SMCChecks=mtrack, hypervisor bit set,
         // 0x40000000 answering FEXIFEXIEMU) while the package said otherwise.
-        let componentEnvironment = WCPComponentsModel.shared.launchEnvironment
+        let componentEnvironment = WCPLaunchEnvironmentStore.shared.entries
         for entry in componentEnvironment { setenv(entry.name, entry.value, 1) }
         if !componentEnvironment.isEmpty {
             LogStore.shared.log("[wcp-env] " + componentEnvironment.map { "\($0.name)=\($0.value)" }.joined(separator: " "))

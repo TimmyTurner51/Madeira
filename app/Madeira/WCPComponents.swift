@@ -522,9 +522,11 @@ final class WCPComponentsModel: ObservableObject {
         guard let data = try? Data(contentsOf: Self.stateFile),
               let state = try? JSONDecoder().decode(State.self, from: data) else {
             components = []
+            publishLaunchEnvironment()
             return
         }
         components = state.components.sorted { $0.installedAt > $1.installedAt }
+        publishLaunchEnvironment()
     }
 
     private func save() {
@@ -538,6 +540,10 @@ final class WCPComponentsModel: ObservableObject {
         } catch {
             self.error = "Could not save the component list: \(error.localizedDescription)"
         }
+        /* Even on the error path: the in-memory list is what the next launch will
+         * use, and a stale snapshot would export a component that was just
+         * removed -- the failure mode this snapshot exists to avoid. */
+        publishLaunchEnvironment()
     }
 
     func report(_ error: Error) {
@@ -920,6 +926,49 @@ final class WCPComponentsModel: ObservableObject {
             for (name, value) in component.environment { merged[name] = value }
         }
         return merged.sorted { $0.key < $1.key }.map { (name: $0.key, value: $0.value) }
+    }
+
+    /// Republish `launchEnvironment` for the launch worker.
+    ///
+    /// `applyEnvironment()` runs off the main actor -- it is the first thing the
+    /// launch does, before the JIT pool is taken -- so it cannot read
+    /// `launchEnvironment` directly: that is main-actor state, and the compiler
+    /// rejects it ("main actor-isolated property 'launchEnvironment' can not be
+    /// referenced from a nonisolated context"). A blocking hop is not an option
+    /// either, because main may be busy and the launch would stall behind it.
+    ///
+    /// So the model publishes a snapshot whenever the component list changes,
+    /// and the launch path reads the snapshot. Every path that can change the
+    /// set funnels through `reload()` or `save()`, so those are the two calls.
+    private func publishLaunchEnvironment() {
+        WCPLaunchEnvironmentStore.shared.set( launchEnvironment )
+    }
+}
+
+/// A thread-safe copy of the merged component environment (see
+/// `WCPComponentsModel.publishLaunchEnvironment`).
+///
+/// Not actor-isolated: the launch worker reads it, the main actor writes it. A
+/// lock rather than an actor because the read must not suspend -- it happens in
+/// the first statements of a launch, before anything else is set up.
+final class WCPLaunchEnvironmentStore: @unchecked Sendable {
+    static let shared = WCPLaunchEnvironmentStore()
+
+    private let lock = NSLock()
+    private var value: [(name: String, value: String)] = []
+
+    private init() {}
+
+    var entries: [(name: String, value: String)] {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+
+    func set(_ entries: [(name: String, value: String)]) {
+        lock.lock()
+        value = entries
+        lock.unlock()
     }
 }
 
