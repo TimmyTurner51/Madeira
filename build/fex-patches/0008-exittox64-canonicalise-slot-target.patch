@@ -1,0 +1,32 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Madeira <madeira@example.invalid>
+Date: Sun, 15 Nov 2026 00:15:00 -0600
+Subject: [PATCH] ExitToX64: canonicalise the import slot target into POOL space
+ before the EcCodeBitMap test
+
+Signed-off-by: Madeira <madeira@example.invalid>
+---
+--- a/Source/Windows/ARM64EC/Module.S
++++ b/Source/Windows/ARM64EC/Module.S
+@@ -323,6 +323,19 @@
+   mov x16, x17                     // ml1207: keep the slot address itself
+   ldr x17, [x17]                   // the pointer the jmp loads
+ 84:
++  // ml1218: canonicalise the target into POOL space before the bitmap test.
++  //
++  // That test indexes a 256 KB bitmap with addr>>15 and rejects anything at or
++  // above 0x40000 words, which is correct for the pool (0x153...) and wrong for
++  // a PE image (0x71fe...). Both paths above can produce either: the PE IAT read
++  // yields whatever loader.c stored, and a value that IS a real ARM64EC target
++  // still fails the range check when it is expressed as a PE address -- so the
++  // call was rejected into emulation for being correct. IOS_PE_TO_POOL_TO is a
++  // no-op on a pool address (it exits early when reg>>15 < 0x40000) and leaves
++  // reg untouched when no alias entry contains it, so calling it here cannot
++  // regress the plain pool path.
++  IOS_PE_TO_POOL_TO x17, x10, x11, x12, x23, 82f
++82:
+   // ml1136: the slot rarely holds the native body. loader.c's
+   // arm64ec_iat_is_exported_x64 keeps the x64-VISIBLE 14-byte fast-forward stub
+   // of a hybrid export (in the importer's .hexpthk) so x64 callers and hook
+-- 
+2.51.0
