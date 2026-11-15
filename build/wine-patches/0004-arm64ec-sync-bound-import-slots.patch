@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Madeira <madeira@example.invalid>
-Date: Sun, 15 Nov 2026 01:05:00 -0600
+Date: Sun, 15 Nov 2026 01:09:00 -0600
 Subject: [PATCH] ntdll: sync bound import slots into the pool copy before the
  DllMain walk
 
@@ -41,7 +41,7 @@ index 5199cc9d..4261f155 100644
  extern NTSTATUS arm64ec_process_init( HMODULE module );
  extern NTSTATUS arm64ec_thread_init(void);
 diff --git a/dlls/ntdll/signal_arm64ec.c b/dlls/ntdll/signal_arm64ec.c
-index d5647738..6103b1c2 100644
+index d5647738..fbd5a19c 100644
 --- a/dlls/ntdll/signal_arm64ec.c
 +++ b/dlls/ntdll/signal_arm64ec.c
 @@ -984,8 +984,14 @@ IMAGE_ARM64EC_METADATA *arm64ec_get_module_metadata( HMODULE module )
@@ -134,7 +134,7 @@ index d5647738..6103b1c2 100644
  #define SET_FUNC(func,val) update_hybrid_pointer( module, sec, metadata->func, val )
              SET_FUNC( __os_arm64x_dispatch_call, arm64x_check_call );
              SET_FUNC( __os_arm64x_dispatch_call_no_redirect, __os_arm64x_dispatch_call_no_redirect );
-@@ -1076,6 +1117,196 @@ void arm64ec_update_hybrid_metadata( void *module, IMAGE_NT_HEADERS *nt,
+@@ -1076,6 +1117,203 @@ void arm64ec_update_hybrid_metadata( void *module, IMAGE_NT_HEADERS *nt,
  }
  
  
@@ -271,6 +271,13 @@ index d5647738..6103b1c2 100644
 +                 * LdrGetProcedureAddress, so this cannot nest the walk we are
 +                 * about to run. */
 +                munbound++;
++                /* Leave the main image alone. fo's imports are handled by the
++                 * dedicated x64 data-import path (ml1245, "[x64-data-imp]
++                 * importer pe=... IAT window ..."), which walks the exe's IAT
++                 * window on its own terms. Rebinding those slots here would
++                 * race that pass for no gain: the call this function exists to
++                 * fix is a DLL-to-DLL import inside ucrtbase/kernel32. */
++                if (module == RtlGetCurrentPeb()->ImageBaseAddress) continue;
 +                if (!provider || IMAGE_SNAP_BY_ORDINAL( ilt->u1.Ordinal )) continue;
 +                {
 +                    IMAGE_IMPORT_BY_NAME *by_name =
