@@ -1,14 +1,14 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Madeira <madeira@example.invalid>
-Date: Sun, 15 Nov 2026 00:47:00 -0600
-Subject: [PATCH] ExitToX64: prefer the followed native body over emulation that
+Date: Sun, 15 Nov 2026 00:50:00 -0600
+Subject: [PATCH] ExitToX64: prefer a resolved native body over emulation that
  cannot exist
 
 Signed-off-by: Madeira <madeira@example.invalid>
 ---
---- a/Source/Windows/ARM64EC/Module.S	2026-11-15 00:47:31
-+++ b/Source/Windows/ARM64EC/Module.S	2026-11-15 00:47:31
-@@ -501,6 +501,47 @@
+--- a/Source/Windows/ARM64EC/Module.S	2026-11-15 00:49:03
++++ b/Source/Windows/ARM64EC/Module.S	2026-11-15 00:49:03
+@@ -501,6 +501,58 @@
    add sp, sp, #32
    br x17
  ios_thunk_reject:
@@ -22,26 +22,37 @@ Signed-off-by: Madeira <madeira@example.invalid>
 +  // crash that has survived builds 24..33 of this investigation. Emulating is
 +  // not merely suboptimal there, it cannot work at all.
 +  //
-+  // Two conditions together make a native branch the only sound answer:
-+  //   * at least one FFS stub was actually followed ([sp+24] != the initial 4),
-+  //     so x17 is a target this code derived itself by walking a hybrid image's
-+  //     .hexpthk stub. Such a stub's jmp target is that image's native ARM64EC
-+  //     body BY CONSTRUCTION -- .hexpthk is the x64-visible face of native code,
-+  //     which is why ucrtbase reaches it through an exit thunk in the first
-+  //     place. The only thing the bitmap can still be wrong about is its own
-+  //     marking, and an unmarked page is not evidence that the code is x64.
++  // Two conditions make a native branch the only sound answer:
++  //   * x17 is a real code address rather than an rva or filler, established
++  //     either by actually following an FFS stub ([sp+24] != the initial 4) or,
++  //     when nothing was followed, by the slot value in use being a full
++  //     address (>= 0x100000). A followed stub's jmp target is that image's
++  //     native ARM64EC body BY CONSTRUCTION -- .hexpthk is the x64-visible face
++  //     of native code, which is why ucrtbase reaches it through an exit thunk
++  //     in the first place -- and a bound IAT slot holds a resolved address,
++  //     not an rva. Either way the only thing still in doubt is the bitmap's
++  //     own marking, and an unmarked page is not evidence that the code is x64.
 +  //   * DispatcherLoopTopEnterEC is NULL, i.e. FEX has not initialised this
 +  //     thread, so the emulation branch would dereference NULL.
-+  // If FEX is live the bitmap keeps its authority and nothing changes; if no
-+  // stub was followed, x17 may be an arbitrary slot value and nothing changes.
-+  ldr x23, [sp, #24]               // hop budget, 4 when nothing was followed
-+  cmp x23, #4
-+  b.eq 94f
++  // If FEX is live the bitmap keeps its authority and nothing changes; if the
++  // slot holds an unbound hint/name rva or 0xcc filler, nothing changes either.
++  //
++  // The point of the second route is that the alternative is not "emulate
++  // correctly" but "br x16 with x16 = 0". Given a guaranteed fatal fault, a
++  // resolved native address is the better branch on any accounting.
 +  IOS_LOAD_TEB x16
 +  ldr x16, [x16, #0x1788]          // TEB->ChpeV2CpuAreaInfo
 +  cbz x16, 94f
 +  ldr x16, [x16, #0x40]            // ->EmulatorData[2] == DispatcherLoopTopEnterEC
 +  cbnz x16, 94f                    // FEX is initialised: honour the bitmap
++  ldr x23, [sp, #24]               // hop budget, 4 when nothing was followed
++  cmp x23, #4
++  b.ne 95f                         // a stub was followed: x17 is a native body
++  ldr x23, [sp]                    // the slot value actually in use
++  movz x16, #0x10, lsl #16         // 0x100000
++  cmp x23, x16
++  b.lo 94f                         // rva or filler: not a target after all
++95:
 +  adrp x16, IosFfsBypassLog
 +  add x16, x16, #:lo12:IosFfsBypassLog
 +  ldr x23, [x16]
