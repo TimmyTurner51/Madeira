@@ -513,19 +513,35 @@ emulator; it does not weaken, skip or disable anything the game checks. It is th
 class of fix as the hotpatch import thunks: make the ARM64EC runtime behave the way
 native x64 Windows does.
 
-## The anti-tamper is past: `ml1253` removed the last `#UD`
+## ⛔ RETRACTED (2026-11-15 11:53) — `ml1253` was never validated
 
-With the hypervisor leaves hidden, the run of 2026-11-15 11:04 behaves like a different
-game. The `#UD` (`0xc000001d`) at RVA `0x537099C` and the `c0000005` at `pc=0` are both
-**gone**: the log contains no `c0000` fault of any kind, `arm64ec_process_init` returns
-`status=0` for `pProcessInit`, `create_cross_process_work_list` and `pThreadInit`, and the
-session runs for 99 s to 24 threads with the emulator executing at IPC 3.39. The
-protection decrypted its functions, exactly as the ECB analysis predicted once the
-`FEXIFEXIEMU` signature stopped giving it a reason not to.
+**The section below is wrong and is kept only to record the mistake.** It claimed the
+11:04 run proved that hiding the hypervisor leaves made the protection decrypt. That
+run never executed a single instruction of the game:
 
-The nine-build hunt through `[ffs-slot]`, `[veh-chain]`, `[veh-add]` and the ARM64EC
-import-slot routing was chasing a symptom. The mechanism was never a mis-routed slot —
-it was the guest refusing to decrypt.
+```
+[jit-pool] L"...\libxess.dll": no JIT-pool copy for executable section .text
+00e8:err:process:NtTerminateProcess ... exit_code=0xc0000135     <- STATUS_DLL_NOT_FOUND
+```
+
+`libxess.dll` is a static import, so the loader failed and the process exited before its
+entry point ran. There was no `#UD` because there was no execution — not because the
+protection decrypted. Every `[seh-xlate]` line in that log belongs to `rpcrt4`, `sechost`,
+`kernel32` and `kernelbase`, i.e. Wine's own modules from earlier processes; none is the
+game. The "99 s to 24 threads at IPC 3.39" is Wine's services and Steam's webhelper.
+
+The measurement that settles it is the protection's own probing, which is present only
+when the game runs:
+
+| Run | `libxess.dll` | `[alloc-fail]` | `c000001d` |
+|---|---|---|---|
+| 11:04:31 | EXHAUSTED — load fails | **1** | 0 |
+| 11:17:59 | pool `0x16bc7e000` | **507** | 10 |
+| 11:37:38 | pool `0x16776a000` | **507** | 10 |
+
+Absence of a fault in a process that never ran is not evidence of a fix. The `#UD` at
+RVA `0x537099C` has been present in **every** run that reached the game's code, before
+and after `ml1253`.
 
 ## Next blocker: the JIT pool cannot fit `libxess.dll`
 
@@ -622,37 +638,30 @@ With the image at its preferred base, `[ud-decrypt]` is the whole verdict:
   code is not the Proton arrangement) and the platform rewrites of module
   `.text`.
 
-## 2026-11-15 11:37 — the Android FEX preset is not a superset; it re-broke decryption
+## 2026-11-15 11:37 — the Android FEX preset changes nothing measurable
 
-The run that added the DroidDeck reference environment to the game's own config
-refused to decrypt again, and the two sessions either side of that change are
-identical except for those lines:
+This entry first claimed the preset re-broke decryption. **That was wrong, and the
+mistake is worth keeping**: it compared the 11:37 run against the 11:04 run, which
+(see the retraction above) never executed the game, so it had no `#UD` for reasons that
+have nothing to do with any environment variable.
 
-| Session | `[game-cfg]` | `c000001d` | Protection |
+The run that settles it is 11:17, which had **no** `env.FEX_*` line at all and behaves
+identically to 11:37:
+
+| Session | `env.FEX_*` | `[alloc-fail]` | `c000001d` |
 |---|---|---|---|
-| `11:04:31` | `env.MADEIRA_EC_HOOK_TRACE=0 exe-window-mb=192 pool=896 pool-low=1 pool-pair=1 pool-split` | **0** | decrypted; the load then died on the `libxess.dll` pool carve |
-| `11:37:38` | the same, plus `env.FEX_SMCCHECKS=full FEX_HIDEHYPERVISORBIT=1 FEX_MULTIBLOCK=1 FEX_TSOENABLED=1 FEX_HALFBARRIERTSOENABLED=1 FEX_VECTORTSOENABLED=0 FEX_MEMCPYSETTSOENABLED=0 FEX_DYNAMICL1CACHE=0 FEX_PROFILESTATS=0 FEX_X87REDUCEDPRECISION=1` | **10** | `[ud-decrypt] … BYTES UNCHANGED (eae96be61448897c)` |
+| `11:17:59` | none | 507 | 10 |
+| `11:37:38` | the full Android preset | 507 | 10 |
 
-The environment was verified to reach the process before the fault — FEX parsed
-it, and its own line confirms the values landed rather than being dropped:
+Same fault, same address, same count. So the preset is neither a fix nor the cause, and
+the environment it sets is not what the protection reads. It has been removed from
+`f19a86ea48b779e2.cfg` anyway — not because it hurt, but because it was never shown to
+help, and a shorter environment is one less variable. The file records this.
 
-```
-[madeira-env] game FEX_SMCCHECKS=full  … FEX_X87REDUCEDPRECISION=1
-I EC FEX: TSO config tso=true halfbar=true vector=false memcpyset=false rev=ml513
-```
-
-so "the preset never got applied" is ruled out. At least one switch in it changes
-FEX in a way the protection reads, and the preset's value was never established:
-the session *without* it is the one that ran for 99 s and executed game code. The
-preset has been removed from `f19a86ea48b779e2.cfg`, with the measurement written
-into the file so it is not re-added on the next comparison against the Android
-build. Madeira's own defaults are what a native x64 machine presents; the
-reference build's options belong to that port.
-
-Two things this does **not** mean: the hypervisor-leaf fix is not implicated (the
-11:04 session is the one that proves the gate works), and nothing here weakens
-what the protection checks. `FEX_HIDEHYPERVISORBIT=1` remains the behaviour FEX
-already used by default on this host.
+Nothing here weakens what the protection checks, and `FEX_HIDEHYPERVISORBIT=1` remains
+FEX's default behaviour on this host. What is now out of the sandbox is the claim that
+the hypervisor leaves were ever the reason for the decline: `ml1253` is still a
+reasonable change, but it has no measurement behind it.
 
 ### Correcting the size of the enciphered set
 
@@ -729,3 +738,58 @@ between widening the predicate (keep the stub, ml943's intent) and decoding the
 prologue in `arm64ec_redirect_ptr` (follow through to the real target) — the two
 differ in what the guest executes, and the second changes a hot path that the CEF
 work already found booby-trapped.
+
+## 2026-11-15 11:53 — the decryptor is never registered, and never writes
+
+With the pool fixed, the 11:17 and 11:37 runs both reach the game's own code and both
+die at the same `#UD`. Three measurements now describe that state precisely, and
+together they rule out "the protection ran and declined":
+
+1. `[veh-add]` — the registration log added for exactly this question — prints **one**
+   line in each session, and it is the anti-debug harness that `[veh-chain]` sees at
+   dispatch time:
+
+   ```
+   [veh-add] ml1252 #1 func=62F86DCE80000000 module=0000000000000000 ? order=first
+   ```
+
+   One registration, in a session that passes through the protection's allocation
+   probing. A decryptor that was registered and removed would leave a second line,
+   because the probe sits in `add_vectored_handler`, not in the chain. So the
+   protection never registers an in-process exception handler beyond the `Dr0`-`Dr7`
+   harness.
+
+2. `BYTES UNCHANGED` and no `[Add SMC interval]` anywhere in the exe's
+   `0x140000000+0xb3c0000` — the protection never writes a code page. So no decryption
+   pass ran and failed; none was ever attempted.
+
+3. The last thing before the fault is the protection probing for a staging area: 506
+   requests of `size=0x1001000` (16 MB + 4 KB), `type=0x3000`
+   (`MEM_COMMIT|MEM_RESERVE`), `protect=0x40` (`PAGE_EXECUTE_READWRITE`), at hints that
+   step by `0x10001000` starting at `0x14c3c3000` — the page just above Madeira's
+   192 MB executable window. 505 of 506 fail with `STAGE=fixed-map err=3`.
+
+   That first hint is where a native x64 process would succeed immediately. Here the
+   pool's own reserved runs sit exactly there (the doc's `0x148000000+598MB` and
+   `0x16ddc0000+290MB`), so the protection walks through ~8 GB of Madeira's
+   reservations before it finds anything, and gets two blocks to work with.
+
+The consistent reading is that the protection's own loader stage does not reach the
+point of installing its exception handler in this process, and the enciphered
+prologues are simply never decrypted. Nothing observed supports "it checked and said
+no": there is no registration to remove, no write to revert, and no verdict to read.
+
+### What the next build has to answer
+
+Both remaining questions are invisible in the current logs, so they need instrumentation
+rather than another inference:
+
+- **Was the staging area usable?** The 16 MB RWX blocks that *did* succeed are the ones
+  the decryptor would live in. Whether the protection then saw them as executable is a
+  `VirtualQuery`-visible property, and this port currently answers `rw-` for them (the
+  `[guest-rwx]` line says so). Reporting the protection the guest *asked for* while the
+  host mapping stays non-exec would close that difference without changing what executes.
+- **Do the registrations include a removal?** `[veh-add]` logs the encoded pointer, so
+  its `func=` value cannot be attributed to a module. Logging the decoded value and the
+  removal path turns "one registration" into "this function, from this module, added and
+  not removed".
