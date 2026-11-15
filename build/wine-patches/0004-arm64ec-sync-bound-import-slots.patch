@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Madeira <madeira@example.invalid>
-Date: Sun, 15 Nov 2026 01:04:00 -0600
+Date: Sun, 15 Nov 2026 01:05:00 -0600
 Subject: [PATCH] ntdll: sync bound import slots into the pool copy before the
  DllMain walk
 
@@ -41,7 +41,7 @@ index 5199cc9d..4261f155 100644
  extern NTSTATUS arm64ec_process_init( HMODULE module );
  extern NTSTATUS arm64ec_thread_init(void);
 diff --git a/dlls/ntdll/signal_arm64ec.c b/dlls/ntdll/signal_arm64ec.c
-index d5647738..55c7238f 100644
+index d5647738..6103b1c2 100644
 --- a/dlls/ntdll/signal_arm64ec.c
 +++ b/dlls/ntdll/signal_arm64ec.c
 @@ -984,8 +984,14 @@ IMAGE_ARM64EC_METADATA *arm64ec_get_module_metadata( HMODULE module )
@@ -134,7 +134,7 @@ index d5647738..55c7238f 100644
  #define SET_FUNC(func,val) update_hybrid_pointer( module, sec, metadata->func, val )
              SET_FUNC( __os_arm64x_dispatch_call, arm64x_check_call );
              SET_FUNC( __os_arm64x_dispatch_call_no_redirect, __os_arm64x_dispatch_call_no_redirect );
-@@ -1076,6 +1117,187 @@ void arm64ec_update_hybrid_metadata( void *module, IMAGE_NT_HEADERS *nt,
+@@ -1076,6 +1117,196 @@ void arm64ec_update_hybrid_metadata( void *module, IMAGE_NT_HEADERS *nt,
  }
  
  
@@ -244,7 +244,16 @@ index d5647738..55c7238f 100644
 +                void *proc;
 +
 +                mslots++;
-+                if (iat->u1.Function >= 0x10000)
++                /* Is the PE view bound? A bound slot holds a VA, and every VA
++                 * in this process is above 4 GB: PE images load near
++                 * 0x71fe..., the JIT pool near 0x153..., FEX's arena at
++                 * 0x7c00.... An UNBOUND slot still holds its hint/name RVA
++                 * from the file -- kernel32's GetCommandLineA slot reads
++                 * 0x63fc8 -- which is under 4 GB and is NOT a target. Testing
++                 * `>= 0x10000` here instead would have classified that RVA as
++                 * bound and copied it into the pool, recreating the exact
++                 * failure this function exists to prevent. */
++                if (iat->u1.Function >= 0x100000000ULL)
 +                {
 +                    /* Already bound in the PE view: this is the case that only
 +                     * needs carrying across to the pool. */
