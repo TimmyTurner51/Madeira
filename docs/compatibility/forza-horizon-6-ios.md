@@ -1158,3 +1158,42 @@ EXEC is the dual-map, not the guest dropping execute. Look for
 `[iOS-xrem] SUPPRESSED SMC keep` on `71F3372000-71F3374000`, build-id
 `rev=ml1269`, then either gadgets on ntdll `.data` or a decrypt VEH
 before the next `#UD`.
+
+## 2026-11-15 17:34 — SMC keep held; gadgets still never decoded
+
+ml1269 loaded (`rev=ml1269 compiled Nov 15 2026 17:26:45`). Restore `n=21`,
+unix-hits=0, libxess loaded. In order:
+
+```
+[exec-req] #2 addr=71F3372000 size=2000 new_prot=40 -> status=00000000
+Add SMC interval: 71F3372000 - 71F3374000
+skip post-notify restore
+[iOS-xrem] SUPPRESSED SMC keep 0x71f3372000-0x71f3374000 notify_prot=0x4
+(~28k 16MB alloc-fails)
+[guest-rwx] #1 0x70712e0000+0x1004000
+Add SMC interval: 70712E0000 - 70722E2000
+Invalid instruction in entry block: 14537099C  bytes=ea e9 6b e6…
+[veh-chain] EMPTY
+NtTerminateProcess exit_code=0xc000001d
+```
+
+SMC keep did what it advertised. No `[veh-add]`. No compile of
+`0x71F3372xxx`. Terminate GPRs still hold the 14:38 xor constant
+(`f58ad36680ab1cf9`) and the `EA` byte: the Windows-path handler body
+ran as SEH, the decrypt-map pointer was null, CONTINUE_SEARCH.
+
+iOS never grants W+X on a file-backed PE page (unix ml999). The guest
+`VirtualProtect(ntdll .data, PAGE_EXECUTE_READWRITE)` is therefore host
+RX; x64 stores Mach-emulate into the pool copy; FEX compiled the PE VA
+and decoded the still-RX file bytes. DroidDeck has one mapping — the
+stored bytes are the fetched bytes. ml1270 (FEX): when a PE VA is a
+guest RWX/SMC interval and has a pool alias, decode and SMC-validate
+from the pool copy. ntdll dumps PE vs pool 16 bytes and
+`NtQueryVirtualMemory` at ntdll-data-exec and empty-veh.
+
+Look for `rev=ml1270`, `[ios-smc-fetch]` of `71F3372…` with pool bytes
+that are not the PE file view, then either a decrypt VEH or no `#UD` at
+the still-encrypted `EA` prologue. `[iOS-prot] protect … prot=0x4` names
+who restated the page as PAGE_READWRITE after the honest RWX. Do not
+re-add GameConfigs `env.FEX_*`. Do not strip ntdll. Do not hide
+`wine_get_version`.
