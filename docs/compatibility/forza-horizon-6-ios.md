@@ -931,3 +931,28 @@ but without `NtProtect` of ntdll `.data` (that protect is what the skip was
 avoiding: iOS IAT-sync rewriting a live ntdll pointer). Look for
 `ntdll re-patch (no NtProtect)` and `ntdll hybrid dispatch_call rva=... pe=`
 non-NULL, then `[ec-syscall]`.
+
+## 2026-11-15 15:49 — CHPE fill worked; FEX then clobbers ntdll .data
+
+ml1258 loaded. Child ntdll logged `ntdll re-patch (no NtProtect)` and
+`dispatch_call rva=d0b90 pe=00000001630FB2C4` (non-NULL). Twelve raw
+syscalls ran, including `nr=50` (`NtProtectVirtualMemory`) at
+`0x14551012C` — the instruction that killed 14:59.
+
+Then the game `VirtualProtect`'d ntdll `.data` itself
+(`0x71F3372000+0x2000`, `PAGE_EXECUTE_READWRITE`). Wine forwarded that
+to FEX as "this page is now x64 code". FEX copied the PE view (on-disk
+zeros) over the pool copy ARM64 ntdll actually reads, wiping
+`pBeginSimulation` at rva `0xd2ea0`. The next `dispatch_emulation` did
+`ldr x11,[ntdll+0xd2ea0]; blr check_call` with `x11=0`.
+
+`0xd2ea0` is not the CHPE `dispatch_call` slot (`0xd0b90`); it is a
+compiler-generated load of `pBeginSimulation` inside inlined
+`dispatch_emulation`. The 14:59 probe named the same rva because that
+run never got far enough for the CHPE fill to matter, and crashed on
+the first syscall's return path through the already-zero slot.
+
+ml1259 still performs the guest `NtProtect` (Denuvo is allowed to change
+ntdll's protection) but does not tell FEX that a PE **data** section is
+now executable. Look for `[exec-data] SUPPRESSED` on that ntdll `.data`
+protect, then more `[ec-syscall]` after it.

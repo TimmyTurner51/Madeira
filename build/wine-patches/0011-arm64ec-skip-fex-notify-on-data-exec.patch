@@ -1,0 +1,102 @@
+diff --git a/dlls/ntdll/signal_arm64ec.c b/dlls/ntdll/signal_arm64ec.c
+index b8f1c0e1..c3e9a011 100644
+--- a/dlls/ntdll/signal_arm64ec.c
++++ b/dlls/ntdll/signal_arm64ec.c
+@@ -2691,6 +2691,58 @@ static BOOL ios_bulk_protect_suppressed( const char *via, void *addr, SIZE_T siz
+     return TRUE;
+ }
+ 
++/* FH6 15:49: after 12 raw syscalls the game VirtualProtect'd ntdll .data
++ * (0x71F3372000+0x2000, PAGE_EXECUTE_READWRITE). FEX treated that as "this
++ * is now x64 code", copied the PE view of the page (on-disk zeros) over the
++ * pool copy ARM64 ntdll actually reads, and wiped pBeginSimulation at
++ * rva 0xd2ea0. The next dispatch_emulation did ldr x11,[ntdll+0xd2ea0];
++ * blr check_call with x11=0. The protect itself is honest (Denuvo is
++ * allowed to change ntdll's protection); the FEX notify is not, because
++ * this is data with live function pointers, not a code page. */
++static BOOL ios_data_exec_suppressed( const char *via, void *addr, SIZE_T size, ULONG prot )
++{
++    static int said;
++    LDR_DATA_TABLE_ENTRY *mod;
++    IMAGE_NT_HEADERS *nt;
++    const IMAGE_SECTION_HEADER *sec;
++    DWORD i;
++    ULONG_PTR rva;
++    const ULONG exec_mask = PAGE_EXECUTE | PAGE_EXECUTE_READ |
++                            PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
++
++    if (!(prot & exec_mask)) return FALSE;
++    if (LdrFindEntryForAddress( addr, &mod ) || !mod || !mod->DllBase) return FALSE;
++    nt = RtlImageNtHeader( mod->DllBase );
++    if (!nt) return FALSE;
++    rva = (ULONG_PTR)addr - (ULONG_PTR)mod->DllBase;
++    sec = IMAGE_FIRST_SECTION( nt );
++    for (i = 0; i < nt->FileHeader.NumberOfSections; i++, sec++)
++    {
++        ULONG_PTR start = sec->VirtualAddress;
++        ULONG_PTR end = start + sec->Misc.VirtualSize;
++        if (rva < start || rva >= end) continue;
++        if (sec->Characteristics & (IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE))
++            return FALSE;
++        if (said < 16)
++        {
++            said++;
++            ERR( "[exec-data] SUPPRESSED via=%s %p+%p prot=%lx module=%s rva=%lx "
++                 "chars=%lx (PE data, not code; FEX copy would clobber live ARM64 .data)\n",
++                 via, addr, (void *)size, (unsigned long)prot,
++                 debugstr_w( mod->BaseDllName.Buffer ), (unsigned long)rva,
++                 (unsigned long)sec->Characteristics );
++        }
++        return TRUE;
++    }
++    return FALSE;
++}
++
++static BOOL ios_protect_notify_suppressed( const char *via, void *addr, SIZE_T size, ULONG prot )
++{
++    return ios_bulk_protect_suppressed( via, addr, size, prot )
++        || ios_data_exec_suppressed( via, addr, size, prot );
++}
++
+ NTSTATUS SYSCALL_API NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *size_ptr,
+                                              ULONG new_prot, ULONG *old_prot )
+ {
+@@ -2720,7 +2772,7 @@ NTSTATUS SYSCALL_API NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SI
+          * A protect spanning >= 1GB is never a code-permission change; it is an allocator
+          * managing a reservation. Modules inside it keep their own real mappings and their
+          * own protections, so suppressing the notification cannot lose a genuine
+          * executability transition — whereas forwarding it loses ALL of them. */
+-        if (!ios_bulk_protect_suppressed( "cur-pre", *addr_ptr, *size_ptr, new_prot ))
++        if (!ios_protect_notify_suppressed( "cur-pre", *addr_ptr, *size_ptr, new_prot ))
+             pNotifyMemoryProtect( *addr_ptr, *size_ptr, new_prot, FALSE, 0 );
+     }
+ 
+@@ -2779,7 +2831,7 @@ NTSTATUS SYSCALL_API NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SI
+             if (!is_current) send_cross_process_notification( process, CrossProcessPostVirtualProtect,
+                                                              *addr_ptr, *size_ptr, 2, new_prot, st );
+             else if (pNotifyMemoryProtect
+-                     && !ios_bulk_protect_suppressed( "cur-post", *addr_ptr, *size_ptr, new_prot ))
++                     && !ios_protect_notify_suppressed( "cur-post", *addr_ptr, *size_ptr, new_prot ))
+                 pNotifyMemoryProtect( *addr_ptr, *size_ptr, new_prot, TRUE, st );
+             /* ml1259: this early return skipped the leave, so the thread kept
+              * InSyscallCallback set and its next notifications to FEX (protect,
+@@ -2794,7 +2846,7 @@ NTSTATUS SYSCALL_API NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SI
+     if (!is_current) send_cross_process_notification( process, CrossProcessPostVirtualProtect,
+                                                       *addr_ptr, *size_ptr, 2, new_prot, status );
+     else if (pNotifyMemoryProtect
+-             && !ios_bulk_protect_suppressed( "cur-post", *addr_ptr, *size_ptr, new_prot ))
++             && !ios_protect_notify_suppressed( "cur-post", *addr_ptr, *size_ptr, new_prot ))
+         pNotifyMemoryProtect( *addr_ptr, *size_ptr, new_prot, TRUE, status );
+ 
+     leave_syscall_callback();
+@@ -3020,8 +3072,8 @@ static void process_cross_process_work(void)
+              * for a sibling handle and the protect is queued here rather than taking the
+              * is_current branch ml203 guarded — which is why that fix logged nothing while
+              * the wipe still happened. Guard it identically. */
+-            if (ios_bulk_protect_suppressed( "xproc", (void *)entry->addr, entry->size,
+-                                             entry->args[0] )) break;
++            if (ios_protect_notify_suppressed( "xproc", (void *)entry->addr, entry->size,
++                                               entry->args[0] )) break;
+             pNotifyMemoryProtect( (void *)entry->addr, entry->size, entry->args[0],
+                                   entry->id == CrossProcessPostVirtualProtect, entry->args[1] );
+             break;
