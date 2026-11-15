@@ -1,5 +1,5 @@
 diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
-index 73ee54eda..f217dd732 100644
+index 73ee54eda..d04288821 100644
 --- a/FEXCore/Source/Interface/Core/Core.cpp
 +++ b/FEXCore/Source/Interface/Core/Core.cpp
 @@ -1353,14 +1353,14 @@ extern "C" uint64_t IosCbEntryLog[8];
@@ -7,7 +7,7 @@ index 73ee54eda..f217dd732 100644
  /* iOS-Madeira ml316: ExitToX64's FFS-bypass counters, defined in Module.cpp and written by
   * the bypass asm in Module.S. Reported below the same way as [cb-entry]. */
 -extern "C" uint64_t IosFfsBypassLog[12];
-+extern "C" uint64_t IosFfsBypassLog[16];
++extern "C" uint64_t IosFfsBypassLog[20];
  #else
  /* The WOW64 module (libwow64fex.dll) is a plain aarch64 PE with no Module.S, no EC entry thunks
   * and no FFS bypass, so the last two symbols above do not exist in its link. Zeroed storage and an
@@ -15,7 +15,7 @@ index 73ee54eda..f217dd732 100644
   * the module has no PE-image-to-pool alias table (its guest images are mapped normally). */
  extern "C" uint64_t IosCbEntryLog[8];
 -static uint64_t IosFfsBypassLog[12] {};
-+static uint64_t IosFfsBypassLog[16] {};
++static uint64_t IosFfsBypassLog[20] {};
  static inline uint64_t IosJitReverseTranslate(uint64_t Addr) {
    return Addr;
  }
@@ -41,7 +41,7 @@ index 73ee54eda..f217dd732 100644
      static uint64_t CBLastCount = 0;
      static uint32_t CBReports = 0;
 diff --git a/Source/Windows/ARM64EC/Module.S b/Source/Windows/ARM64EC/Module.S
-index fcb72a925..2600244ac 100644
+index fcb72a925..e7e067fa0 100644
 --- a/Source/Windows/ARM64EC/Module.S
 +++ b/Source/Windows/ARM64EC/Module.S
 @@ -77,6 +77,37 @@
@@ -82,7 +82,7 @@ index fcb72a925..2600244ac 100644
  // Read by RetToEntryThunk below; ARM64EC/Module.cpp sets it at process init.
  .data
  .balign 8
-@@ -198,7 +229,87 @@ ios_thunk_bare:
+@@ -198,7 +229,100 @@ ios_thunk_bare:
    add x17, x9, x16
    add x17, x17, #6
  ios_thunk_slot:
@@ -119,6 +119,13 @@ index fcb72a925..2600244ac 100644
 +  add x17, x16, x10
 +  add x17, x17, #6
 +87:
++  // ml1213: record what the PE copy's own displacement produced, so a log can
++  // separate "the displacement is wrong too" from "the displacement is right
++  // and the slot it names is unbound".
++  adrp x11, IosFfsBypassLog
++  add x11, x11, #:lo12:IosFfsBypassLog
++  str x10, [x11, #128]             // [16] = the displacement used (signed rel32)
++  str x17, [x11, #136]             // [17] = the slot address it derived
 +  // x17 is now the slot's address in PE space. Read the VALUE from the PE view:
 +  // loader.c binds an import by storing through a PE VA, and the log proves the
 +  // PE view carries the resolved pointer (the ucrtbase dispatcher slot reads
@@ -159,6 +166,12 @@ index fcb72a925..2600244ac 100644
 +  ldr x12, [x11, #96]
 +  add x12, x12, #1
 +  str x12, [x11, #96]              // [12] = slot values taken from the PE view
++  // ml1213: keep the last PE slot address and the value found there. Counters
++  // alone cannot distinguish "the PE view is unbound too" from "the PE view is
++  // bound but the answer is the wrong function"; these two numbers can, and
++  // they cost nothing to record on a path that already loads both.
++  str x16, [x11, #112]             // [14] = last PE-view slot address
++  str x17, [x11, #120]             // [15] = value read from it
 +  add sp, sp, #16                  // taken: drop the fallback
 +  b 84f
 +89:
@@ -170,7 +183,7 @@ index fcb72a925..2600244ac 100644
    // ml1136: the slot rarely holds the native body. loader.c's
    // arm64ec_iat_is_exported_x64 keeps the x64-VISIBLE 14-byte fast-forward stub
    // of a hybrid export (in the importer's .hexpthk) so x64 callers and hook
-@@ -239,6 +350,30 @@ ios_thunk_slot:
+@@ -239,6 +363,30 @@ ios_thunk_slot:
    // Frame: [sp+0]=slot value, [sp+8]=x4 (x64 R10), [sp+16]=x23, [sp+24]=hop budget.
    stp x17, x4, [sp, #-32]!         // keep sp 16-aligned; save slot value + R10
    stp x23, xzr, [sp, #16]
@@ -202,7 +215,7 @@ index fcb72a925..2600244ac 100644
    // single 14-byte FFS whose jmp target is the native EC body -- but kernel32 ->
    // kernelbase forwarders can put a second hybrid export in the way, so follow up to
 diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
-index a5840d4d6..4082db515 100644
+index a5840d4d6..1932e6972 100644
 --- a/Source/Windows/ARM64EC/Module.cpp
 +++ b/Source/Windows/ARM64EC/Module.cpp
 @@ -96,7 +96,7 @@ static uint64_t IosEcCodeBitMapValue = 0;
@@ -210,7 +223,7 @@ index a5840d4d6..4082db515 100644
   *       not ship with a FEX component.
   * Read by the [ffs-bypass] reporter in Core.cpp's CompileBlock. */
 -extern "C" uint64_t IosFfsBypassLog[12];
-+extern "C" uint64_t IosFfsBypassLog[16];
++extern "C" uint64_t IosFfsBypassLog[20];
  /* Defined in FEXCore Arm64Emitter.cpp; read when the dispatcher and blocks are emitted. */
  extern "C" uint32_t IosEcReturnWithRet;
  
@@ -223,11 +236,11 @@ index a5840d4d6..4082db515 100644
 + * view, [13] counts times the sub-0x100000 "this is an rva, not an address"
 + * guard turned a value away -- between them they say whether ExitToX64's new
 + * PE-side read ran and whether the value it found looked bound. */
-+uint64_t IosFfsBypassLog[16] {};
++uint64_t IosFfsBypassLog[20] {};
  /* ml1131: transition probe, written by Module.S and read by wine's ntdll-unix
   * sampler through this DATA export (libarm64ecfex_ios.def). Layout in bytes:
   *   0     magic 'MADXPFEX' (set in ProcessInit)
-@@ -1335,6 +1339,54 @@ NTSTATUS ProcessInit() {
+@@ -1335,6 +1339,55 @@ NTSTATUS ProcessInit() {
  void ProcessTerm(HANDLE Handle, BOOL After, NTSTATUS Status) {
    if (!After) {
      ProcessTerminating.store(true, std::memory_order_relaxed);
@@ -257,23 +270,24 @@ index a5840d4d6..4082db515 100644
 +        }
 +      }
 +      if (h) {
-+        static const char kLabels[16][9] = {
++        static const char kLabels[20][9] = {
 +          "bypass", "bypLast", "reject", "rejLast", "ecEnt", "ecEntLst",
 +          "slot",   "slotLast", "follow", "folLast", "slotCopy", "peread",
-+          "pereadOK", "rvaGuard", "x14", "x15",
++          "pereadOK", "rvaGuard", "peSlot", "peValue", "peRel32", "peDerive",
++          "x18", "x19",
 +        };
-+        char buf[64 + 16 * 22];
++        char buf[80 + 20 * 24];
 +        int n = 0;
 +        const char* tag = "[ffs-log] ";
 +        while (*tag) buf[n++] = *tag++;
 +        const char hexd[] = "0123456789abcdef";
-+        for (int i = 0; i < 16; ++i) {
++        for (int i = 0; i < 20; ++i) {
 +          for (const char* p = kLabels[i]; *p; ++p) buf[n++] = *p;
 +          buf[n++] = '=';
 +          buf[n++] = '0';
 +          buf[n++] = 'x';
 +          for (int j = 60; j >= 0; j -= 4) buf[n++] = hexd[(IosFfsBypassLog[i] >> j) & 0xf];
-+          buf[n++] = (i == 15) ? '\n' : ' ';
++          buf[n++] = (i == 19) ? '\n' : ' ';
 +        }
 +        ULONG written = 0;
 +        WriteFile(h, buf, n, &written, nullptr);
