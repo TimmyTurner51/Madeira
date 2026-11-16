@@ -1236,3 +1236,32 @@ bytes at `+0` / `+ea0` that are not 16×00, then `[ios-smc-fetch]` of
 `71F3372…` or a decrypt VEH before the next `#UD`. Do not re-add
 GameConfigs `env.FEX_*`. Do not strip ntdll. Do not hide
 `wine_get_version`.
+
+## 2026-11-15 17:59 — ml1271 ntdll loaded; libxess EXHAUSTED before Denuvo
+
+ml1271 ntdll was on the session bundle (`query-win32` strings present).
+FEX still `rev=ml1270`. Child died in `loader_init` importing
+`forzahorizon6.exe`, `exit_code=0xc0000135`, before any ntdll `.data`
+protect. Cause:
+
+```
+[game-cfg] … pool-low-margin=32 pool-mid=1 pool-page-fit=1
+[pool-low] region C 0x1399b0000+102MB (runs 120MB + 102MB)
+[jit-pool] tail EC_CODE … tail_resv=0x8000000
+[jit-pool] tail EC_CODE … tail_resv=0x10000000
+[jit-pool] EXHAUSTED … want=0x4a40000 bump=0x1bcc8000/0x34000000 tail_resv=0x10000000
+Loading library libxess.dll … failed (error c0000017)
+```
+
+Pair A=502 MB + B=321 MB (824 MB), 7 MB stack hole. C 102 MB cannot hold a
+128 MB FEX carve, so both 128 MB buffers took the pool tail. Remaining
+contiguous: 58 MB in A to the hole, 65 MB in B after the tail. libxess
+wants 74 MB. 17:10 had C 334 MB and tail_resv=0.
+
+GameConfigs (not `env.FEX_*`): `MADEIRA_POOL_BIG_SLOT_MB=80` and
+`MADEIRA_POOL_BIG_SLOT_BELOW=1` reserve 80 MB immediately below the hole
+for one ≥64 MB image. An upper slot is unsafe (widens the hole so the
+second tail carve walks into the bump). Look for `[pool-big] … below the
+hole`, libxess `used=` without EXHAUSTED, then ml1271 `query-win32` /
+empty-veh bytes / `[ios-smc-fetch]`. Do not re-add `env.FEX_*`. Do not
+strip ntdll. Do not hide `wine_get_version`.
