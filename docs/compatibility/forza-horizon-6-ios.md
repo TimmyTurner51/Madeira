@@ -1314,3 +1314,37 @@ restore`, census `split=` or extra `pe_nz` beyond the FEX hooks, then
 `[ios-smc-store]` of `71F3372…` or a decrypt VEH before the next `#UD`.
 Do not re-add `env.FEX_*`. Do not strip ntdll. Do not hide
 `wine_get_version`. Do not use an upper big-slot.
+
+## 2026-11-15 18:52 — ml1272; decrypt pointer stored at pWow64PrepareForException
+
+ml1272 loaded (`rev=ml1272 compiled Nov 15 2026 18:14:28`). libxess in the
+80 MB slot. unix-hits=0. Query wrap 80→40. SMC keep held. In order:
+
+```
+[exec-req] #2 addr=71F3372000 size=2000 new_prot=40
+Add SMC 71F3372000-71F3374000
+keep-exec skip restore new_prot=4
+census keep-exec pe_nz=24 (was 23) first_pe=510
+(~28k 16MB alloc-fails)
+[guest-rwx] #1 0x70692d0000+0x100c000
+Add SMC 70692D0000-706A2DA000
+Invalid instruction 14537099C  bytes=ea e9 6b e6…
+[veh-chain] EMPTY
+unixProtect still 80 Region=2000
+NtTerminateProcess exit_code=0xc000001d
+```
+
+Zero `[ios-smc-store]`: the 8-byte store did not fault. Census first_pe moved
+from `e68` (hooks) to `510` — rva `0xd2510` is ntdll
+`pWow64PrepareForException`. Denuvo writes its decrypt gadget there, which
+Windows `KiUserExceptionDispatcher` calls. ARM64EC prepare_exception reads
+the pool copy of that pointer (still NULL), so it skipped the x64 thunk and
+ran ARM64 `dispatch_exception` with an empty VEH.
+
+ml1273 (PE ntdll): copy the PE slot into `pWow64PrepareForException` after
+the store so the existing x64-thunk path runs the guest hook; dump `+510`
+and first-pe bytes; log `[ki-path]` for `#UD`. Look for
+`pWow64PrepareForException=00000001454f21b9` (or similar EXE address),
+`[ki-path] … x64-THUNK`, then either a decrypt VEH or no `#UD` at the
+still-encrypted `EA` prologue. Do not re-add `env.FEX_*`. Do not strip
+ntdll. Do not hide `wine_get_version`.
