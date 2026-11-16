@@ -1265,3 +1265,52 @@ second tail carve walks into the bump). Look for `[pool-big] … below the
 hole`, libxess `used=` without EXHAUSTED, then ml1271 `query-win32` /
 empty-veh bytes / `[ios-smc-fetch]`. Do not re-add `env.FEX_*`. Do not
 strip ntdll. Do not hide `wine_get_version`.
+
+## 2026-11-15 18:05 — libxess loaded; Query 0x40; gadgets still never stored
+
+Big-slot cfg applied (`[pool-big] slot [0x1a8e4000,0x1f8e4000) (80 MB) below
+the hole`). `libxess.dll` placed in the slot and loaded. FEX still
+`rev=ml1270`. ml1271 wrap live. Restore `n=21`, unix-hits=0, SMC keep held.
+In order:
+
+```
+[exec-req] #2 addr=71F3372000 size=2000 new_prot=40 -> status=00000000
+query via=ntdll-data-exec unixProtect=80 guestProtect=40  (80->40)
+bytes +0 16×00 PE and pool; +eb0 live FEX hooks both views
+Add SMC 71F3372000-71F3374000
+[iOS-xrem] SUPPRESSED SMC keep … notify_prot=0x4
+(~28k 16MB alloc-fails)
+[jit-pool] anon RWX 0x706f2d0000 size=0x1010000
+Add SMC 706F2D0000-70702E0000
+(emulated stores into staging, 395k hits at 0x706f2d0000)
+Invalid instruction … 14537099C  bytes=ea e9 6b e6…
+[veh-chain] EMPTY
+query via=empty-veh unixProtect=8 Region=1e000  (8->40)
+bytes +0 still 16×00 PE and pool; +eb0 hooks intact
+NtTerminateProcess exit_code=0xc000001d
+```
+
+Lower 80 MB slot did what it advertised. Query wrap reported 0x40 at
+ntdll-data-exec; Denuvo never Query'd through the wrap (only two
+`query-win32` lines, both from our dump). Empty-veh dump ran (sticky
+survived). Zero `[ios-smc-fetch]`: RIP never entered `0x71F3372xxx`.
+No `[guest-rwx]` this launch; staging still mapped.
+
+The Windows-path block at `0x1453caf8e` is: find `48 8B` at a scanned
+ntdll pointer, `VirtualProtect(page, 0x2000, 0x40)` (BOOL via `setns` on
+NTSTATUS, so our success is theirs), then `mov qword ptr [rax], gadget`.
+That 8-byte store is the decrypt-map pointer, not executable thunks at
+`+0`. Four dump offsets of zeros did not prove the qword was never
+written — and unix IAT-sync on the WRITECOPY restore (skip is EXEC-only)
+would copy PE zeros over the pool copy of it. Mach STR emulation uses
+`ios_jit_anon_alias_lookup`, not the PE→pool image table, so a store
+into file-backed RX ntdll `.data` has no RW alias.
+
+ml1272: ntdll skips that 8KB WRITECOPY restore (keep guest EXEC; census
+the 8KB for PE/pool/split qwords); Query remaps only `0x80` not `0x08`.
+FEX `rev=ml1272` completes SMC stores to the pool RW alias and
+`NtWrite`s the PE view (`[ios-smc-store]`). Look for `keep-exec skip
+restore`, census `split=` or extra `pe_nz` beyond the FEX hooks, then
+`[ios-smc-store]` of `71F3372…` or a decrypt VEH before the next `#UD`.
+Do not re-add `env.FEX_*`. Do not strip ntdll. Do not hide
+`wine_get_version`. Do not use an upper big-slot.
