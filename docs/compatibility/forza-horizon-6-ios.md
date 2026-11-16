@@ -1348,3 +1348,33 @@ and first-pe bytes; log `[ki-path]` for `#UD`. Look for
 `[ki-path] … x64-THUNK`, then either a decrypt VEH or no `#UD` at the
 still-encrypted `EA` prologue. Do not re-add `env.FEX_*`. Do not strip
 ntdll. Do not hide `wine_get_version`.
+
+## 2026-11-15 19:34 — ml1273; hook pointer live, x64 ntdll stub never ran it
+
+ml1273 ntdll loaded. unix-hits=0. libxess in the slot. keep-exec copied PE
+`+0x510` into the live pointer:
+
+```
+pWow64PrepareForException=00000001454F21B9 from pe+510
+keep-exec +510 pe=b9 21 4f 45 01 00 00 00  (and pool too)
+[guest-rwx] #1 0x70702e0000+0x1004000
+Invalid instruction 14537099C  bytes=ea e9 6b e6…
+[ki-path] … x64-THUNK (guest hook runs) (patched=0 wow64=00000001454F21B9)
+[veh-chain] EMPTY
+BYTES UNCHANGED (eae96be61448897c)
+exit_code=0xc000001d
+```
+
+Zero FEX compiles of `1454F21B9`. Wine ARM64EC `KiUserExceptionDispatcher`
+returns `EXP+#KiUserExceptionDispatcher` (an x64 stub that `call`s that
+pointer) to `ExitToX64`. ntdll is hybrid, so ExitToX64's EC bitmap treats
+the stub as ARM64EC and does not enter the JIT; the stub never `call`s the
+gadget. Empty VEH is expected on the Windows path — decrypt is the KiUser
+hook, not a vectored handler.
+
+ml1274 (PE ntdll): call `0x1454F21B9` through `ExitToX64` with RCX=rec
+RDX=x64 context (Windows KiUserExceptionDispatcher), then ARM64
+`dispatch_exception`. Look for `[ki-path] calling pWow64PrepareForException=`
+and `returned` with Rip bytes no longer `ea e9 6b e6`, or a further fault
+inside the gadget. Do not re-add `env.FEX_*`. Do not strip ntdll. Do not
+hide `wine_get_version`.
