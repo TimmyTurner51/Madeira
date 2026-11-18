@@ -1480,3 +1480,65 @@ registered there. Nothing in the fault path can decrypt without that registratio
 and the only writer of the table in this image is the protection's own loader — so
 the question ml1278 answers is whether the table has entries at all, and whether
 `0x14537099C` is among them.
+
+### ml1278 answers it: both maps are empty, and that is a timing result
+
+The 20:34 run (ml1278, unstripped ntdll, `sha256 a0710234…`) walked the tree at the
+right depth for the first time:
+
+```
+[dec-map] code=c000001d rip=000000014537099C ctx.Rip=000000014537099C
+[dec-map] wine-flag ptr=000000706DAD0B40 value=00
+[dec-map] obj:  obj=000000706DAD8040 cont=000000706DADC690 head=000000706DADC690 isnil=01
+[dec-map] obj:  RIP not registered (all keys below it)
+[dec-map] root: obj=000000706DAD80A0 cont=000000706DAD0CA0 head=000000706DAD0CA0 isnil=01
+[dec-map] root: RIP not registered (all keys below it)
+[ki-path] hook returned x0=000000706C75FD50 (0 = declined)
+```
+
+`isnil=01` on both headers means neither map has a single node: the initialiser ran
+(it allocated the objects and the `wine_flag` cell) but nothing has been *inserted*
+yet. So `pWow64PrepareForException` behaved exactly as written — the harness is not
+broken, it is unpopulated — and the fault is not "the hook refused", it is "the
+protection had not finished unpacking when the game called a function whose prologue
+is still `EA`".
+
+The frame handler that ran next is `forzahorizon6.exe+0x5eaa3b8`, a table of
+`jmp [rip+…]` thunks; it declined, VEH was empty (`[veh-chain] ml1251 EMPTY`), and the
+process died `0xc000001d`. The ordering is the bug.
+
+### The ordering is the store emulator: 179561 stores at 8.4 µs each
+
+Same run, before the fault:
+
+```
+[fault-class]   pc=0x16390eb68 blockRIP=0x71f332b067 hits=195878 page=0x706f2d0000
+                stride=32 restarts=0 pages>=64
+[jit-pool] anon RWX 0x706f2d0000 size=0x1010000 → used=0x1dd34000/0x34000000
+                NEW off=0x1cd24000 tid=00e8 peb=0x101038000 rev=ml625
+[fault-cost] ml685 emulated-store faults=179561 total=1501 ms avg=8363 ns
+```
+
+The protection asked for 16 MB + 64 KB of `PAGE_EXECUTE_READWRITE` and filled it
+32 bytes at a time from the guest's own ntdll `memcpy` (`pc=0x16390eb68`). That size
+is a multiple of 64 KB, so `ios_guest_anon_rwx_view_ok()` classified the block as a
+Mono-style *code chunk*, `mprotect_exec()` backed it with a JIT pool slot, and every
+store became a Mach fault into the emulator: ~2 ms per KB, ~4.3 s for the fill.
+
+On Windows the same fill is a plain `memcpy`. The protection unpacks on one thread
+while the game's CRT initialisers run on another, and the main thread reached a
+still-encrypted function ~4 s ahead of the unpacker. The 1501 ms is the whole gap.
+
+### ml1283: an 8 MB+ anonymous RWX allocation is data, whatever its low bits say
+
+`IOS_GUEST_RWX_DATA_MIN` (8 MB) is the discriminator the 64 KB-modulo test was
+standing in for. Mono's code chunks are 1 MB and V8's are 256 KB — no runtime
+allocates code in one RWX block this large, while a protector's unpack staging is.
+A page FEX has compiled from is still armed (`GetTrapProt -> PAGE_EXECUTE_READ`) and
+still traps the first write, so SMC invalidation is unchanged; what is skipped is
+per-store emulation of a page FEX has never translated.
+
+`[guest-rwx] ml1283 %p+0x%lx DECLINED plain RW: <gate>` now says outright why a
+large request still landed on the pool (`MADEIRA_GUEST_RWX_DATA off`, `EC_CODE
+request`, `no arm64ec_view`, `already alias-backed`, or the view's `protect`/
+`valloc`/size), so a repeat cannot be silently attributed to this policy.

@@ -18576,6 +18576,33 @@ static int ios_guest_rwx_data_enabled(void)
     return cached;
 }
 
+/* ml1283: from this size up an anonymous RWX allocation is a data buffer, whatever
+ * its low 16 bits say.
+ *
+ * THE SYMPTOM (FH6, 20:40 run). Forza's protector asked for 16 MB+64 KB of
+ * PAGE_EXECUTE_READWRITE and filled it with 32-byte stores (a `memcpy` in the
+ * guest's own ntdll, `pc=0x16390eb68 blockRIP=0x71f332b067`). Because the size is
+ * a multiple of 64 KB, ios_guest_anon_rwx_view_ok() filed it as a JIT code chunk,
+ * so mprotect_exec() backed it with a pool slot and routed every store through the
+ * store emulator: `[fault-cost] emulated-store faults=179561 total=1501 ms
+ * avg=8363 ns`. A 16 MB fill costs ~4.3 s that way instead of ~2 ms.
+ *
+ * That is not a performance footnote here: the protection unpacks into that block
+ * from one thread while the game's CRT initialisers run on another, and the main
+ * thread reached a function whose first bytes are the protector's `EA` encrypted
+ * prologue (0x14537099c) while the block was still 12 MB full. The `#UD` went to
+ * KiUserDispatcher, the protector's own pWow64PrepareForException hook ran and
+ * declined (its redirect map was still empty -- nothing had been registered yet),
+ * no VEH and no frame handler claimed it, and the process died 0xc000001d.
+ *
+ * Size is the honest discriminator the 64 KB test was standing in for: Mono's code
+ * chunks are 1 MB, V8's 256 KB, and no runtime allocates code in a single RWX block
+ * this large, while a protector's unpack staging or a runtime's data heap is. A page
+ * FEX has compiled from is still armed (GetTrapProt -> PAGE_EXECUTE_READ) and still
+ * traps the first write, so SMC invalidation is unchanged; what is skipped is the
+ * per-store emulation of a page FEX has never translated. */
+#define IOS_GUEST_RWX_DATA_MIN 0x800000u
+
 static int ios_guest_anon_rwx_view_ok( const struct file_view *view )
 {
     if (!is_view_valloc( view )) return 0;
@@ -18583,6 +18610,7 @@ static int ios_guest_anon_rwx_view_ok( const struct file_view *view )
     /* allocated RWX, not made executable after the fact: see above */
     if ((view->protect & (VPROT_WRITE | VPROT_EXEC)) != (VPROT_WRITE | VPROT_EXEC)) return 0;
     if (view->size < 0x10000) return 0;
+    if (view->size >= IOS_GUEST_RWX_DATA_MIN) return 1;   /* ml1283: data by size */
     return (view->size & 0xffff) != 0;   /* data, not a code chunk: see above */
 }
 
@@ -18697,15 +18725,42 @@ static int ios_guest_anon_rwx_is_host_data( const void *base, size_t size )
         any = 0;
     }
 
-    if (!ios_guest_rwx_data_enabled() || ios_alloc_ec_code || !arm64ec_view) return 0;
+    if (!ios_guest_rwx_data_enabled() || ios_alloc_ec_code || !arm64ec_view)
+    {
+        /* ml1283: a large request rejected HERE would be filled through the pool, one
+         * emulated store fault per 32 bytes -- say which gate closed, once. */
+        static int why_n;
+        if (size >= IOS_GUEST_RWX_DATA_MIN && why_n++ < 8)
+            dprintf( 2, "[guest-rwx] ml1283 %p+0x%lx DECLINED plain RW: %s%s%s\n", base, (unsigned long)size,
+                     !ios_guest_rwx_data_enabled() ? "MADEIRA_GUEST_RWX_DATA off " : "",
+                     ios_alloc_ec_code ? "EC_CODE request " : "", !arm64ec_view ? "no arm64ec_view" : "" );
+        return 0;
+    }
     if (e <= b) return 0;
     if (rx && e > rx && b < rx + ios_jit_pool_size_global) return 0;
-    if (ios_jit_anon_alias_find_cover( (void *)base, size, &cov_rw, &cov_rx )) return 0;
+    if (ios_jit_anon_alias_find_cover( (void *)base, size, &cov_rw, &cov_rx ))
+    {
+        static int cov_n;
+        if (size >= IOS_GUEST_RWX_DATA_MIN && cov_n++ < 8)
+            dprintf( 2, "[guest-rwx] ml1283 %p+0x%lx DECLINED plain RW: already alias-backed\n",
+                     base, (unsigned long)size );
+        return 0;
+    }
     for (a = b; a < e; )
     {
         struct file_view *view = find_view( (const void *)a, 1 );
         if (!view) { a = (a + 0x1000) & ~(uintptr_t)0xfff; continue; }   /* rounding gap */
-        if (!ios_guest_anon_rwx_view_ok( view )) return 0;
+        if (!ios_guest_anon_rwx_view_ok( view ))
+        {
+            static int view_n;
+            if (size >= IOS_GUEST_RWX_DATA_MIN && view_n++ < 8)
+                dprintf( 2, "[guest-rwx] ml1283 %p+0x%lx DECLINED plain RW: view %p+0x%lx protect=%08x "
+                            "valloc=%d (size test: %s)\n",
+                         base, (unsigned long)size, view->base, (unsigned long)view->size,
+                         (unsigned)view->protect, is_view_valloc( view ),
+                         view->size >= IOS_GUEST_RWX_DATA_MIN ? "large" : "not large" );
+            return 0;
+        }
         any = 1;
         a = (uintptr_t)view->base + view->size;
     }
