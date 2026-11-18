@@ -1542,3 +1542,74 @@ per-store emulation of a page FEX has never translated.
 large request still landed on the pool (`MADEIRA_GUEST_RWX_DATA off`, `EC_CODE
 request`, `no arm64ec_view`, `already alias-backed`, or the view's `protect`/
 `valloc`/size), so a repeat cannot be silently attributed to this policy.
+### ml1286/ml1287: the `#UD` hook declines on the opcode, and the FEX fix never loaded
+
+The 21:02 run settled what the `0xC000001D` at `0x14537099C` actually is, and it
+was not what the previous three probes assumed.
+
+**The hook was never declining.** `[ki-path] hook returned x0=<rec>` was read as
+"0 = declined", but the game's thunk at `0x1454F21B9` pushes `rax` at `0x1454F21C3`
+and pops it at `0x1454F222F` before `ret`, so the caller's `rax` is restored on
+every path. `x0 == rec` is what a *successful* run leaves, not a refusal.
+
+**The hook's real contract.** `r14` is a `{rec, ctx}` pair, not the record: the
+thunk calls the body with `rcx = ~(rsp+8)` and the body's `not r14` (taken only
+when `[[0x14ab88560]] == 0`) undoes it, so `[r14] = rec` and `[r14+8] = ctx`.
+The body hashes `(ExceptionCode ^ 0xf58ad36680ab1cf9) * 2` and branches on the
+result:
+
+| constant | exception code | arm |
+|---|---|---|
+| `0xeb15a6cc015639f4` | `0x80000003` | breakpoint / single-step shim |
+| `0xeb15a6cc015639fa` | `0x80000004` | single-step shim |
+| `0xeb15a6cc815639c8` | `0xc000001d` | the encrypted-prologue arm |
+
+The `0xC000001D` arm is at `0x1453d9df3` and does this:
+
+```
+1453d9e0a: mov rax, [rcx+0xf8]          ; ctx->Rip
+1453d9e1a: mov edx, 0xb0f
+1453d9e1f: cmp word ptr [rax], dx       ; REQUIRES 0F 0B = UD2
+1453d9e22: jne 0x1453d9eab              ; else decline
+1453d9e28: add rax, 2                   ; resume at Rip + 2
+```
+
+Our site holds `ea e9 6b e6 14`, so the arm declines on the **opcode**, not on the
+exception code and not on a missing map entry. `.text` holds two stub shapes:
+934 sites starting `0F 0B` (UD2, what the arm handles) and 979 starting `EA E9`
+(4-byte opcode, out of range for the following `mov`, so these are not jumps either).
+Only one site in the image compares against `0xb0f`; nothing compares against
+`0x0b0a` or the `EA` form.
+
+The block *before* the arm tests `[ctx+0x70]`, which is `Dr7` (`ctx+0x68..0x78` is
+`Dr0..Dr7`, then `EFlags` at `0x7c`) — it is an anti-debug shim, so `Dr7=0` and the
+empty decrypt map are both expected and neither is the fault. `[veh-add]` is
+compiled in (three call sites) and logged **zero** lines in 15,872, so the
+protection never registered a vectored handler at all; it was not added then
+removed. No handler in the chain is a decryptor: the only frame handler is an IAT
+thunk, and the top filter is MSVC `__CxxFrameHandler`, which returns 0 for anything
+that is not `0xe06d7363`.
+
+**`build/{wine,fex}-patches/apply.sh` were skipping the fix.** Both aborted on a
+patch that the fork already carries, so `0012-hypervisor-leaves-*` never shipped.
+That patch's own note describes this exact symptom: a `0x40000000` leaf answering
+`eax = 0x40000001` with signature `FEXIFEXIEMU` while leaf 1 says no hypervisor is
+present is a fingerprint no real machine can produce, and anti-tamper that reads it
+concludes "emulator" and never decrypts. With `FEX_HIDEHYPERVISORBIT=1` (already in
+the FEX component's `environment`) that range now returns zero.
+
+`build/fex-patches/apply.sh` was also **destructive**: `stack_applied()` reversed
+patches to probe and restored them with `|| true`, so one failed restore left a tree
+that was neither the pin nor the series and silently dropped the `ml1230` blocks
+from `Module.S`. It is removed; a patch that no longer applies is now reported and
+skipped, with `MADEIRA_PATCHES_STRICT=1` to make that fatal.
+
+**`push-fex-to-device.sh` was not reaching the bundle.** Its bundle candidates all
+prepended the wrong container id, so every write failed silently and only the
+component path was updated — which `arm64ec-windows/xtajit64.dll` shadows. The
+21:20 session therefore ran the 20:47 bundle DLL while the script reported success.
+`APP_REL` is now tried first and every copy is read back and hash-checked.
+Note that `[build-id] rev=` cannot detect this: it is a hand-maintained literal in
+`Module.cpp`, which a `CPUID.h` change does not recompile, so a correct build still
+prints the previous revision and date. Hash the bundle copy instead.
+

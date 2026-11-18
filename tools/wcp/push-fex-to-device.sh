@@ -74,7 +74,15 @@ iosdev app-put "$DLL" "$REMOTE" >/dev/null
 APP_REL="Documents/Applications/com.willfaust.madeora.app/arm64ec-windows/xtajit64.dll"
 WANT_SHA="$(shasum -a 256 "$DLL" | cut -d' ' -f1)"
 BUNDLE_WROTE=0
+# APP_REL first, with no container prefix: `iosdev app-put`/`app-ls` already
+# take paths relative to the LiveContainer appDataContainer root, and that is
+# the form the working bundle path takes. On 2026-11-17 every candidate below
+# except this one failed silently, so a push reported success while the session
+# kept loading the old xtajit64 (build-id still ml1272) and the run explained
+# nothing about the new code.
 for BUNDLE in \
+    "$APP_REL" \
+    "Documents/Data/Application/EDAFB512-48D7-4839-98DA-E66816D6174E/$APP_REL" \
     "Documents/Data/Application/BD038598-DE0F-4AA5-B8F3-6AC778939190/$APP_REL" \
     "$MAD/Applications/com.willfaust.madeora.app/arm64ec-windows/xtajit64.dll" \
     "Documents/Data/Application/BD038598-DE0F-4AA5-B8F3-6AC778939190/Documents/Applications/com.willfaust.madeora.app/Frameworks/arm64ec-windows/xtajit64.dll"
