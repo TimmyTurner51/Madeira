@@ -1954,7 +1954,9 @@ not a regression in the emulator: build the target instead.
 `dist/Madeira.ipa` held `f6baa4f3` for `xtajit64.dll` while `app/Madeira/arm64ec-windows/`
 held `94c941ae` — the IPA was older than the bundle it was supposed to contain, so
 installing the IPA and pushing the DLL tested two different emulators. The IPA has been
-repacked (build 30) and now matches at `42c6f147`.
+repacked (build 30). Built artifacts and the IPA now agree at `d97aa74f`, which also adds
+`[area-state] init-post-crt` -- the first checkpoint after `InitCRTThread`, and therefore the
+first one whose silence actually means ThreadInit was not entered.
 
 ### Checked and found correct
 
