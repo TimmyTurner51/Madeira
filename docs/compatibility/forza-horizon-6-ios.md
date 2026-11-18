@@ -1434,3 +1434,49 @@ ml1275 adds `[dec-map]`: at the hook call it dumps the eight qwords at
 tree with the guest's own comparisons, marking a `MATCH`. Look for
 `root is not a pointer -- the map was never built` (the table is still raw
 RVAs) versus a walk whose keys bracket `0x14537099C` without a `MATCH`.
+
+## 2026-11-17 20:34 — the decrypt map is a real structure, read at the wrong depth
+
+ml1276's probe ran at the hook call and printed the protection's own globals:
+
+```
+[dec-map] code=c000001d rip=000000014537099C obj=00000070725E8040 root=00000070725E80A0
+[dec-map] table 00000070725E8040 00000070725E80A0 0 00000070725E0990 0 0 00000070725E0920 0000000140000000
+[dec-map] wine-flag ptr=00000070725E0B40 value=00
+[dec-map] node[0]=00000070725E0CA0 key=0 end=01 left=self right=self
+```
+
+The cells are live HEAP pointers (not the raw RVAs still visible in the file image),
+so the initialiser at `0x1453CAE60..0x1453CBF80` did run: it allocates the two map
+objects (`st rax -> exe+0xab885b8` at `0x1453CB0B9`, `exe+0xab885c0` at
+`0x1453CB115`) and the Wine-detection flag cell (`exe+0xab88560`). `wine-flag = 0`
+confirms the Windows branch was taken, which is also why the ntdll gadget store
+happened.
+
+The `node[0]` line is a measurement artefact, not a result: the guest dereferences
+twice (`r9 = [cell]; rdx = [r9]; rcx = [rdx+8]`), so `0x70725E0CA0` is the map
+CONTAINER and the header is `*(container+8)`. ml1277/ml1278 walk it at the right
+depth, count the keys, compare them with the faulting RIP, and print the hook's own
+return value (`x0`) plus the initialiser's progress slots (`ctx+0x00`, `ctx+0x90..`).
+
+### What the harness actually does with an `EA` entry
+
+Reading the arms of `0x1453D9270` disambiguates the stub kinds by first byte:
+
+- `0x17` at `Rip`: look up `(TEB.ClientId.UniqueThread, Rip)` in the object at
+  `exe+0xab88558` and **rewrite `ctx->Rip`** to the recorded target
+  (`mov [ctx+0xf8], rbx`, then `eax = 1`).
+- `0x07` at `Rip`: the same shape through the `r15d = 3` path on the map at
+  `exe+0xab885b8`.
+- `0xEA` (ours): `lower_bound(Rip)` in the map at `exe+0xab885c0`; a hit loads the
+  record (`[node+0x140]`) and redirects `ctx->Rip` the same way, a miss falls through
+  to `0x1453DA482`, inserts the RIP with value `-1`, and returns
+  `(wine_flag == 0)` — i.e. `1`, which is why the wrapper took its clean epilogue and
+  returned to us.
+
+So the map is a **redirect table for the protection's own entry stubs**, keyed by RIP,
+and the encrypted `EA` prologue is a stub whose real body was supposed to be
+registered there. Nothing in the fault path can decrypt without that registration,
+and the only writer of the table in this image is the protection's own loader — so
+the question ml1278 answers is whether the table has entries at all, and whether
+`0x14537099C` is among them.
