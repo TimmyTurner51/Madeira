@@ -12734,6 +12734,89 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                         ? *(void **)(tsd_base_now + ios_teb_tls_slot_offset) : NULL,
                     pthread_getspecific(ios_teb_tls_key));
             }
+            /* ml1290: how many SEGVs this thread has taken, and the CPU area that
+             * enter_jit would branch through. Both pc=0 explanations collapse to a
+             * NULL indirect target, and they need opposite fixes:
+             *   * arm64ec_process_init_dispatchers publishes DispatcherLoopTopEnterEC
+             *     into ChpeV2CpuAreaInfo->EmulatorData[2] (+0x40), and enter_jit does
+             *     `ldr x16,[x17,#0x40]; br x16` -- a NULL there is an immediate pc=0;
+             *   * native ARM64EC code reaching an unbound hybrid/GOT slot does
+             *     `ldr x8,[x8,#off]` and then calls it -- a NULL there is also pc=0,
+             *     but ED2 is fine and the emulator is not involved.
+             * Printing ED0..ED3 separates them. Read with mach_vm_read_overwrite
+             * because a faulting thread's TEB may be half torn down. */
+            {
+                extern int ios_teb_tls_slot_offset;
+                uintptr_t base_now;
+                void *teb_now = NULL;
+                uint64_t area = 0, ed[4] = { 0, 0, 0, 0 };
+                mach_vm_size_t g_ed = 0;
+                __asm__ volatile("mrs %0, TPIDRRO_EL0" : "=r"(base_now));
+                base_now &= ~7ULL;
+                if (ios_teb_tls_slot_offset)
+                    teb_now = *(void **)(base_now + ios_teb_tls_slot_offset);
+                if (teb_now &&
+                    mach_vm_read_overwrite(mach_task_self(),
+                        (mach_vm_address_t)teb_now + 0x1788, 8,
+                        (mach_vm_address_t)&area, &g_ed) == KERN_SUCCESS
+                    && g_ed == 8 && area)
+                {
+                    if (mach_vm_read_overwrite(mach_task_self(),
+                            (mach_vm_address_t)area, sizeof(ed),
+                            (mach_vm_address_t)ed, &g_ed) == KERN_SUCCESS
+                        && g_ed == sizeof(ed))
+                        ERR("  [cpu-area] teb=%p ChpeV2CpuAreaInfo=%p ED0=%p ED1=%p ED2=%p ED3=%p %s\n",
+                            teb_now, (void*)area, (void*)ed[0], (void*)ed[1],
+                            (void*)ed[2], (void*)ed[3],
+                            ed[2] ? "ED2 SET: enter_jit can branch"
+                                  : "ED2 NULL: enter_jit branches to 0");
+                    else
+                        ERR("  [cpu-area] teb=%p area=%p UNREADABLE\n",
+                            teb_now, (void*)area);
+                }
+                else
+                    ERR("  [cpu-area] teb=%p ChpeV2CpuAreaInfo NULL/UNREADABLE\n", teb_now);
+            }
+            /* ml1290: the loaded callee's own indirect slot. The dump above prints
+             * `callee[+0x38]` for the one fixed offset (ntdll's x18 load); this
+             * decodes it for any callee, then reads the slot it would call. x8 is
+             * the base the LDR uses, so [x8 + imm12*8] is the missing target when
+             * the instruction is `ldr x8,[x8,#imm]` followed by an indirect call. */
+            {
+                uint64_t x8v = REGn_sig(8, context);
+                uint64_t x11v = REGn_sig(11, context);
+                uint32_t insn38 = 0;
+                mach_vm_size_t g_i = 0;
+                if (x11v >= 0x100000000ULL &&
+                    mach_vm_read_overwrite(mach_task_self(),
+                        (mach_vm_address_t)(x11v + 0x38), 4,
+                        (mach_vm_address_t)&insn38, &g_i) == KERN_SUCCESS && g_i == 4)
+                {
+                    ERR("  [slot] x8=%p x11=%p callee+0x38=%08x\n",
+                        (void*)x8v, (void*)x11v, insn38);
+                    /* LDR (immediate, unsigned offset), 64-bit: 1111 1001 01 imm12 Rn Rt */
+                    if ((insn38 & 0xFFC00000U) == 0xF9400000U)
+                    {
+                        uint64_t off = ((uint64_t)((insn38 >> 10) & 0xFFF)) << 3;
+                        uint64_t slot = 0;
+                        mach_vm_size_t g_s = 0;
+                        int rn = (int)((insn38 >> 5) & 31);
+                        uint64_t base_reg = (rn == 8) ? x8v : 0;
+                        if (base_reg &&
+                            mach_vm_read_overwrite(mach_task_self(),
+                                (mach_vm_address_t)(base_reg + off), 8,
+                                (mach_vm_address_t)&slot, &g_s) == KERN_SUCCESS
+                            && g_s == 8)
+                            ERR("  [slot] ldr x%u,[x%d,#0x%llx] -> *%p = %p %s\n",
+                                insn38 & 31, rn, (unsigned long long)off,
+                                (void*)(base_reg + off), (void*)slot,
+                                slot ? "" : "NULL CALL TARGET");
+                        else
+                            ERR("  [slot] ldr x%u,[x%d,#0x%llx] UNREADABLE (base=%p)\n",
+                                insn38 & 31, rn, (unsigned long long)off, (void*)base_reg);
+                    }
+                }
+            }
             /* ml209: the libcef-init wall. A guest PUSH faulted writing to an address
              * Wine does not own, because the guest RSP held 0x40001141 while the thread's
              * real stack was [73d2130000..73d2170000]. The faulting block was

@@ -1613,3 +1613,368 @@ Note that `[build-id] rev=` cannot detect this: it is a hand-maintained literal 
 `Module.cpp`, which a `CPUID.h` change does not recompile, so a correct build still
 prints the previous revision and date. Hash the bundle copy instead.
 
+## The shipped FEX cannot currently be rebuilt (ml1288)
+
+`dockhost.exe` is the first x86-64 process up and it is what launches the game, so a
+`pc=0` crash there blocks every launch. Builds made from the current FEX tree crash it:
+
+```
+[x9-probe] x9 is not a thunk shape ExitToX64 knows
+err:seh:segv_handler SEGV at pc=0x0 addr=0x0
+err:seh:segv_handler   __os_arm64x_check_call=0x0 (not set or bad)
+```
+
+`x9` is a plain x64 target in `dockhost.exe`'s own `.text` (base+0x8120). It fails the
+thunk shape tests, `ios_ec_entry` correctly misses because the image is `0x8664`, and
+`ios_ffs_no_bypass` emulates -- but during `process_attach` no thread has a
+`CpuStateFrame`, so `enter_jit` reads an all-zero CPU area and `br x16` jumps to NULL.
+This is the failure patch `0004` documents as already fixed by `ml1220`/`ml1230`; those
+labels and `ios_ec_entry` are present in the tree, so the guard itself is not missing.
+
+What is established:
+
+* `FEX` HEAD is `12ed8a268` (all commits dated 11-15, none after the good build).
+* The build is deterministic: two builds of one tree give one hash (`8770dab9...`).
+* A fresh configure is not the cause: the CMake caches of the original and the
+  regenerated build directory are identical (76 entries, no diff).
+* The patches are not the cause: `0006`/`0011` fail `git apply` but their markers are
+  present in HEAD, and skipping them leaves the tree as `HEAD + 0012`.
+* HEAD alone (`8770dab9`), HEAD + `0012` (`2816faeb`), and the rebuild after the stash
+  (`cc91eff8`) all load on device (verified by hash) and all crash the dock the same way.
+* The shipped `xtajit64.dll` (`34632810`) differs from a build of this tree in 34.6% of
+  its bytes. Same size, same flags, same source base, so it was **not** produced by
+  `build/fex-arm64ec/build.sh` from `12ed8a268`. It is an older artifact that
+  `package-ipa.sh` copied out of `app/Madeira/arm64ec-windows/`.
+
+Consequences:
+
+* `34632810` is restored to all three device bundle copies and to
+  `app/Madeira/arm64ec-windows/` and `.runtime-cache/windows/files/`, which the 21:18
+  build had overwritten with the broken module. Verify with
+  `shasum -a 256` on the bundle path, not on `[build-id]`.
+* `0012` (hypervisor leaf hiding) is therefore **untested**: it cannot be evaluated
+  until a FEX build matches the shipped behaviour, because any build we can currently
+  make never reaches the game.
+* Next step is to find which source state produced `34632810` -- most likely the FEX
+  tree as it stood before the SMC commits (`062205f2b`/`583fbd00e`/`12ed8a268`) were
+  built into the shipped module, or with the pre-`IOS_PE_TO_POOL_TO` form of
+  `ios_ec_entry`.
+## Correction to ml1288: the dock crash is not a FEX regression (ml1290)
+
+The `ml1288` section above is superseded. It read the `dockhost.exe` `pc=0` as caused by a
+rebuilt FEX. It is not:
+
+* The shipped `xtajit64.dll` (`34632810`) was restored to all three device bundle paths and
+  read back by hash; the crash is **byte-identical** -- same `x9=0x111098120`, same `pc=0`,
+  same `addr=0`, same `callee+0x38`. A build cannot be the cause of a fault the known-good
+  build also takes.
+* The `ml1288` claim that "the good session had no dock crash" compared a *game* log
+  (`madeira-last-game-log.txt`) against *app* logs. `dockhost` writes to the app log. That
+  comparison was invalid and is what made the regression look real.
+
+Two other explanations were also disproved:
+
+* **`EmulatorData[2]` was not NULL.** `ThreadInit` logs
+  `EnterEC=0x12f9b0108` for `teb=0x71fffa0000 area=0x111250000`, i.e.
+  `ChpeV2CpuAreaInfo->EmulatorData[2]` was populated, so `enter_jit`'s
+  `ldr x16,[x17,#0x40]; br x16` could not have gone to NULL. At the fault `x16=0x14e321900`,
+  a valid JIT address.
+* **`__os_arm64x_check_call=0x0` is not a signal.** Every module logs
+  `check_call=0x000000014DB47354`; the zero is reported for `dockhost.exe`, a pure x64 image
+  (`Machine=0x8664`) that legitimately has no ARM64EC metadata.
+* **`[jit-gate]` absence proves nothing.** The `enter_jit` route stamp writes 14 raw bytes to
+  fd 2, and the marker appears in **zero** logs -- including sessions where the game ran and
+  emulated x64 code continuously. fd 2 there is not `madeira-log.txt`, so the marker cannot be
+  used as evidence either way.
+
+What the crash actually looks like: `dockhost.exe` is the launch host
+(`starting the host for app 2483190; Valve's client authenticates and authorizes the launch`).
+Thread `0038` logs the SEGV and then never logs again, and **no further process is spawned** --
+no `steam.exe`, no `steamwebhelper`, no game. The UI sits at "Starting Madeira Dock..."
+indefinitely, which is consistent with the host dying mid-handshake.
+
+`x9 = 0x111098120` = `dockhost.exe + 0x8120`, whose bytes in the rebuilt image are
+`56 57 48 83 ec 28 48 8b 05 43 38 00 00 83 38 02` -- a genuine x64 function
+(`push rsi; push rdi; sub rsp,0x28; mov rax,[rip+0x3843]; cmp dword ptr [rax],2`), which is
+exactly what must be *emulated*, not branched to. The `[x9-probe]` verdict
+"AArch64 code (not an x64 thunk)" is a wrong heuristic in a `dprintf`-only diagnostic; it
+cannot affect routing.
+
+Build-infrastructure notes found while packaging:
+
+* `runtime-components.py verify` fails on `dock` unless `HOST_CC` names a real host clang.
+  `build-runtime-component.sh` runs `build/madeira-dock/build.sh --check`, whose test build
+  uses `clang` from `PATH`, and `setup-llvm-mingw.sh` has already put the mingw clang first --
+  so it fails with `'assert.h' file not found`. `HOST_CC=/usr/bin/clang` fixes it, and the
+  full dock suite then passes (including *launch-start-when-ceg-already-prepared*).
+* `app/Madeira/aarch64-windows/d3d11.dll` no longer matches the shipped IPA at identical size,
+  so the tree has drifted. Do not run `runtime-components.py build windows` to "fix" it without
+  first checking that it does not overwrite the good `arm64ec-windows/xtajit64.dll`.
+
+Open: `dockhost.exe` is loaded from the **bundle**, not from the prefix, so pushing a rebuilt
+copy into `arm64ec-windows/` takes effect on the next launch with no reinstall. That is the
+next experiment: the fresh build is `5f7b663f9463ec0b`, and the device copy before this was
+never verified against it.
+## The dock crash blocks the game, and it is in DllMain (ml1291)
+
+Two facts settled by comparing launches:
+
+* `dockhost.exe` is rebuilt clean (`5f7b663f9463ec0b`, Dock's own suite passing) and pushed
+  to all four `arm64ec-windows/` bundle paths with hash read-back. The crash does not change,
+  so a stale Dock binary is not the cause either.
+* Every launch so far -- including the preserved `madeira-log.prev.txt` -- has
+  `dockcrash=2` **and zero game spawns** (`[phase] spawn` lists only dockhost, services,
+  conhost and rpcss). No `steam.exe`, no `steamwebhelper`, no game, and none of the host's
+  report stages (`probe-start-bits`, `session-authenticated-online`, `ceg-request`, ...)
+  ever appear. The Dock report (`C:\madeira-dock.txt`) is never written, so the starting
+  screen sits on "Starting Madeira Dock…" (docs/MADEIRA_DOCK.md, the status table).
+  This corrects the guess that the crash might be survivable: it is the blocker.
+
+`x9 = dockhost.exe + 0x8120` is **DllMain**:
+
+```
+140008120: push %rsi; push %rdi; sub $0x28,%rsp
+140008126: mov 0x3843(%rip),%rax      # 0x14000b970
+14000812d: cmpl $0x2,(%rax)
+140008130: je ...
+140008132: movl $0x2,(%rax)
+140008138: cmpl $0x1,%edx             # fdwReason
+14000813b: je ...
+14000813d: cmpl $0x2,%edx
+```
+
+So the fault is taken during **process attach's DllMain walk** -- the window `Module.S`
+already documents as having no `CpuStateFrame` yet. That makes the guard placement below the
+prime suspect rather than the emulator itself.
+
+Guard placement, in the current tree:
+
+```
+ios_ec_entry_miss:
+  ldp x4, x23, [sp], #16
+  b ios_ffs_no_bypass          <-- skips ios_thunk_reject entirely
+```
+
+`ml1220`'s "FEX is uninitialised, so do not emulate" guard lives in `ios_thunk_reject`. The
+`ios_ec_entry` miss edge branches straight to `ios_ffs_no_bypass`, which is past that guard,
+so a fault that arrives via `check_target_ec` -> `ios_ec_entry` -> miss never gets the
+protection the comment claims. This is consistent with the crash being byte-identical in the
+shipped `34632810` too: the bug is old, not a rebuild artefact.
+
+Caveat, recorded so it is not over-read: at the fault `x16=0x14e321900` and
+`[cpu-area] ThreadInit-done tid=0x38 ... EnterEC=0x12f9b0108` show that a valid dispatcher
+*was* published for that thread. So "ED2 is NULL" is not established -- the emulator was
+entered and then faulted at guest `pc=0`, which is why the next step is instrumentation
+(`[cpu-area]` + a slot decode in `build/ntdll-unix/signal_arm64_ios.c`, `ml1290`) rather than
+a blind patch to the guard.
+## Bisect: FEX and PE ntdll are exonerated; the app binary or the prefix is left (ml1292)
+
+Every committed `xtajit64.dll` and `ntdll.dll` is recoverable with
+`git show <commit>:app/Madeira/arm64ec-windows/<file>`, so the guest stack can be bisected
+with a push and a relaunch and no rebuild. Hashes per commit:
+
+```
+051835e  xtajit=b4f12015 ntdll=f756d580   11-15 12:30   (f756d580 is 1.5MB -- see below)
+a7f7bef  xtajit=3ae2dff3 ntdll=20e43e9a   11-15 16:48
+03c0422  xtajit=382c1119 ntdll=683a26dd   11-15 17:27
+0fdd16c  xtajit=e6931987 ntdll=937edcc0   11-15 17:44
+a1187a9  xtajit=34632810 ntdll=6eda4406   11-15 18:14
+c6b8dd2  xtajit=34632810 ntdll=001de7db   11-15 18:57
+3934444  xtajit=34632810 ntdll=94a3c462   11-15 19:37
+06b437a  xtajit=34632810 ntdll=572c8f9a   11-17 20:31
+ae7091c  xtajit=34632810 ntdll=b7eff7dd   11-17 20:32
+17435bc  xtajit=34632810 ntdll=a0710234   11-17 20:39
+```
+
+`b29` (built 11-15 16:23) shipped `xtajit=b4f12015 ntdll=46bd300a`, i.e. the FEX from
+`051835e` and an ntdll that is in no commit after it -- b29 is the last pre-FH6 build.
+
+Results, holding the app at `b31` (HEAD) throughout:
+
+| `xtajit64.dll` | `ntdll.dll` | dock |
+|---|---|---|
+| `34632810` (HEAD) | `a0710234` (HEAD) | crash |
+| `b4f12015` (b29) | `a0710234` (HEAD) | crash |
+| `b4f12015` (b29) | `46bd300a` (b29) | crash |
+
+So neither guest PE is the cause: the fault stays `pc=...fc70`, `addr=0xfffffffffffffc70`,
+`[cpu-area] ED0=0x0`, then the `pc=0` cascade, with both stocks in place. What is left is the
+**app binary** (`libntdll_unix.a`, `build/ntdll-unix/virtual_ios.c`) or the **Wine prefix**,
+which is why the next test is a full `b29` install: a stock app that still stalls means the
+code was never the problem.
+
+If it is the app, the twelve `wine` commits after b29 are the bisect range, and two are
+prime suspects because they change how FEX's own hooks are restored:
+
+* `b633c163` (17:02) *do not restore FEX hooks after Denuvo's ntdll .data exec protect* --
+  `ios_finish_ntdll_data_preserve` now sets `ios_fex_hooks_live = FALSE` and returns without
+  calling `ios_restore_fex_hooks`, relying on post-unix having already done it. That ordering
+  is Denuvo-specific; a plain x64 process such as `dockhost.exe` never arms the ntdll `.data`
+  interval, so it is the case least likely to satisfy the assumption.
+* `f2c8a65c` (17:16) *keep ios_restore_fex_hooks out of line* -- the previous inlined loop
+  lost its trip count and became `str; add #8; b` over the RX pool copy of ntdll `.data`
+  (7.3M SIGBUS stores, 59MB+ smashed). The fix is correct, but it documents that this area
+  can corrupt arbitrary memory, which matches the wild-pointer faults
+  (`0xfffffffffffffc70`, `0xffffffffffffff50`, `gregs[RSP]=0`) better than a NULL-slot call
+  does.
+
+Also corrected: the 1.5MB `app/Madeira/arm64ec-windows/ntdll.dll` is `051835e`'s committed
+content (`n 1572864`), not a stripped-file accident, and the `d3d11.dll` mismatch is
+`package-ipa.sh`'s `hide-wine-exports.py` rewriting `app/Madeira/*-windows/*.dll` in place
+(git holds `f1cfc568`), not repository drift.
+## The Dock stall is not a regression: stock b29 fails identically (ml1293)
+
+`Madeira-0.2.0-b29.ipa` (the last pre-FH6 build, `[build] v0.2.0 (29)`) was installed and
+launched. It crashes the Dock exactly as `b31` does -- `pc=...fc70`,
+`addr=0xfffffffffffffc70`, the same `pc=0` cascade, the same infinite fault loop, and the same
+`dockhost.exe-09d95efb7c42a67b` module. `allow-jit` reads `false` on all four launches, so
+that is not the difference either.
+
+That closes the bisect. No component of the FH6 work is responsible:
+
+| `xtajit64.dll` | `ntdll.dll` | app | dock |
+|---|---|---|---|
+| HEAD `34632810` | HEAD `a0710234` | b31 | crash |
+| b29 `b4f12015` | HEAD `a0710234` | b31 | crash |
+| b29 `b4f12015` | b29 `46bd300a` | b31 | crash |
+| b29 `b4f12015` | b29 `46bd300a` | **b29** | crash |
+
+The Dock path is simply a part that has been broken for at least as long as b29; it was never
+exercised by the direct library launches that were working. It is a separate bug, not damage
+from the Denuvo/SMC work.
+
+### Root cause
+
+During `dockhost.exe`'s DllMain process-attach, the guest thread runs with an uninitialised
+CPU area. The instrumentation shows both halves:
+
+```
+[cpu-area] teb=0x71fffa0000 ChpeV2CpuAreaInfo=0x110820000
+           ED0=0x0 ED1=... ED2=... ED3=...      <- ED0 is the CpuStateFrame, and it is NULL
+[rsp-forensics] x23(SRA RSP)=0x400007 gregs[RSP]=0x0
+```
+
+`ED0` NULL and `gregs[RSP]=0` are the same fact seen twice: there is no frame, so RSP reads as
+zero. The first stack store in the callee then computes `0 - 0x390` and faults at
+`0xfffffffffffffc70` (`x20` = that value, faulting instruction `str w8,[x20]`), which cascades
+to `pc=0` and then into the repeating `0x10eb1a8b4` / `0xffffffffffffff50` loop. The starting
+screen reads that loop as "Still starting Madeira Dock…" because the host never writes
+`C:\madeira-dock.txt`, so no report field ever arrives.
+
+`x23` holding `0x400007` -- the same value as `rax` -- is the register-aliasing signature
+`Module.cpp` describes for the broken `SpillStaticRegs` ("State.gregs[REG_RSP] never spilled
+before CompileBlock"). That workaround's own logs (`[FEX-iOS] DispatcherPatch`) are dead
+channels (ml1216/ml1217), so it cannot be confirmed or refuted from a log; it needs a
+LogMan-side counter.
+
+This is case (a) in `IosLogCPUArea`'s taxonomy: **ThreadInit never ran for this thread before
+its DllMain was emulated.** The fix belongs there -- make the CPU area and CpuStateFrame exist
+before the process-attach walk is emulated -- not in the `x9`/`ios_ec_entry` dispatch route
+that earlier notes blamed. Patching that route cannot help: the fault is a stack store with a
+zero RSP, which arrives regardless of how the target was reached.
+## Where the Dock investigation stands (ml1296)
+
+**Pending one relaunch.** `94c941ae` is on all four bundle paths. It adds the first two
+diagnostics this area has ever had on a working channel:
+
+* `[area-state] init-enter | init-set | fail-nostate | fail-callret`
+* `[dispatcher-patch] enterEC=… patched=N already_ok=M`
+
+Read `[dispatcher-patch]` first. `patched=0 already_ok=0` means the dispatcher holds no
+`SpillStaticRegs` site at all, so RSP is never spilled — that is the fix to write. Non-zero
+means the workaround fires and the fault is elsewhere.
+
+### The logging trap that cost three cycles
+
+`LogMan::Msg::EFmt` **works** from this module; `LogMan::Msg::DFmt` is the **no-op**. The
+evidence: `IosLogCPUArea` uses `EFmt` and its `[cpu-area]` lines are in every log, while both
+attempts at `DFmt` printed nothing. Note this contradicts what the `ml1216`/`ml1217` comments
+in `Module.cpp` assert about *all* of this file's logging being dead — those comments are
+about `log_hex` (which writes through `WriteFile(hStdError)` / raw `write(2)`), not about
+`LogMan`. Before adding a diagnostic here, copy the exact `LogMan` form from a line that
+already appears in `madeira-log.txt`.
+
+### What is settled
+
+* Not a regression: stock `b29` fails identically (`ml1293`).
+* Not FEX or the PE `ntdll`: bisected to stock and still fails (`ml1292`).
+* The `CpuStateFrame` is **intact**, not clobbered. `x28=0x7c00801140` at the fault equals the
+  frame published at `ThreadInit-done`. An earlier `ED0=0x0` reading in `ml1294`/`ml1295` was
+  misleading — that field only has meaning on the teardown path.
+* The real defect: `gregs[RSP]=0` **inside a live frame**, with `x23` (SRA's RSP) holding
+  `0x400007` — the same value as `rax`, i.e. the register-aliasing signature `Module.cpp`
+  documents for broken `SpillStaticRegs`. The first stack store then computes `0-0x390` and
+  faults at `0xfffffffffffffc70`, cascading to `pc=0` and a repeating `0xffffffffffffff50`
+  loop that the UI reads as "Still starting Madeira Dock…".
+## Cleanroom audit (ml1297): the tested artifact never contained the fix
+
+The ml1296 "pending one relaunch" plan was wrong, and the reason matters more than the
+result: **every device test that was supposed to produce `[area-state]` and
+`[dispatcher-patch]` ran a binary built before the `DFmt` → `EFmt` change.** The
+instrumentation was present as source and as string literals, but the emitted calls were
+`DFmt`, which `MSG_LEVEL = INFO` compiles out entirely (`if (MSG_LEVEL < DEBUG) return;` —
+`DEBUG > INFO`, so the body, including the format call, is dead code).
+
+Evidence, all offline:
+
+* `Source/Windows/ARM64EC/Module.cpp` mtime `23:03:20`, `Bin/libarm64ecfex.dll` `23:03:28`,
+  and `find build-arm64ec -name '*.o' -newer Module.cpp` returned **0 objects**. The link
+  ran, the compile did not: the build was mid-flight when the file was edited, so ninja
+  linked objects produced from the pre-edit source.
+* `strings` finds `[area-state]` / `[dispatcher-patch]` in the old DLL, which is why a
+  strings check "confirmed" the instrumentation and cost a relaunch. Their presence proves
+  only that the literals exist, not that a logging call references them.
+* Rebuilding the same source changed the hash: `94c941ae` → `42c6f147`.
+
+So the absence of `[area-state]` was never evidence about `ThreadInit` — it was evidence
+about the build. The `[cpu-area] ThreadInit-done` line that *did* appear comes from an
+`EFmt` call that predates this work, which is exactly why it was the only survivor.
+
+**Rule for this area:** before trusting any FEX-side log line, confirm the running artifact
+by hash against a freshly built `Bin/libarm64ecfex.dll`, not against the app bundle copy,
+and confirm the object is newer than the source.
+
+### `ninja` will silently skip the rebuild
+
+`ninja -C build-arm64ec` reported `no work to do` for `arm64ecfex` while `Module.cpp` was
+newer than the *object* but older than the *DLL*. Ninja's mtime check on the final link
+output wins, so an edit that lands between compile and link is invisible forever. After
+editing `Module.cpp`, `touch` it and rebuild, or check the object mtime explicitly.
+
+### `ninja` default target is broken
+
+`ninja -C build-arm64ec` (all) fails in `FEXOfflineCompiler.exe`, which links `libFEXCore.a`
+without the `Source/Windows/ARM64EC` objects and therefore cannot resolve `IosSubfloorEnum`,
+`ios_fex_mono_*`, `IosJitSMCFetch`, `FEXCore::DualMap::WriteOffset`, and similar. This is
+not a regression in the emulator: build the target instead.
+`ninja -C build-arm64ec arm64ecfex` is the only correct invocation.
+
+### Packaging drift
+
+`dist/Madeira.ipa` held `f6baa4f3` for `xtajit64.dll` while `app/Madeira/arm64ec-windows/`
+held `94c941ae` — the IPA was older than the bundle it was supposed to contain, so
+installing the IPA and pushing the DLL tested two different emulators. The IPA has been
+repacked (build 30) and now matches at `42c6f147`.
+
+### Checked and found correct
+
+* The `SpillStaticRegs` patcher's seven hardcoded `stp` words decode exactly as claimed,
+  and the register mapping matches `Arm64Emitter.cpp`'s ARM64EC `SRA` table: RAX=x8,
+  RCX=x0, RDX=x1, RBX=x27, **RSP=x23**, RBP=x29, RSI=x25, RDI=x26, R8=x2, R9=x3, R10=x4,
+  R11=x5, R12=x19, R13=x20, R14=x21, R15=x22. The patcher is not corrupting the spill.
+* `SpillStaticRegs` emits from `GPRSpillMask` defaulting to `~0U`, so a *correct* build
+  spills all eight pairs including RSP. A missing RSP spill therefore implies either a
+  mis-emitted site or a mask that dropped it — it cannot be the mask's default.
+* The Wine cross-link pass removes and recreates every `sys32` symlink, so the bundle copy
+  does reach the prefix (`[WineProc] Cross-linked 0 non-colliding files` refers only to the
+  other arch and is benign).
+* `7644eadb6`'s `enter_jit` frame fix is sound. Its root cause is worth remembering: the
+  path enters with `sp ≡ 8 (mod 16)` because of `str x30,[sp,#-8]!`, and pairing with SP as
+  a writeback base requires 16-byte alignment.
+
+### Workspace hygiene applied
+
+* `Reference/` (176 MB `forzahorizon6.exe`) is now git-ignored; it was untracked and one
+  `git add -A` from entering the repo.
+* `FEX/build-arm64ec.old.40099` removed. A `find` for `libarm64ecfex.dll` matched it before
+  the live build directory, which is how a stale hash can be "verified" by accident.

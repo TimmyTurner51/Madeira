@@ -229,3 +229,6 @@ __pycache__/
 
 # Local IPA / .wcp build output
 dist/
+
+# Local game/platform reference binaries (large, copyrighted; never committed)
+Reference/
