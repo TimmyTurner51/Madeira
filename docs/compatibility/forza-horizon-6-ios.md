@@ -1378,3 +1378,59 @@ RDX=x64 context (Windows KiUserExceptionDispatcher), then ARM64
 and `returned` with Rip bytes no longer `ea e9 6b e6`, or a further fault
 inside the gadget. Do not re-add `env.FEX_*`. Do not strip ntdll. Do not
 hide `wine_get_version`.
+
+## 2026-11-17 20:18 — the KiUser hook runs, and it is not the decryptor
+
+ml1274 (ntdll sha `94a3c462…`, `wow64=00000001454F21B9`) was live. The x64
+call through `ExitToX64` worked exactly as designed:
+
+```
+[ki-path] calling pWow64PrepareForException=00000001454F21B9 ExitToX64=00000001635A55C4
+          rec=000000706C9EFD50 ctx=000000706C9EF4D0 Rip=000000014537099C bytes=eae96be61448897c
+[ki-path] pWow64PrepareForException returned Rip=000000014537099C code=c000001d bytes=eae96be61448897c
+[veh-chain] EMPTY (0 handler(s))
+[ud-decrypt] BYTES UNCHANGED (eae96be61448897c)
+```
+
+FEX compiled and ran the gadget: the call returned through the gadget's own
+epilogue, and `[ki-path] … returned` printed after it. So the hook is not
+blocked any more — the store Denuvo made into ntdll `.data +0x510` is now
+honoured by the dispatcher, which is what Windows does.
+
+### The 8-byte store is a pre-dispatch callback, not a decrypt map
+
+The 18:05 entry guessed that the `mov [rax], gadget` store *was* the decrypt
+map. The gadget (`0x1454F21B9`) forwards to the body at `0x1453D9270`, which is
+the same harness the Wine-path VEH pointed at (`0x1453CD858` → `jmp +0x53D9270`):
+
+- `(ExceptionCode ^ 0xf58ad36680ab1cf9) * 2` of `0xc000001d` is
+  `0xeb15a6cc815639c8` **exactly** — the `#UD` arm is entered, no doubt left.
+- that arm compares the word at `ctx->Rip` with `0x0F0B` (`UD2`) and skips two
+  bytes when it matches (our entries start `EA`, so it does not), then branches
+  on `ctx->Dr7 != 0` and finally looks `ctx->Rip` up in a range map rooted at
+  `forzahorizon6.exe+0xab885b8` (object) / `+0xab885c0` (tree):
+  `cmp [node+0x20], rip`, children at `+0x0`/`+0x10`, end flag at `+0x19`.
+- a NULL object pointer returns `(wine_flag == 0)` and CONTINUE_SEARCH; a miss
+  in the tree goes to the `0x1453DA482` arm, which also ends in
+  CONTINUE_SEARCH after taking a map lock.
+
+The hook returned without any fault inside `0x1453D9EAB`, so the map header was
+readable and its entries were sane pointers — the decline is the lookup, not a
+half-initialised table.
+
+### Two more things this run rules out
+
+- `[x64-dr]` shows only the two reads at fault time (`dr0=0 dr7=0 valid=0`) and
+  the log has **no** `NtSetContextThread` at all: nothing ever arms `Dr0`-`Dr3`
+  in this process, so the single-step arm of the harness is not what Windows
+  would use here either.
+- `forzahorizon6.exe` is at its preferred base this time (`[main-exe]
+  virtual_map_module = 0x0`, `ml988 … CLAIMING`, `ImageBase=0x140000000`,
+  `TransferAddress=0x145a66394`), so the relocated-image theory is off the
+  table for this crash.
+
+ml1275 adds `[dec-map]`: at the hook call it dumps the eight qwords at
+`exe+0xab885b8`, the object/root pointers, the `wine-flag` byte, and walks the
+tree with the guest's own comparisons, marking a `MATCH`. Look for
+`root is not a pointer -- the map was never built` (the table is still raw
+RVAs) versus a walk whose keys bracket `0x14537099C` without a `MATCH`.
