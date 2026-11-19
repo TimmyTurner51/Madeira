@@ -2180,3 +2180,64 @@ costs three instructions. `x9` (the target the dispatcher asked for) is recorded
 `tier0_s64.dll`, and an `IPC:CSteamEngine` thread. The engine thread samples at 0% CPU in a
 wait state, and `enter_jit` stops being entered, so the next investigation is what that thread
 is waiting on -- not FEX, and not the dock.
+## ml1302 run: dock clean, Steam reached, then backgrounded
+
+The one-shot gate did its job — 1 line instead of 295,583, and a 10k-line log instead of 613k:
+
+```
+[build-id] rev=ml1302 compiled Nov 18 2026 19:44:11
+[jit-gate] 0
+BUS/SEGV: none
+```
+
+`dockhost.exe` completed and the screen advanced to `Loading Steam...`. **The dock stage is no
+longer the blocker.**
+
+### What ended the session
+
+Not a crash. Madeira's own summary says *"up to when Madeira went to the background"*, and the
+log agrees:
+
+```
+19:46:48  [bg-run] keeping Madeira running in the background for: game
+          (game 10 min, downloads 60 min, CPU held under 50% of one core)
+```
+
+So a run that looks stuck at `Loading Steam... 11s` may simply be **backgrounded**: iOS
+suspends it, the log stops, and `enter_jit` stops being entered. Check for that line before
+reading a stall as a hang.
+
+`steamerrorreporter64.exe` was spawned and then `[proc-gate] REFUSING spawn … (steamerrorreporter
+gate)` — deliberate, so Steam's error dialog cannot cover the screen. It is a symptom worth
+noting, not the cause of the stop.
+
+### Where Steam got to
+
+`Steam/logs/connection_log.txt`, `configstore_log.txt` and `appinfo_log.txt` were all written
+at 19:46:
+
+```
+[2026-11-18 19:46:27] Client version: no bootstrapper found
+[2026-11-18 19:46:27] Loaded store 'install' from config\config.vdf successfully
+[2026-11-18 19:46:27] Connectivity test: Starting test, fetching 'http://test.steampowered.com/204'
+```
+
+and then nothing — the connectivity fetch never completed, because the session was backgrounded
+21 seconds later. For contrast, the **17 Nov 21:02 session did log on successfully**
+(`Logged On`, `U:1:1189646074`), so the Steam login path has worked before and is not the thing
+to fix first.
+
+### Memory is near the ceiling and worth watching
+
+```
+[footprint] phys=1575 MB (peak 1581) internal=1568 MB
+[jit-pool] used=0x9bcc000/0x34000000          (156 MB of 832 MB)
+[no-footprint] pool-RW-alias: ALL 4 variants refused — pool stays jetsam-counted
+```
+
+The pool is not the bulk of it (156 MB used); the ~1.5 GB is guest memory. But the exemption
+still does not apply: every variant returned `ownership failed kr=4`, and the `plain` variants
+report `entry covers only 16384 of 554762240 bytes (partial)` — a 16 KB entry for a 529 MB
+region, which is the real reason ownership is rejected. `kr=4` is the consequence, not the
+cause. If the dock/Steam stages start getting killed rather than backgrounded, fix the partial
+entry first.
