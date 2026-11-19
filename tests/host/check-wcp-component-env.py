@@ -116,4 +116,16 @@ if readme.exists():
         check(f"{key}={value}" in text,
               f"the reference build documents {key}={value}")
 
+# --- 6. the installed environment actually carries the CPU identity keys ------
+# These are read by the FEX module, so a package that sets them but a component
+# entry that does not leaves the module on its defaults without saying so.
+preset = json.loads((ROOT / "tools/wcp/fh6-fex-env.json").read_text(encoding="utf-8"))
+preset_env = preset.get("environment", {})
+check(preset_env.get("FEX_CPUBRAND", "").startswith("Intel(R) Core(TM)"),
+      "the FH6 preset presents an x86 brand consistent with the vendor leaves that "
+      "CPUID 0 and 1 already announce", preset_env)
+check("FEX_LOG_CPUID_LEAVES" in preset_env,
+      "the FH6 preset keeps CPUID leaf telemetry on so identity probing is observable",
+      preset_env)
+
 print("\nPASS: a component's environment reaches the launch, under the game's own settings")

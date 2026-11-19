@@ -6,7 +6,7 @@
 # Push a built iOS FEX module into Madeira's installed FEX component on a paired
 # iPhone, over devicectl.
 #
-#   tools/wcp/push-fex-to-device.sh <libarm64ecfex.dll> [version-name]
+#   tools/wcp/push-fex-to-device.sh <libarm64ecfex.dll> [version-name] [env-json]
 #
 # The FEX loop is then build -> push -> relaunch -> read the log, with no file
 # picker, no screen automation and no IPA: Madeira links
@@ -22,6 +22,7 @@ set -euo pipefail
 
 DLL="${1:?usage: push-fex-to-device.sh <libarm64ecfex.dll> [version-name]}"
 VERSION="${2:-}"
+ENVJSON="${3:-}"
 [ -f "$DLL" ] || { echo "missing $DLL" >&2; exit 1; }
 command -v iosdev >/dev/null || PATH="$HOME/bin:$PATH"
 command -v iosdev >/dev/null || { echo "iosdev is required (put it on PATH or in ~/bin)" >&2; exit 1; }
@@ -47,6 +48,9 @@ PY
 
 REMOTE="$MAD/Components/$ID/files/lib/wine/aarch64-windows/libarm64ecfex.dll"
 iosdev app-put "$DLL" "$REMOTE" >/dev/null
+
+# The component's environment lives in state.json (that is the list WineProcessBridge.m
+# reads), so it is deployed there by the merge below rather than from a side file.
 
 # The component link is NOT what the session loads. Wine resolves xtajit64.dll
 # out of the app bundle's own arm64ec-windows folder, and the bundle's copy
@@ -108,10 +112,10 @@ fi
 echo "dll    $(shasum -a 256 "$DLL" | cut -c1-64)"
 echo "       $REMOTE"
 
-python3 - "$TMP/state.json" "$DLL" "${VERSION:-}" <<'PY'
+python3 - "$TMP/state.json" "$DLL" "${VERSION:-}" "${ENVJSON:-}" <<'PY'
 import hashlib, json, os, sys, time
 
-path, dll, version = sys.argv[1], sys.argv[2], sys.argv[3]
+path, dll, version, env_json = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 state = json.load(open(path))
 entry = [c for c in state["components"] if c.get("kind") == "fex"][0]
 
@@ -129,6 +133,20 @@ entry["versionCode"] = int(entry.get("versionCode") or 0) + 1
 entry["installedAt"] = time.time()
 entry["sha256"] = hashlib.sha256(open(dll, "rb").read()).hexdigest()
 entry.setdefault("notes", []).append("Pushed by tools/wcp/push-fex-to-device.sh")
+
+# The environment is read from this entry, not from the DLL. A package whose
+# environment changed used to arrive with the old values, so the new code ran under
+# its defaults and the run proved nothing. Merge the package's environment whenever
+# one is supplied: keys it sets are written, and keys that were set before but are
+# gone from the package are removed, so a deleted option really is deleted. Keys the
+# package never mentions are left alone.
+if env_json:
+    package_env = json.load(open(env_json)).get("environment", {})
+    previous = dict(entry.get("environment") or {})
+    merged = {k: v for k, v in previous.items() if k not in package_env and not k.startswith("FEX_")}
+    merged.update(package_env)
+    entry["environment"] = merged
+    print(f"env    {len(merged)} keys from {env_json}")
 
 json.dump(state, open(path, "w"), indent=2, sort_keys=True)
 print(f"entry  {entry['id']}: {entry['name']} (versionCode {entry['versionCode']})")

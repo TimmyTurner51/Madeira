@@ -3,6 +3,8 @@
   "environment": {
     "FEX_SMCCHECKS": "full",
     "FEX_HIDEHYPERVISORBIT": "1",
+    "FEX_LOG_CPUID_LEAVES": "1",
+    "FEX_CPUBRAND": "Intel(R) Core(TM) i7-6700K CPU @ 4.00GHz",
     "FEX_MULTIBLOCK": "1",
     "FEX_X87REDUCEDPRECISION": "1",
     "FEX_TSOENABLED": "1",
