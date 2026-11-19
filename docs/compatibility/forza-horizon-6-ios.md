@@ -2241,3 +2241,57 @@ report `entry covers only 16384 of 554762240 bytes (partial)` — a 16 KB entry 
 region, which is the real reason ownership is rejected. `kr=4` is the consequence, not the
 cause. If the dock/Steam stages start getting killed rather than backgrounded, fix the partial
 entry first.
+## The dock works end to end (ml1302, 18 Nov 19:57)
+
+The stage this document opened on -- `dockhost.exe` dying in `DllMain` and the UI hanging on
+"Still starting Madeira Dock…" forever -- is finished. The same day's later run:
+
+```
+[dock-report] session-requested-app-entitled=1
+[dock-report] session-requested-app-listed=1
+[dock-report] session-subscription-count=490
+[dock-offline] Valve's client can log this account on offline: saved
+[dock-report] launch-client-error=0
+[dock-report] session-auth-test-result=0
+[dock-report] probe-result=0
+[dock-report] shutdown-complete=1
+[madeira-dock] host finished (result 0)
+```
+
+and then `forzahorizon6.exe` is created, mapped into the pool (`0x70732c0000+0xb3c0000`), loads
+85 modules, installs its own unhandled-exception filter, and starts executing. The screen passes
+`Loading Steam...` and the game runs its own code.
+
+`Madeira Dock stopped / exited before a game window appeared` is a consequence of what follows,
+not a dock failure: the dock returned 0 (success) and the game died before presenting a window.
+
+### What stops the game: Denuvo never decrypts
+
+```
+[exc] ml811 code=c000001d addr=000000707863099C        (STATUS_ILLEGAL_INSTRUCTION)
+[ud-decrypt] EC handler declined at 000000707863099C: BYTES UNCHANGED (eae96be61448897c)
+wine: Unhandled illegal instruction at address 000000707863099C
+```
+
+The runtime bytes are **byte-identical to the on-disk image** for that RVA:
+
+```
+RVA 0x537099c, .text, file offset 0x536ff9c
+on disk : eae96be61448897c 241055488bec4883
+in memory: eae96be61448897c ...
+region entropy 7.82 bits/byte (Denuvo-encrypted section)
+```
+
+So the page was never decrypted. The protection declined to decrypt its own code, the game
+executed ciphertext, took an illegal-instruction fault with no valid x64 text window to unwind
+through (`[guest-insn] no registered x64 text window`), and terminated with `0xc000001d`. No
+missing Windows API accounts for it -- the surrounding `fixme:` lines are unrelated stubs.
+
+This is not an emulation defect in the dock, FEX's dispatcher, or the memory manager. It is the
+title's own anti-tamper refusing to run in this environment, and it is a licensing/DRM boundary
+rather than a bug to engineer around.
+
+### So the honest status
+
+Everything Madeira owns in this path now works: dock, service manager, Steam launch, PE loader,
+ARM64EC emulation, and the pool. What remains is outside the emulator.
