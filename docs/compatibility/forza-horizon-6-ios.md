@@ -2393,3 +2393,60 @@ would have bought nothing; `wine_get_version` correctly stays because FEX resolv
 Note for the next rebuild: `build/wine-pe/build-ntdll.sh` produces an **unrenamed**
 ntdll, and the rename is applied afterwards by `tools/build/package-ipa.sh`. Shipping a
 rebuilt ntdll without re-running `hide-wine-exports.py` silently restores the trigger.
+## ml1304 measured: delivery was not the cause
+
+The ml1304 adoption fires exactly as intended, so the mechanism is verified:
+
+```
+[mach-deliver] rev=ml1304 adopted guest rsp=0x706dc3fe08 (native sp=0x71f2f90000 is outside this stack) teb=0x706a4e0000
+[unwind-root] ACCEPTING terminal root frame 706dc40000 (== stack hi)
+```
+
+`BEST-EFFORT` no longer appears at all, and the terminal root frame is now the
+guest's own stack top rather than a module base. So the faulting thread is delivered
+with `CONTEXT.Rsp` pointing where the guest's RSP actually was.
+
+**The protection still declines**, at the same RVA (`0x537099c`):
+
+```
+[entry-invalid] bytes=ea e9 6b e6 14 48 89 7c 24 10 55 48 8b ec 48 83
+[ud-decrypt] EC handler declined: BYTES UNCHANGED
+```
+
+Hypothesis falsified: exception delivery was not why the protector declines. That is a
+clean negative and it removes the whole delivery thread from the search.
+
+### Two corrections to earlier readings of this log
+
+- **The Steam logon gap is not a regression.** It is 151 seconds in all three builds:
+
+  ```
+  L9 (ml1302): 19:54:41 -> 19:57:12 = 151s
+  M3 (ml1303): 20:10:33 -> 20:13:04 = 151s
+  P6 (ml1304): 20:54:39 -> 20:57:10 = 151s
+  ```
+
+  An earlier note in this session claimed the first run did this in 7 seconds; that
+  compared `load-client-error` to `probe-result`, a window that starts *after* the
+  logon. The 151 seconds is constant and predates every Madeira change in this session.
+- **The game's load base varies.** This run it loaded at its preferred base
+  `0x140000000` (`forzahorizon6.exe+0x537099c`); earlier runs had it relocated to
+  `0x7076280000` (`+0x537099c`). Same RVA, same ciphertext, so the base is not the
+  variable that decides decryption.
+
+### The export gate is confirmed satisfied, not merely assumed
+
+The VEH's check is FNV-1a over lowercased export names with 32-bit constants (see the
+section above). Hashing every export name of every bundled DLL -- 182,299 names -- and
+also the obvious module names (`kernel32.dll`, `ntdll.dll`, ...) against all three
+constants it carries yields **no match**. Whatever the remaining two constants target,
+it is not a name we currently export, so hiding the 19 visible `__wine_*` names cannot
+change this decision.
+
+### Where this leaves the investigation
+
+Both of the session's leading hypotheses are now falsified: the export-name gate is
+satisfied, and exception delivery is correct. The protector declines to decrypt for a
+reason not yet identified, and nothing about the dock, the loader, FEX dispatch, the
+JIT pool, thread setup, or exception delivery is implicated any more. Finding it means
+working backwards through the protector's own initialisation, which is open-ended.
