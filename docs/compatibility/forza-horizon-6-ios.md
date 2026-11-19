@@ -2026,3 +2026,61 @@ it. (The `rev=` tag is stale at `ml1272` and should be bumped; the timestamp is 
 
 Component `FH6-iOS-1.4-fex-fex` is now `ml1297`, versionCode 42, `sha256 d97aa74f…`, enabled,
 and its file carries `area-state`, `dispatcher-patch`, `init-post-crt` and `build-id`.
+## First honest measurement (ml1299): SpillStaticRegs is NOT broken
+
+The 18 Nov 19:25 run is the first one whose artifact was verified on device:
+`[build-id] xtajit64 rev=ml1272 compiled Nov 17 2026 23:17:46` matches the pushed
+`d97aa74f`. What it printed:
+
+```
+[area-state] init-enter   tid=0x38 area=0x10d010000 ED0=0x0        ED1=0x0 ED2=0x0
+[area-state] init-post-crt tid=0x38 area=0x10d010000 ED0=0x0        ED1=0x0 ED2=0x0
+[area-state] init-set     tid=0x38 area=0x10d010000 ED0=0x7c00801140 ED1=0x0 ED2=0x0
+[dispatcher-patch] enterEC=0x126044108 scan-bytes=8192 patched=0 already_ok=17
+```
+
+**`patched=0 already_ok=17`.** The dispatcher holds 17 `SpillStaticRegs` sites and every one
+of them already emits the correct `stp`. Nothing was patched, so nothing was broken. Guest RSP
+*is* spilled. The theory that has driven this investigation since ml1288 — "FEX emits 7 stale
+`madd` where 7 `stp` should be, so `gregs[REG_RSP]` is never spilled" — is **refuted**.
+
+Consequences:
+
+* The ~200-line patcher in `Module.cpp` has never fired on any verified build. It is dead
+  code that scans 8 KB at every `ThreadInit`, and it has repeatedly supplied a false
+  explanation for a real crash. It should be reduced to a reporter (log the counts, never
+  write), or removed.
+* `x23 == rax == 0x400007` in the ml1296 notes is *not* evidence of a skipped spill. RSP being
+  zero has another cause.
+
+### What the crash actually looks like
+
+`ThreadInit` runs cleanly for `dockhost.exe` (tid `0x38`), publishes a valid frame
+(`ED0=0x7c00801140`), and **no failure path runs** — there is no `fail-nostate`, no
+`fail-callret`, no "thread state unavailable". So nothing in `ThreadInit` cleared the frame.
+
+The guest state at the fault is nevertheless empty:
+
+```
+[x86_live] RAX=0x157566000 RCX=0x10ac30000 ... RSP=0x0
+[x86_live] State.RIP=0x0 callret_sp=0x7c01001000
+[x86_stk]  live_rsp=0x0 out of range — RSP not yet established
+```
+
+`callret_sp` is valid, so the frame itself is sound — `RIP` and `RSP` inside it were simply
+never populated. Order of events:
+
+1. `BUS #1: pc=0x157975d74 addr=0x0 insn=0xf90003e0` — a **write to address 0**, inside
+   `libarm64ecfex.dll` (pool pc maps to PE `0x71fce79d74`), *before* any x86 code executes.
+2. `SEGV #1: pc=0x10f35d64c addr=0xfffffffffffffc70` — the known `0-0x390` stack store.
+3. `SEGV #2: pc=0x0 addr=0x0`, then `setup_exception: virtual_handle_fault failed`.
+
+Also decisive, by absence: **`[jit-gate]` never printed.** `enter_jit` publishes its route
+before doing anything else, so the crashing entry did *not* come through `enter_jit`. The
+`x9`/`ios_ec_entry` dispatch route that the ml1288 notes blamed is therefore not the path
+being taken.
+
+So the open question is now narrow and testable: an ARM64EC → x64 dispatch arrives with a null
+target and a null stack. The next instrumentation belongs at the EC dispatch entry — log the
+target the native code requested, the code-map result, and the RIP/RSP FEX derived from it —
+and it must print *before* `enter_jit`, since that is not where this arrives.
