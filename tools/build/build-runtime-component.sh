@@ -29,7 +29,21 @@ case "${1:-}" in
 esac
 case "${1:-}" in
   dock) bash "$ROOT/build/madeira-dock/build.sh" --check ;;
-  windows) bash "$ROOT/build/windows-runtime/build.sh" ;;
+  windows) bash "$ROOT/build/windows-runtime/build.sh"
+           # Forza Horizon 6 hashes export names looking for Wine-only ones
+           # (wine_get_unix_file_name), and finding them makes it skip decrypt
+           # setup. The rename must happen HERE, before runtime-components
+           # snapshots hashes: package-ipa.sh used to apply it afterwards, so
+           # every rebuilt component failed verification with a checksum
+           # mismatch against bytes that had never shipped. Doing it in the
+           # component build keeps the manifest describing the shipped bytes,
+           # and leaves package-ipa's pass as a no-op.
+           python3 "$ROOT/tools/wcp/hide-wine-exports.py" \
+               "$ROOT/app/Madeira/arm64ec-windows/"*.dll \
+               "$ROOT/app/Madeira/aarch64-windows/"*.dll \
+               "$ROOT/app/Madeira/i386-windows/ntdll.dll" \
+               "$ROOT/app/Madeira/i386-windows/kernel32.dll" \
+               "$ROOT/app/Madeira/i386-windows/shell32.dll" >/dev/null ;;
   moltenvk|zink|kosmickrisp) bash "$ROOT/tools/build/prepare-graphics.sh" "$1" ;;
   mesa-d3d12) bash "$ROOT/build/mesa-d3d12/build.sh" ;;
   vulkan-pe)
