@@ -2349,3 +2349,47 @@ Wine-identifying exports were still visible to the guest. If the gate is export-
 hashing, then a faithful Windows ABI surface — hiding names Windows does not have —
 is what lets the protection take its normal path, and it needs no app rebuild: those
 are PE exports in the pushed DLLs.
+## The export-name check, recovered exactly (and closed)
+
+`tools/wcp/hide-wine-exports.py` described the check as "FNV-1a's every loaded
+module's export names and looks for `0xb2dc38a8e4baecd`". The first half is right and
+the constant is real, but the function is not standard FNV-1a 64: FNV-1a 64 of
+`wine_get_unix_file_name` is `0x1bdc07c70c6e46ad`, not that constant. Anyone trying to
+re-derive the check from that description will conclude the premise is wrong.
+
+It is an FNV-1a with **32-bit constants in a 64-bit accumulator**, over the
+**lowercased** name, stopping at NUL or non-ASCII:
+
+```
+mov    r13d, 0x811c9dc5
+loop:
+  movsx  edi, byte [rbx]        ; inc rbx
+  cmp    dil, 0x7f ; ja  bail    ; non-ASCII ends the string
+  test   dil, dil  ; je  end     ; NUL ends it
+  or     edx, 0x20               ; A-Z -> a-z, other bytes unchanged
+  xor    rdx, rsi
+  imul   rsi, rdx, 0x01000193    ; h = (h ^ c) * 0x01000193
+  cmp    rsi, r14
+```
+
+at RVA `0x53e30a2`..`0x53e3142`, inside the VEH at `0x53D9270`. With that function
+`wine_get_unix_file_name` hashes to `0xb2dc38a8e4baecd` exactly, so the rename to
+`xine_get_unix_file_name` (hash `0x6a3373b64979fc54`) does defeat this check -- and the
+run agrees: `unix-hits=0`.
+
+### Nothing left to hide
+
+Two more 60-bit constants sit in the same function with the same shape
+(`0x0103832b93855b60` at RVA `0x53E0E66`, `0x0ed0cce49a3270ac` at RVA `0x53E1885`), so
+the check exists in three copies. Hashing **every export name of every bundled DLL**
+(182,299 names across `arm64ec-windows`, `aarch64-windows`, `i386-windows`,
+`syswow64`) against all three constants yields **no match at all** -- including no
+match for `wine_get_unix_file_name`, which we had already renamed.
+
+So the export-name gate is satisfied, and the `other-wine=19` count in the log is our
+own census, not a list the protection compares against. Hiding the remaining 19 names
+would have bought nothing; `wine_get_version` correctly stays because FEX resolves it.
+
+Note for the next rebuild: `build/wine-pe/build-ntdll.sh` produces an **unrenamed**
+ntdll, and the rename is applied afterwards by `tools/build/package-ipa.sh`. Shipping a
+rebuilt ntdll without re-running `hide-wine-exports.py` silently restores the trigger.
