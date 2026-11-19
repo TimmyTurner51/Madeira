@@ -2084,3 +2084,53 @@ So the open question is now narrow and testable: an ARM64EC → x64 dispatch arr
 target and a null stack. The next instrumentation belongs at the EC dispatch entry — log the
 target the native code requested, the code-map result, and the RIP/RSP FEX derived from it —
 and it must print *before* `enter_jit`, since that is not where this arrives.
+## ml1301: the gate faulted on alignment, not a null address
+
+`ml1300` made the `enter_jit` gate test SP before spilling. It still printed no `[jit-gate]`,
+and the fault moved from `enter_jit+0x4` to `enter_jit+0x34`. That offset is only reachable
+through the `b.hs` taken when SP *passes* the 0x1000 test, which forced a re-read of the
+exception rather than another theory:
+
+```
+BUS #1: pc=0x14e179da4 addr=0x0 ... insn=0xf90003e0 si_code=1
+```
+
+**`si_code=1` is `BUS_ADRALN`, not an address fault.** The `addr=0x0` is the handler's
+placeholder, and equal to the immediate in `str x0, [sp]` — the same coincidence that
+misleadingly "confirmed" a null SP in ml1296. Disassembling the loaded build settled it:
+
+```
+002a: 180119da0: d10103ff   sub  sp, sp, #0x40     <- the b.hs target (SP passed 0x1000)
+002b: 180119da4: f90003e0   str  x0, [sp]          <- FLT, BUS_ADRALN
+```
+
+So SP is a **real stack that is only 4-byte aligned**. A 32-bit x86 caller can legitimately
+hand us `sp ≡ 4 (mod 8)`, and ARM64 stores require natural alignment. ml1231 already fixed one
+alignment fault here (16-byte `stp`), and this is the same defect one class down: any spill
+through SP faults regardless of the address, which also means the gate could *never* have
+reported — it always wrote through SP before writing the tag.
+
+### Why the fix is to not use the stack at all
+
+Guarding on the SP *value* cannot help: the address is fine, the alignment is not, and testing
+alignment would only let the gate tag the failure without ever reporting the route. So the gate
+now saves `x0-x5` and the incoming SP to a static slot (`IosJitGateSave`) and restores from
+there — no stack use, no alignment requirement, report in every case. Verified in the linked
+image: `enter_jit` contains no SP-relative store.
+
+Single-slot, so a concurrent second entry could lose a saved value. That only affects the
+diagnostic's `x0-x5` payload, never the process, and is preferable to never reporting.
+
+### Verification must use `rev=`, not only the timestamp
+
+`build-id`'s timestamp is `__DATE__`/`__TIME__` of **`Module.cpp`**. A `Module.S`-only change
+does not touch it, so the `Nov 17 23:17:46` string persisted across a real rebuild and made a
+correctly-deployed binary look stale. `MADEIRA_REV` is now bumped per deploy and must be read
+alongside the timestamp: `ml1301 compiled Nov 18 2026 19:37:48`.
+
+### Where this leaves the dock crash
+
+The `enter_jit` gate is no longer part of the crash. ml1301 should print a route tag, and the
+first `blr x16` into `enter_jit` from `ntdll.dll+0x81f5c` is the transition to watch. If the tag
+arrives with SP at 4 mod 8, the defect is an x86 → ARM64EC entry that does not realign the
+stack, and the fix belongs where that ABI boundary is crossed — not in the JIT.
