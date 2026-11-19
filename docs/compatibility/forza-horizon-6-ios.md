@@ -2134,3 +2134,49 @@ The `enter_jit` gate is no longer part of the crash. ml1301 should print a route
 first `blr x16` into `enter_jit` from `ntdll.dll+0x81f5c` is the transition to watch. If the tag
 arrives with SP at 4 mod 8, the defect is an x86 → ARM64EC entry that does not realign the
 stack, and the fix belongs where that ABI boundary is crossed — not in the JIT.
+## The dock crash is fixed (ml1301), and it was the gate all along
+
+The ml1301 run is the first with a working `enter_jit` gate, and it settles the whole thread:
+
+```
+[build-id] xtajit64 rev=ml1301 compiled Nov 18 2026 19:37:48
+[jit-gate] 0                     (x295,583)
+BUS faults: none
+```
+
+* **No BUS/SEGV at all.** The crash that has blocked the dock since ml1288 does not occur.
+* The screen advanced from `Still starting Madeira Dock…` to **`Loading Steam...`**, with
+  `dockhost.exe` setting its own unhandled-exception filter (`[uef] ml1255 set #1`).
+
+What the faulting instruction actually was:
+
+```
+180119d6c: str x30, [sp, #-0x8]!    <- the push every dispatch path does
+180119d70: enter_jit:
+180119d70: sub sp, sp, #0x40        <- the gate's frame
+180119d74: str x0, [sp]             <- FLT: BUS_ADRALN when SP is 4-byte aligned
+```
+
+The `enter_jit` *gate itself* was the crash. It spilled `x0-x5` through SP before writing its
+tag, so whenever the dispatch handed it a 4-byte-aligned SP -- which a 32-bit caller can
+legitimately do -- the spill faulted, the tag was never written, no `[jit-gate]` line appeared,
+and the downstream `0-0x390` store, `pc=0x0`, and the repeating `0xffffffffffffff50` loop all
+followed from that first fault. ml1231 fixed the 16-byte `stp` variant of this; the 8-byte
+`str` variant survived until ml1301 removed the stack dependency entirely.
+
+So the entire `SpillStaticRegs` / `gregs[RSP]=0` line of reasoning -- ml1288 through ml1299 --
+was chasing damage produced by the diagnostic itself. `patched=0 already_ok=17` was the real
+answer all along: the emitter was always correct.
+
+### ml1302: the gate now reports once
+
+295,583 `write(2)` calls in four minutes, and 5.9 MB of log. A syscall in the path of every JIT
+entry can turn a slow load into a stalled one, so the gate reports the first entry and then
+costs three instructions. `x9` (the target the dispatcher asked for) is recorded too.
+
+### Current frontier: `Loading Steam...`
+
+`Steam` is where it stops now. Mapped and running at that point: `steamclient64.dll`,
+`tier0_s64.dll`, and an `IPC:CSteamEngine` thread. The engine thread samples at 0% CPU in a
+wait state, and `enter_jit` stops being entered, so the next investigation is what that thread
+is waiting on -- not FEX, and not the dock.
