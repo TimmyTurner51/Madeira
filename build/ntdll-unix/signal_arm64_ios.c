@@ -9958,6 +9958,41 @@ static int ios_mach_deliver_guest_exception_inner( thread_t thread, arm_thread_s
     {
         uint64_t cand[2] = { state->__x[18], (uint64_t)thread_teb };
         uint64_t sp = arm_thread_state64_get_sp( *state );
+        uint64_t native_sp = sp;
+        /* MADEIRA ml1304: FOR EMULATED x86 CODE THE NATIVE SP IS NOT THE GUEST SP.
+         *
+         * This test was written for faults in NATIVE code, where the ARM64 SP is
+         * the thread's stack and containment decides which TEB is ours. When the
+         * fault comes from FEX's translated x86 instead, the ARM64 SP is the JIT's
+         * own stack, and FEX keeps the guest's RSP in its CpuStateFrame (x28: +0x18
+         * RIP, +0x40 RSP -- the same fields [rsp-trunc] and [guest-state] read).
+         *
+         * FH6 faults exactly that way: guest rsp 0x7081e3fe08 sat inside the TEB
+         * stack while the native sp read 0x71f29f0000, which is the LOAD BASE of
+         * kernelbase.dll -- in the previous session it was 0x71f29b0000, also
+         * kernelbase's base there. So every containment test failed, the delivery
+         * degraded to "best-effort", and the frame was placed at a module base. The
+         * protection's own handler then ran with a CONTEXT whose Rsp was a module
+         * base instead of the guest's stack, and declined.
+         *
+         * Adopt the guest RSP when the native one is implausible and the guest's is
+         * inside this thread's stack. Safe because the delivery below overwrites SP
+         * with the exception frame regardless (SP_sig(&uc) = frame_addr), so this
+         * value only feeds frame placement and the handler's CONTEXT.Rsp -- exactly
+         * the two things that were wrong. */
+        uint64_t guest_rsp = 0;
+        {
+            uint64_t frame28 = state->__x[28], grip = 0, grsp = 0;
+            mach_vm_size_t g = 0;
+            if (frame28 > 0x10000 && frame28 < 0x800000000000ull
+                && mach_vm_read_overwrite( mach_task_self(),
+                        (mach_vm_address_t)(frame28 + 0x18), 8,
+                        (mach_vm_address_t)&grip, &g ) == KERN_SUCCESS && g == 8 && grip
+                && mach_vm_read_overwrite( mach_task_self(),
+                        (mach_vm_address_t)(frame28 + 0x40), 8,
+                        (mach_vm_address_t)&grsp, &g ) == KERN_SUCCESS && g == 8 && grsp > 0x10000)
+                guest_rsp = grsp;
+        }
         int i;
 
         for (i = 0; i < 2; i++)
@@ -9982,6 +10017,21 @@ static int ios_mach_deliver_guest_exception_inner( thread_t thread, arm_thread_s
             if (sp > dealloc && sp <= base)
             {
                 teb = (TEB *)(uintptr_t)cand[i];
+                break;
+            }
+            if (guest_rsp && guest_rsp > dealloc && guest_rsp <= base)
+            {
+                state->__sp = guest_rsp;
+                sp = guest_rsp;
+                teb = (TEB *)(uintptr_t)cand[i];
+                if (deliver_logs < 24)
+                {
+                    deliver_logs++;
+                    dprintf( 2, "[mach-deliver] rev=ml1304 adopted guest rsp=0x%llx "
+                                 "(native sp=0x%llx is outside this stack) teb=0x%llx\n",
+                             (unsigned long long)guest_rsp, (unsigned long long)native_sp,
+                             (unsigned long long)cand[i] );
+                }
                 break;
             }
             if (deliver_logs < 24)

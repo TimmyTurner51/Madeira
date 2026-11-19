@@ -2295,3 +2295,57 @@ rather than a bug to engineer around.
 
 Everything Madeira owns in this path now works: dock, service manager, Steam launch, PE loader,
 ARM64EC emulation, and the pool. What remains is outside the emulator.
+## The delivery bug behind "best-effort": native SP is not the guest SP (ml1304)
+
+`[mach-deliver]` picks the faulting thread's TEB by testing whether the faulting SP
+lies inside that TEB's stack. That test was written for faults in **native** code,
+where the ARM64 SP is the thread's stack. FH6's fault comes from FEX's translated
+x86, where the ARM64 SP is the **JIT's** stack; FEX keeps the guest's RSP in its
+CpuStateFrame (x28: `+0x18` RIP, `+0x40` RSP — what `[rsp-trunc]` already reads).
+
+The two are wildly different, and the native one is not even plausible:
+
+```
+[rsp-trunc]    guest_rip=0x707b5f099c  rsp=0x7081e3fe08   <- inside the TEB stack
+[guest-state]  rsp=0x7081e3fe08 rbp=0x7081e3fe60
+[mach-deliver] sp=0x71f29f0000                            <- native, outside it
+```
+
+`0x71f29f0000` is the **load base of `kernelbase.dll`** in that session
+(`[jit-pool] image 0x71f29f0000+0x2f0000 (kernelbase.dll)`). In the previous session
+the same field read `0x71f29b0000`, which was kernelbase's base *there*. A module
+base, not a stack: so no containment test could ever pass.
+
+Consequences were all in the delivery, not in emulation:
+
+- the TEB was chosen by the ml378 "best-effort" path instead of by containment;
+- the frame was placed at `SP_sig(&uc) & ~15`, i.e. at a module base;
+- `save_context` wrote that value into `CONTEXT.Sp`, so **the game's own handler ran
+  with `Rsp` = a module base** rather than the guest's stack, then declined.
+
+ml1304 reads the guest RSP out of the CpuStateFrame and adopts it when the native SP
+is outside the thread's stack and the guest's is inside it. This is safe because the
+delivery overwrites SP with the exception frame regardless (`SP_sig(&uc) = frame_addr`),
+so the value only feeds frame placement and the handler's `CONTEXT.Rsp` — precisely
+the two things that were wrong.
+
+## The cheaper lever this turned up: export-name hashing
+
+`tools/build/package-ipa.sh` already carries the note that settles the shape of this
+bug:
+
+> FH6 hashes kernel32 export names for `wine_get_unix_file_name`. Windows does not
+> export it; leaving the Wine name makes the game **skip decrypt VEH setup**.
+
+The run reports the same thing from the other side:
+
+```
+[wine-export] ... census via=empty-veh mods=85 unix-hits=0 other-wine=19
+[wine-export] ... census via=ntdll-data-exec ... other-wine=19
+```
+
+`via=empty-veh` is the census firing with **no decrypt VEH installed**, and 19
+Wine-identifying exports were still visible to the guest. If the gate is export-name
+hashing, then a faithful Windows ABI surface — hiding names Windows does not have —
+is what lets the protection take its normal path, and it needs no app rebuild: those
+are PE exports in the pushed DLLs.
