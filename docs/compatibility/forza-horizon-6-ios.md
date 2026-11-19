@@ -1980,3 +1980,49 @@ first one whose silence actually means ThreadInit was not entered.
   `git add -A` from entering the repo.
 * `FEX/build-arm64ec.old.40099` removed. A `find` for `libarm64ecfex.dll` matched it before
   the live build directory, which is how a stale hash can be "verified" by accident.
+## Cleanroom audit (ml1298): the component FEX has been overriding the bundle
+
+The bundle was never the emulator the device ran. An **enabled FEX component** is installed in
+LiveContainer:
+
+```
+Components/FH6-iOS-1.4-fex-fex   name=ml1289  versionCode=41  enabled=true
+  layout: ${system32}/xtajit64.dll <- files/lib/wine/aarch64-windows/libarm64ecfex.dll
+```
+
+`madeira_wcp_apply` links that file over `${system32}/xtajit64.dll` *after* the bundle's own
+pass, replacing it — `push-fex-to-device.sh` documents this explicitly. The session log
+confirms it fires: `[wcp] 2 enabled package(s): 8 links, 0 failed` (1 FEX link + 7 wine links).
+
+That component held `cc91eff8`, a **14 Nov** build whose `strings` contain none of
+`area-state`, `dispatcher-patch`, or `init-post-crt`. So:
+
+* Every `[area-state]` / `[dispatcher-patch]` absence is explained twice over — the component
+  FEX predates the instrumentation entirely, and the bundle copy that did contain it was never
+  loaded.
+* **The `ml1292`/`ml1293` bisect is invalid.** Stock `b29` and HEAD both reported the same
+  `dockhost` fault because both runs executed the same `cc91eff8` component module. That
+  "proves" nothing about a regression; it only proves the component was installed. Any FEX-side
+  change landed after 14 Nov never ran on device.
+* Pushing `xtajit64.dll` into the bundle directory — which is what earlier verification did,
+  hashing the bundle path and reading "verified" — leaves the loaded emulator unchanged.
+
+Always push FEX through the component (`tools/wcp/push-fex-to-device.sh`), which now writes all
+five bundle copies *and* the component entry. It is the component that decides.
+
+### Verifying which module actually loaded
+
+`Module.cpp:1140` emits, through `EFmt`:
+
+```
+[build-id] xtajit64 rev=ml1272 compiled Nov 17 2026 23:17:46
+```
+
+The `compiled` timestamp is unique per build and is the only trustworthy answer. If it does not
+match the build just pushed, nothing in that DLL ran and the run's crash is not evidence about
+it. (The `rev=` tag is stale at `ml1272` and should be bumped; the timestamp is what matters.)
+
+### State after ml1297
+
+Component `FH6-iOS-1.4-fex-fex` is now `ml1297`, versionCode 42, `sha256 d97aa74f…`, enabled,
+and its file carries `area-state`, `dispatcher-patch`, `init-post-crt` and `build-id`.
