@@ -428,6 +428,58 @@ half at app start (16:53:49) while `installInboxAtLaunch` only imports it afterw
 **older** one is installed, so the new one must be pushed *and* the old disabled in
 `Components/state.json` — otherwise the fix never runs and reads as "no effect".
 
+### 4j. MEASURED — the fault is ELIMINATED by honouring guest PROT_EXEC on anon RWX
+
+**First, the address was never written.** `MADEIRA_PROBE_RVA=0x537099c` samples 8 bytes
+at `view->base+RVA` on every protect that covers it:
+
+```
+[rva-probe] #1 new_prot=0x4  (PAGE_READWRITE)    bytes: ea e9 6b e6 14 48 89 7c
+[rva-probe] #2 new_prot=0x20 (PAGE_EXECUTE_READ) bytes: ea e9 6b e6 14 48 89 7c
+```
+
+The writable window opened and closed and the stub was **unchanged**, so the protector
+makes `.text` writable and then does not write this function. That is the answer to
+"does the protector ever write the page containing `image+0x537099c`": it protects it,
+it never writes it.
+
+**Second, the same run found the actual defect.** With `MADEIRA_GUEST_RWX_EXEC=1`:
+
+```
+[exec-alloc]  NtAllocateVirtualMemory #4 req_addr=0x17a823000 size=0x1001000 protect=0x40
+[guest-rwx]   HONOURING guest EXEC
+mprotect_exec(0x17a820000, 0x1004000, rwx)
+iOS mprotect(rwx) appeared to succeed but EXEC not actually granted (qkr=0 prot=0x3);
+  falling through to JIT-pool path
+[jit-copy] #5 PRE-REMAP 0x17a820000+0x1004000: 0/16793600 bytes nonzero
+[jit-copy] #5 POST-REMAP rx=... rw=... pre=... => PRESERVED
+iOS JIT: anon RWX 0x17a820000+0x1004000 → pool off=0x21214000 (rx=0x13ab60000 rw=0x7021214000)
+Add SMC interval: 17A820000 - 17B824000
+[stp-emul] #1..#8 ... stores redirected into the pool RW alias
+```
+
+Dropping `PROT_EXEC` (the ml1030 behaviour) sent the protector's
+`VirtualAlloc(PAGE_EXECUTE_READWRITE)` arena to **plain, incoherent `rw-` anonymous
+memory**. Honouring it falls through to the JIT-pool path, which **dual-maps the arena
+(`rx`+`rw`), keeps contents across the remap, and makes its stores SMC-coherent**. The
+ml1030 strip is right for image pages and wrong for anonymous RWX, which is precisely
+where a JIT or protector needs coherence.
+
+**Result, measured on device 2026-11-21:** `Invalid instruction in entry block` and
+`Unhandled illegal instruction` both **0 for the whole run**, no `fault_rip` whose RIP
+ends in `099c`, and the process runs **290 s+** where every previous run died at ~6 s.
+The protection crash is gone.
+
+**What is left is a different problem:** the process is alive but idle (`[freeze] alive
+t+272s ... threads=52`, `0 wakes/s`, `[rip-profile] no guest threads found`) and no game
+window ever appears — the UI returns to the library after "Waiting for its window…".
+Also a cost: the 16 MB arena is now a 16 MB pool copy and
+`[jit-pool] anon RWX ... used=0x22218000/0x26000000` is **~94% of the pool**, so pool
+exhaustion is the risk this trades against.
+
+`MADEIRA_GUEST_RWX_EXEC` is **default off**; the shipped behaviour is unchanged until
+this is validated across other titles.
+
 ### 4e. Scope note
 
 Per the objective's boundary: this is a memory-layout / loader-fidelity question
