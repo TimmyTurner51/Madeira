@@ -22,6 +22,37 @@ export PATH="$HOME/bin:$PATH"
 
 TARGET_ID="com.willfaust.madeora"
 ROW=120   # max px between a name line and its Run button
+# The phone this project drives. usbmux lists every iPhone on the cable, including
+# other people's, so a bare "a device is connected" test is not enough: addressed by
+# UDID, every iosdev call below either reaches THIS phone or fails.
+DEVID="${IOSDEV_UDID:-00008150-001564AE3407801C}"
+
+# A preflight that costs a second and prevents the failure mode that made this script
+# necessary: with the target phone off the cable, `iosdev launch` and `iosdev see` fail
+# silently, every check below passes vacuously, and a caller that then taps a
+# remembered coordinate acts on whatever is on screen -- which opened an unrelated app
+# on 2026-11-21. Refuse up front, and name the phones that ARE connected so the wrong
+# cable is obvious.
+preflight() {
+    local json
+    json="$("${IOSDEV_PMD3:-$HOME/.local/bin/pymobiledevice3}" usbmux list 2>/dev/null)"
+    if [ -z "$json" ] || [ "$json" = "[]" ]; then
+        echo "ABORT: no iPhone is connected over USB (usbmux list is empty)." >&2
+        exit 2
+    fi
+    if ! printf '%s' "$json" | grep -q "$DEVID"; then
+        echo "ABORT: the phone this project drives ($DEVID) is not on the cable." >&2
+        echo "  Connected instead: $(printf '%s' "$json" | grep -o '"UniqueDeviceID": "[^"]*"' | cut -d'"' -f4 | tr '\n' ' ')" >&2
+        exit 2
+    fi
+    # A live tunnel is what iosdev actually needs; usbmux alone does not imply it.
+    if ! iosdev see >/dev/null 2>&1; then
+        echo "ABORT: $DEVID is on the cable but its RSD tunnel is not answering." >&2
+        echo "  Unlock the phone and try again." >&2
+        exit 2
+    fi
+}
+preflight
 
 # Shared start/stop for LiveContainer. Defines LC_BUNDLE's helpers, which is why the
 # list is opened through open_livecontainer_list below rather than a bare launch.
