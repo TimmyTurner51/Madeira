@@ -374,6 +374,60 @@ arena, then enters a stub that was never written. Whether it *intended* to write
 that stub (and the write went somewhere ineffective) or never reached the write
 is the next question, and one probe answers it.
 
+### 4i. MEASURED — the `.text` sync hypothesis is REJECTED, and two deploy traps
+
+The suppressed traces were turned back on for one run by shipping a FEX component with
+`WINEDEBUG=err+virtual` (the app's default is `err+all,err-virtual`, which is why every
+`virtual_ios.c` `ERR()` was invisible; component environment is applied *after* the
+default, at `WineProcessBridge.m:2485`). Control: `iOS JIT: copied image` went from 0 to
+221 hits. Then:
+
+```
+00e4 NtProtectVirtualMemory(orig=0x16bc41000 sz=0x639ae00 prot=0x4)
+[prot-img] #45 tid=00e4 ... section #0 '.text' chars 0x60000020 (R-X CODE) new_prot=0x4 old=0x20
+[...]
+#46 .rdata -> RW, "re-applied 1209291 DIR64 fixups"
+#47 .data  -> RW, "re-applied 161049 DIR64 fixups"
+#48 .pdata -> RW
+```
+
+That sweep is the **loader's relocation pass**, not the protector: the image is rebased
+`0x140000000 -> 0x16bc40000` and 1,370,340 of the 1,370,862 DIR64 entries are applied
+here. So `.text` becoming writable is **not** evidence of a decrypt.
+
+The `.text` sync really was dropping the code bytes (`skipping text [0x0-0x639ace3]`,
+i.e. the whole region, copying nothing). A fix was implemented and **measured as a
+non-fix**: with `.text` copied into the pool (`text INCLUDED`, 4 hits), the fault was
+byte-identical.
+
+**Why it cannot work, and this is the useful part:** for a *pure x64 guest image* FEX
+reads the x86 bytes from the **backing**, not from the pool. The pool copy exists so
+ARM64EC/ARM64 code in an image is host-executable; x86 is data to FEX. Confirmed by the
+RIP staying a PE VA (`State.RIP=0x170fb099c`) while `[pool-rip-fix]` only ever redirects
+*module* pool-copy aliases. Copying `.text` into the pool is therefore off the execution
+path — and costs a 99 MB memcpy per protect call. **Reverted.**
+
+What the run did surface is a new, concrete lead, one line before the fault:
+
+```
+[exec-alloc] NtAllocateVirtualMemory #4 req_addr=0x178003000 size=0x1001000 protect=0x40
+[guest-rwx] #1 0x178000000+0x1004000 prot=rwx — anonymous guest memory, EXEC is FEX
+             bookkeeping; applying rw- instead
+D E4 Add SMC interval: 178000000 - 179004000
+E E4 Invalid instruction in entry block: 170FB099C
+```
+
+The protector asks for `PAGE_EXECUTE_READWRITE` and **we silently return non-executable
+memory**. That is a real protection-fidelity deviation, it is on the faulting thread, and
+it is immediately followed by an SMC interval and the fault.
+
+**Two deploy traps, both hit, both worth remembering.** (1) A newly pushed UnixHalf
+component does **not** take effect on the launch that installs it: `UnixHalf` loads the
+half at app start (16:53:49) while `installInboxAtLaunch` only imports it afterwards
+(16:53:52). One extra launch is required. (2) With two UnixHalf components enabled, the
+**older** one is installed, so the new one must be pushed *and* the old disabled in
+`Components/state.json` — otherwise the fix never runs and reads as "no effect".
+
 ### 4e. Scope note
 
 Per the objective's boundary: this is a memory-layout / loader-fidelity question
