@@ -5154,22 +5154,46 @@ static void *ios_mach_exception_thread( void *arg )
                         noalias_n++;
                         mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)fault_pc, 4,
                                                (mach_vm_address_t)&ninsn, &ngot);
-                        if (mach_vm_region(mach_task_self(), &na, &ns, VM_REGION_BASIC_INFO_64,
-                                           (vm_region_info_t)&ni, &nc, &no) == KERN_SUCCESS)
+                        /* ml2026: mach_vm_region answers with the region at OR AFTER the
+                         * address, so an UNMAPPED fault_addr returns the NEXT region -- and
+                         * the verdict below used to describe that innocent region as the
+                         * faulting page. Measured 2026-11-21 (fh6): an EXC_BAD_INSTRUCTION
+                         * executing the emulator's HLT stub reported addr=insn=0xd4400000
+                         * and this printed "region 0x1026d0000+0xc000 prot=5 ... prot
+                         * without W = exec-downgraded page that never got dual-mapped",
+                         * about a page 400MB away that had nothing to do with the fault.
+                         * It read as a wild store on a page that lost W, which is a
+                         * different bug with a different fix, so it sent a whole session
+                         * after a memory fault that does not exist.
+                         *
+                         * Require the region to actually cover the address, and name the
+                         * case where FAR is not an address: for an instruction-class fault
+                         * the architecture leaves FAR UNKNOWN, and here it held the
+                         * instruction word itself. */
+                        kern_return_t nkr = mach_vm_region(mach_task_self(), &na, &ns,
+                                                          VM_REGION_BASIC_INFO_64,
+                                                          (vm_region_info_t)&ni, &nc, &no);
+                        int ncovers = (nkr == KERN_SUCCESS) && (na <= (mach_vm_address_t)fault_addr);
+                        const char *nfar_echo = ((uint64_t)ninsn == (uint64_t)fault_addr)
+                            ? " | addr EQUALS the instruction word: FAR holds no address, so this is an "
+                              "instruction-class fault, NOT a store -- do not chase the address"
+                            : "";
+                        if (ncovers)
                             dprintf(STDERR_FILENO,
                                 "[store-noalias] #%d rev=ml348 addr=0x%llx insn=0x%08x pc=0x%llx "
                                 "NO pool/anon alias | region 0x%llx+0x%llx prot=%d max=%d "
-                                "(prot without W = exec-downgraded page that never got dual-mapped)\n",
+                                "(prot without W = exec-downgraded page that never got dual-mapped)%s\n",
                                 noalias_n, (unsigned long long)fault_addr, ninsn,
                                 (unsigned long long)fault_pc,
                                 (unsigned long long)na, (unsigned long long)ns,
-                                ni.protection, ni.max_protection);
+                                ni.protection, ni.max_protection, nfar_echo);
                         else
                             dprintf(STDERR_FILENO,
                                 "[store-noalias] #%d rev=ml348 addr=0x%llx insn=0x%08x pc=0x%llx "
-                                "NO alias and NO region (unmapped) — genuine bad pointer\n",
+                                "NO alias and NO region (unmapped; next region 0x%llx is not this page)%s\n",
                                 noalias_n, (unsigned long long)fault_addr, ninsn,
-                                (unsigned long long)fault_pc);
+                                (unsigned long long)fault_pc,
+                                (unsigned long long)na, nfar_echo);
                     }
                 }
                 /* FEX's exception handler completes some guest accesses itself
