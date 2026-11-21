@@ -18,13 +18,24 @@ import Foundation
 /// Two things are established here and one is still being measured:
 ///
 ///   * where a component's library lives (`Documents/Components/<id>/files/`), and
-///   * whether dyld will map it at all under LiveContainer, whose re-sign at install gives
-///     the app an identifier and team the Mac cannot reproduce. A replacement of the app's
-///     own dylib is rejected outright; loading a new library is a different dyld path and
-///     the answer is printed, not assumed.
+///   * whether dyld will map it at all under LiveContainer. It will, but only when the
+///     library is signed with the DEVELOPMENT identity: LiveContainer re-signs the guest
+///     bundle with this project's own team (4CDWTGR84Z), so a library signed with the same
+///     certificate passes. Ad-hoc has no team and is refused with "code signature
+///     invalid"; unsigned is refused with "missing code signature". The entitlements
+///     plist is not part of this answer -- the installed guest binary is flags=0x0(none),
+///     so a macOS-only entitlement like disable-library-validation never reaches the
+///     device at all.
 ///
-/// Until a component ships a real half, the linked archive stays the fallback and this is a
-/// no-op beyond one log line. `UnixHalf.install()` must run before Wine starts.
+/// What is measured but NOT yet done: installing the table from `init()` cannot take
+/// effect, because Wine's `load_ntdll_functions` (wine/dlls/ntdll/unix/loader.c) assigns
+/// `*p__wine_unixlib_handle = unix_call_funcs` while `__wine_main` bootstraps, which is
+/// after this runs, and would overwrite whatever was installed here. The fix is for that
+/// assignment to prefer a table supplied by the loaded half -- at which point this
+/// becomes the only copy of the unix half in the process.
+///
+/// Until then the linked archive stays the fallback and this is a no-op beyond one log
+/// line. `UnixHalf.install()` must run before Wine starts.
 enum UnixHalf {
     /// Name of the library a component provides. Kept in sync with the build product in
     /// `build/ntdll-unix/build.sh`.
