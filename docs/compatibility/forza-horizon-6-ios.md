@@ -123,6 +123,24 @@ different problem (§4).
 **Claim.** The game jumps into its own protected code while that code is still
 ciphertext, so the first byte executes as an invalid instruction.
 
+**What the protection actually is** (measured off-device against
+`Reference/forzahorizon6.exe`, which is the build on the device — see §4f). The
+ciphertext is not a whole encrypted region. It is **per-function entry stubs**:
+
+- Parsing the PE `.pdata` exception directory gives 414,805 x64 functions.
+- **4,538 of them (1.09%) begin with byte `0xEA`**, which is the far-jump opcode
+  and is *invalid in 64-bit mode*. That is the ciphertext signature.
+- Of those 4,538, **only ~19 have readable code immediately after the stub**.
+  The other 99.6% are encrypted throughout their bodies.
+- The stub is **5 bytes** — exactly the length of a `jmp rel32`, i.e. the size of
+  a call-redirection stub that gets decrypted in place at run time.
+- 4,538 stubs share only **247 distinct 5-byte values** (`eac704bed2` ×2693,
+  `ea49dd8ad5` ×1362, …), so the stub ciphertext is drawn from a small set
+  rather than being 4,538 independent blobs.
+
+The faulting function is one of the ~19 stub-only ones, which is why its body
+disassembles into a normal MSVC prologue and made this look like ordinary code.
+
 **Fault site** — identical to the one the objective describes:
 
 ```
@@ -252,6 +270,48 @@ this process — not a handler that declined. That is a different question from
 "the decryptor rejected the exception", and it is the one worth asking next: on
 the reference platform the same call decrypts *before* it ever executes.
 
+### 4f. Which binary we are actually testing
+
+Three copies exist and they are **not the same build**. Always confirm identity
+before drawing conclusions:
+
+| copy | size | sha256 (first 8) | `.pdata` funcs | `0xEA` entries |
+|---|---|---|---|---|
+| `Reference/forzahorizon6.exe` | 184,038,360 | `b8c18ec8` | 414,805 | **4,538 (1.09%)** |
+| CrossOver/Steam bottle | — | not installed | — | — |
+| `/Volumes/RETROBACKUP/.../ForzaHorizon6/` | 184,268,248 | `63791d0b` | 415,564 | 668 (0.16%) |
+
+The device runs the **Reference** build: the 16 bytes captured in memory
+(`ea e9 6b e6 14 48 89 7c 24 10 55 48 8b ec 48 83`) are byte-identical to
+Reference at RVA `0x537099c` and are followed by the same
+`ec 60 48 8b 05 8b f0 c9 03`. They are not identical to the RETROBACKUP build,
+where RVA `0x537099c` is not even a function entry and the surrounding bytes are
+entirely different.
+
+Consequence for objective item 6: the RETROBACKUP install is a *different,
+more heavily protected* build, so **a local run against it cannot validate this
+bug**. Testing locally would test the wrong binary.
+
+### 4g. RETRACTION — the faulting bytes ARE ciphertext
+
+While working §4, the first five bytes were momentarily read as "not ciphertext,
+because byte 5 onward is a valid MSVC prologue with a `/GS` cookie". That was
+wrong, and the mistake is worth recording because it is easy to repeat.
+
+The bytes at `image+0x537099c` are: `ea e9 6b e6 14` followed by a genuine
+prologue. But `.pdata` says the function **starts exactly at `0x537099c`** and is
+305 bytes long, and cross-checking the other 4,537 stub functions shows the body
+is normally encrypted too. This function is simply one of the ~19 whose body
+happens to be readable. A readable prologue after the stub is therefore *not*
+evidence that the stub was decrypted — and the objective's original statement
+stands unchanged:
+
+> **The 5-byte stub at fault time is still ciphertext. `memory == file` at fault
+> time, byte for byte, so it was never decrypted.**
+
+The correct conclusion from §4c's `memory == file` observation is the *opposite*
+of the one briefly drawn: it is positive evidence that the decryptor never ran.
+
 ### 4e. Scope note
 
 Per the objective's boundary: this is a memory-layout / loader-fidelity question
@@ -285,22 +345,34 @@ and the fault is at `image+0x537099c`.
 
 ## 6. Next experiments, cheapest first
 
-1. **Ask whether the protected page was ever written, not why a handler
-   declined.** §4d shows no `#UD` handler exists at first call, so "the
-   decryptor declined" is the wrong question. The right one: before the jump to
-   `image+0x537099c`, did anything write to that page? Two cheap observations,
-   both from the unix half and therefore shippable by package push:
-   `NtProtectVirtualMemory`/`NtWriteVirtualMemory` calls whose range covers the
-   page, and the page's dirty-vs-on-disk contents at fault time. If nothing ever
-   wrote it, decryption was skipped upstream and the search moves to the
-   protector's init; if something wrote it through a *different* mapping than
-   the one that executes, that is a dual-map coherence bug on our side.
+1. **Find out whether the stub decryptor ran at all.** §4c/§4g establish that the
+   5-byte stub was never written as of the fault. So the single highest-value
+   question is whether the protector's own decrypt/init path executed. The
+   decisive observation is cheap: catch the *first* guest write whose range
+   touches any of the 4,538 stub RVAs (the set is enumerable from `.pdata` +
+   `byte==0xEA`, so a probe can be preloaded with it). Then:
+   - never written → the decryptor never ran; search upstream in the protector's
+     init, and compare against a run where `FEX_SMCCHECKS` is default rather than
+     `full` (§3 shows the env genuinely matters).
+   - written, but the executed bytes are stale → SMC invalidation, see item 3.
 2. **Fix the two probe defects in §4a** so a future fault is not mislabelled as
    a wild store. Already written and packaged (`dist/unixhalf-ml2026-native.wcp`);
    needs the phone.
-3. **Port FEX 0002/0004** (block-level CRC validation, JIT stability) so
-   `FEX_SMCCHECKS=full` can be restored without breaking Steam. Not expected to
-   fix §4 on its own; it removes a variable from every later comparison.
+3. **Port the remaining SMC patch, `fh6-fex 0004`, and be precise about what is
+   left.** An earlier note claimed 0001/0002/0004 were all unported. That is
+   wrong: **0001 and 0002 are already in** (`1774c2fd9`, then `01161827e`
+   re-ported 0001 properly onto the FULL path), and 0003 is ported
+   (`a72fe4093`). Only **0004 "jit-stability-and-smc-batching"** remains — 2,395
+   lines across ~20 files plus two new files (`SharedCodeBufferManager.{h,cpp}`)
+   that do not exist in our tree, and it does not 3-way apply. Its central
+   abstraction `FH6Stats` has 0 occurrences here.
+   This matters because the protection *is* self-modifying code: 4,538
+   functions are decrypted in place at run time (§4), which is exactly what a
+   block-level SMC validator has to notice. The reference's own README says the
+   patches let FH6 "boot past its anti-tamper checks" — read carefully, those
+   patches are SMC **correctness**, not evasion: making FEX notice code writes
+   lets the game's own self-checks pass honestly. That is in scope under
+   boundary rule 2; faking detection results would not be.
 4. **DroidDeck comparison (north star).** Compare what DroidDeck's FEX does with
    the same two VirtualAllocs — the count of refusals and the granted protection
    are directly comparable from its logs, and that is the one measurement that
