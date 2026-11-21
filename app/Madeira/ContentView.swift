@@ -2469,6 +2469,21 @@ struct ContentView: View {
     /// Madeira's Enable JIT instead of starting a launch that cannot get its pool.
     private func jitReadyForLaunch(inLibrary: Bool, entry: UUID? = nil, then launch: (() -> Void)? = nil) -> Bool {
         if StikJITHelper.ready { return true }
+        // Inside LiveContainer "Enable JIT" cannot succeed: the built-in helper refuses to
+        // run in a guest and StikDebug belongs to the host. Reaching here means the host's
+        // debugger has already left and this run never took a pool, so the only fix is a
+        // relaunch from LiveContainer — say that instead of opening a setup sheet whose
+        // methods are both unavailable here.
+        if getenv("LC_HOME_PATH") != nil {
+            logStore.log("[jit-on-play] inside LiveContainer with no debugger and no pool: "
+                         + "cannot enable JIT from the guest", level: .error)
+            if inLibrary {
+                library.jitNotice = "This run started without a debugger, so JIT could not be set up. "
+                    + "Quit Madeira and start it again from LiveContainer: LiveContainer enables JIT as the "
+                    + "guest starts, and Madeira takes its JIT pool then."
+            }
+            return false
+        }
         if inLibrary, let launch {
             logStore.log("[jit-on-play] JIT is not on: enabling it, then starting the game")
             launchAfterJIT = launch
@@ -2479,7 +2494,19 @@ struct ContentView: View {
         if StikJITHelper.flaggedWithoutDebugger {
             logStore.log("[jit-debugger] launch held: CS_DEBUGGED is set but no debugger is attached; "
                          + "JIT has to be enabled again from Madeira", level: .error)
-            if inLibrary { library.jitNotice = StikJITHelper.noDebuggerMessage }
+            if inLibrary {
+                // Under LiveContainer Madeira cannot enable JIT itself: Built-in StikJIT
+                // refuses to run there, and StikDebug is the host's job. What can work is
+                // the host's own debugger, but only at the guest's launch — so the answer
+                // is to relaunch the guest, not to open JIT setup.
+                if getenv("LC_HOME_PATH") != nil && StikJITHelper.claimedPool == nil {
+                    library.jitNotice = "This run started without a debugger, so JIT could not be set up. "
+                        + "Quit Madeira and start it again from LiveContainer: LiveContainer enables JIT as the "
+                        + "guest starts, and Madeira takes its JIT pool then."
+                } else {
+                    library.jitNotice = StikJITHelper.noDebuggerMessage
+                }
+            }
         } else {
             logStore.log("JIT not enabled. Press 'Enable JIT' first.", level: .error)
             if inLibrary { library.error = "Enable JIT before playing." }
@@ -3131,12 +3158,26 @@ struct ContentView: View {
             }
 
             winios_phase("pool-alloc-begin")
-            logStore.log("Allocating \(poolSizeMB)MB JIT pool (BRK will suspend process)...")
             let t0 = CFAbsoluteTimeGetCurrent()
-            let pool = StikJITHelper.allocatePool(poolSize: poolSizeMB * 1024 * 1024)
+            let pool: (rx: UnsafeMutableRawPointer, rw: UnsafeMutableRawPointer, size: Int)?
+            if let claimed = StikJITHelper.claimedPool {
+                // Under LiveContainer the debugger this run started with has already
+                // left by the time Play is tapped, so this is the pool from that
+                // window. Its size is whatever start-up asked for; a game-specific
+                // pool setting only takes effect when the launch can still ask.
+                pool = claimed
+                logStore.log(String(format: "[jit-early] using the pool claimed at start-up: %dMB (this launch "
+                                    + "would have asked for %dMB)", claimed.size / 1024 / 1024, poolSizeMB),
+                             level: .success)
+            } else {
+                logStore.log("Allocating \(poolSizeMB)MB JIT pool (BRK will suspend process)...")
+                pool = StikJITHelper.allocatePool(poolSize: poolSizeMB * 1024 * 1024)
+            }
             let elapsed = CFAbsoluteTimeGetCurrent() - t0
             winios_phase("pool-ready")
-            logStore.log("BRK suspension lasted \(String(format: "%.2f", elapsed))s")
+            if StikJITHelper.claimedPool == nil {
+                logStore.log("BRK suspension lasted \(String(format: "%.2f", elapsed))s")
+            }
 
             // Arena carver self-test. Documents/madeira-arena-test.txt holds
             // "churn:N", "ramp:N" or "random:N". Deliberately a SEPARATE file

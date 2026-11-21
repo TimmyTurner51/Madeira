@@ -4,13 +4,19 @@ import SwiftUI
 @main
 struct MadeiraApp: App {
     init() {
-        // A component may ship the Wine unix half as a dylib; when it does, this loads it
-        // and hands its dispatch table to the PE ntdll. Must run before Wine starts, and it
-        // is a no-op (one log line) when no component provides one.
+        // A component may ship the Wine unix half as a dylib. When one does, this loads it
+        // and the bridge starts Wine from that half instead of the linked archive, so a
+        // unix-side change is a package install rather than an app rebuild. No-op (one log
+        // line) when no component provides one.
         UnixHalf.install()
         // A package pushed into Documents/Import is installed on the next launch, so a
         // component release takes no UI interaction at all.
         Task { @MainActor in WCPComponentsModel.shared.installInboxAtLaunch() }
+        // A debugger that is attached now may be gone before Play is tapped: under
+        // LiveContainer it is the guest's launch session, which detaches as soon as it
+        // has set CS_DEBUGGED. Take the JIT pool inside that window so a later launch
+        // has one. No-op (one decision, no work) when nothing is attached.
+        Task.detached(priority: .userInitiated) { StikJITHelper.claimPoolWhileTraced() }
         // Opt-in iPhone pointer experiments (PhonePointer.m): before any scene exists.
         madeira_phone_pointer_setup()
         // madeira-bcd: the Metal Performance HUD's performance insights (the

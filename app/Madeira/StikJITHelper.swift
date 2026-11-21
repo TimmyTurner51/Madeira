@@ -220,7 +220,44 @@ enum StikJITHelper {
     /// polls this every 2 s for the whole app run (and waitForDebugger every 0.5 s).
     static var ready: Bool {
         guard SigningStatus.current.debugged else { return false }
-        return !attachCheck || poolTaken || isDebuggerAttached()
+        return !attachCheck || poolTaken || claimedPool != nil || isDebuggerAttached()
+    }
+
+    /// A pool taken during the debugger session this app started under (see
+    /// claimPoolWhileTraced). LiveContainer hands its guest a debugger only for the
+    /// first moment of the guest's life: its StikDebug script attaches to the
+    /// LiveContainer process, sets CS_DEBUGGED on the whole tree, and leaves. Tapping
+    /// Play minutes later therefore finds CS_DEBUGGED set and no debugger -- and the
+    /// pool request is a BRK only a debugger can answer, so JIT reads as off and the
+    /// game never starts. Claiming the pool inside that window is the only chance
+    /// this run gets; the launch path then reuses it instead of asking again.
+    ///
+    /// On a normal install nothing is claimed: Play enables JIT itself, as before.
+    private(set) static var claimedPool: (rx: UnsafeMutableRawPointer, rw: UnsafeMutableRawPointer, size: Int)?
+
+    /// Claim the JIT pool now if a debugger is attached, so a launch later in this
+    /// app run can start without one. Safe to call more than once and from a
+    /// background thread: allocatePool is the same call the launch path makes.
+    static func claimPoolWhileTraced(poolSize requestedPoolSize: Int = 896 * 1024 * 1024) {
+        // Only where this run cannot enable JIT for itself later. A normal install
+        // reaches Play with no pool and enables JIT there, which also means the pool
+        // takes the size the launching game asks for (madeira.cfg or the game's own
+        // settings). Taking it at start-up would fix that size for the whole app run,
+        // so it stays opt-in outside LiveContainer.
+        guard getenv("LC_HOME_PATH") != nil || MadeiraConfig.flag("MADEIRA_JIT_EARLY_POOL") else { return }
+        guard claimedPool == nil, !poolTaken, isDebuggerAttached() else { return }
+        LogStore.shared.log("[jit-early] debugger is attached at start-up: claiming the JIT pool now, "
+                            + "while this run still has a debugger to answer the BRK")
+        guard let pool = allocatePool(poolSize: requestedPoolSize) else {
+            LogStore.shared.log("[jit-early] the pool request failed at start-up; Play will ask again",
+                                level: .error)
+            return
+        }
+        claimedPool = pool
+        LogStore.shared.log(String(format: "[jit-early] pool claimed at start-up: RX=%p RW=%p %dMB — a later "
+                                + "launch reuses it", Int(bitPattern: pool.rx), Int(bitPattern: pool.rw),
+                                pool.size / 1024 / 1024),
+                            level: .success)
     }
 
     /// CS_DEBUGGED is set but nothing can answer a pool request: JIT has to be
