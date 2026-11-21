@@ -480,6 +480,74 @@ exhaustion is the risk this trades against.
 `MADEIRA_GUEST_RWX_EXEC` is **default off**; the shipped behaviour is unchanged until
 this is validated across other titles.
 
+### 4k. Why no window appears — the game is not blocked, the session is
+
+Measured on the 290 s run after 4j. The obvious suspects are all clear:
+
+* **D3D12 / VKD3D is not the blocker.** `d3d12.dll` resolves through the mixed-arch
+  fallback to `C:\windows\sysx64\d3d12.dll` → `madeira_d3d12.dll`, and `DXGI.dll` and
+  `winemetal.dll` load into the game too. `[winios-vk] Vulkan is off for this session`
+  is **expected** on that path, not a failure: it only means `MADEIRA_VULKAN_LIBRARY`
+  is unset, i.e. vkd3d is not in use. `[DBG] madeira-d3d12: gate off` only means the
+  M1 shader-converter canary did not run (Content View's own note).
+* **Steam is not the blocker.** The Dock logged `session-logon-start-result=1`,
+  `session-authenticated-online=1`, `session-requested-app-entitled=1`,
+  `session-requested-app-listed=1`, `launch-client-error=0`, and `steam_api64.dll`
+  loaded into the game at `0x71E9910000`. The game's `IPC:CSteamEngine` peers are the
+  Steam client hosted in `dockhost.exe`, and they are alive and idle, not dead.
+
+What actually happened, in order:
+
+```
+17:15:09.369  [promote] display link armed (60 Hz)
+17:15:09.371  [steam-launch-view] hold app=2483190 auto-reveal=1
+17:15:15      [proc-ident] slot 4 = forzahorizon6.exe (peb=0x109fec000, 85 modules)
+17:15:19.385  [promote] link ran 593 ticks in 10.0 s = 59.2 Hz
+17:15:20.303  [dock-report] launch-client-error=0
+17:15:20.431  Wine finished after 10.8s
+17:15:20.877  [steam-launch-view] end reason=session-ended scene=waiting revealed=0 t=11s
+17:15:20.878  [promote] display link released
+17:15:29.926  [ERR] [madeira-dock] session ended without a host result
+```
+
+`Wine finished after 10.8s` is `ContentView`'s debugger-wait loop leaving because
+`wine_process_is_running()` returned 0. That getter is just `g_wine_running`, set from
+`wine_launched_process_did_exit()` — and `WineProcessBridge.h` is explicit that this
+fires for **the session's initial process**, and "other processes are not reported".
+
+In the Dock path the initial process is Steam's launch stub: it exits as soon as
+`launch-client-error=0` comes back. The game is not that process. So the session is
+declared over at 10.8 s, the display link is released, and the launch view gives up
+(`revealed=0`) — while `forzahorizon6.exe` is 5 s into an initialization that takes
+~5 minutes here. It then runs headless to t+289 s (`[xp]` IPC 3.7–4.0, ~36 % of a
+core, `[rip-profile] no guest threads found`, all sampled threads idle).
+
+**Consequence:** "why no window?" cannot be answered from this run, because the
+harness stopped watching before the game could reach presentation. Nothing presented
+a frame (`presents=` / frame counters: 0 hits) and the display link was never
+re-armed. The next experiment has to keep the session bound to the *game* process,
+not to the launch stub, and then ask the window question with the game actually
+being watched.
+
+**Independent defect found while tracing this.** During window creation there are
+three Mach exceptions whose backtrace is exactly the window path:
+
+```
+NtUserCreateWindowEx+0xb44
+  apply_window_pos+0x970
+    winios_drv_window_pos_changed+0x388
+      winios_window_frame -> winios_census_note_frame
+        winios_drv_census_owner -> get_window_long -> get_window_long_size
+          get_user_handle_ptr   (pc fault, addr=0x18, x9=0x18, insn c8dffd29 = CAS)
+```
+
+`winios_drv_census_owner()` (this repo, `build/win32u-unix/driver_ios.c`) calls
+`get_window_long(hwnd, GWL_STYLE)` on the handle it is handed; the lookup resolves to
+no object and the refcount CAS then dereferences `NULL+0x18`. It occurs in
+`explorer.exe` (peb `0x71ffff0000`) while the desktop window is created, and the run
+recovers, so it is **not proven** to be the game's window blocker — but it is a fault
+inside the exact syscall that creates windows and should be guarded regardless.
+
 ### 4e. Scope note
 
 Per the objective's boundary: this is a memory-layout / loader-fidelity question
