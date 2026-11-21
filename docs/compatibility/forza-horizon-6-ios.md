@@ -312,6 +312,68 @@ stands unchanged:
 The correct conclusion from §4c's `memory == file` observation is the *opposite*
 of the one briefly drawn: it is positive evidence that the decryptor never ran.
 
+### 4h. MEASURED — both copies are ciphertext, and a real sync bug exists
+
+Three separate readings agree at the fault:
+
+| where | probe | bytes |
+|---|---|---|
+| the PE file at RVA `0x537099c` | offline read | `ea e9 6b e6 14 48 89 7c 24 …` |
+| the **backing** at `0x165ec099c` | `[rsp-trunc] x86 @rip` reads `cs[0]` via `mach_vm_read_overwrite` | same |
+| the **pool copy** at `0x12ab0099c` | `[guest-code] rev=ml333` | same |
+
+So **nothing decrypted this function in either copy.** That retires a plausible
+theory (below) rather than confirming it.
+
+**Theory retired: "the pool is a stale snapshot".** The pool really is a
+`memcpy`, not a shared mapping:
+
+```
+/* Copy ENTIRE PE image to JIT pool (code + data + headers). */
+memcpy((char *)jit_rw_base + offset, image_base, image_size);
+```
+
+so the split looked like an obvious root cause: decrypt writes to the backing,
+execution reads the pool. It is not, because the backing is ciphertext too.
+
+**But the split is still a real bug, and it is ours.** The only code path that
+syncs a written region from the backing into the pool is the
+`NtProtectVirtualMemory` hook, and when the region overlaps `.text` it
+deliberately drops the code bytes:
+
+```
+else
+{
+    /* Copy only the parts OUTSIDE .text */
+    ...
+    ERR("iOS JIT IAT sync: partial copy %p+0x%lx → JIT (skipping text [0x%lx-0x%lx])\n", ...);
+}
+```
+
+The comment explaining why is sound for ARM64EC modules, whose pool `.text`
+carries `[x18-patch]` trampolines that a raw copy would destroy. For a **pure
+x64 guest image** (`Machine=0x8664`) the pool `.text` is a faithful memcpy with
+no such patches, so skipping it is wrong: any program that does the ordinary
+Windows decrypt dance (`VirtualProtect` writable → write code → restore
+executable) has its code writes silently discarded and then executes the old
+bytes. That is a platform-fidelity defect independent of this bug, and it
+explains `0` `NtProtect`-sync lines for the image only because the protector
+never made a protect call at all.
+
+**What the 99 MB dirty figure does and does not mean.** The observed region is
+exactly `header + .text` (`0x639c000`, matching `.text` `0x1000+0x639ace3`
+rounded), `dirty=99 MB`. Tempting to read as "the protector decrypted 99 MB".
+It is not conclusive: the image was rebased from `0x140000000` to `0x160b50000`,
+and recounting the `.reloc` directory gives **1,370,862 DIR64 entries over
+9,276 distinct 4 KiB pages ≈ 36 MB** of unavoidable dirtying. So relocations
+account for roughly a third; the rest is unidentified. Do not treat the dirty
+total as proof of decryption — it was nearly mistaken for exactly that here.
+
+**Still open, and now sharply posed:** the protector allocates its 16 MB+64 KB
+arena, then enters a stub that was never written. Whether it *intended* to write
+that stub (and the write went somewhere ineffective) or never reached the write
+is the next question, and one probe answers it.
+
 ### 4e. Scope note
 
 Per the objective's boundary: this is a memory-layout / loader-fidelity question
