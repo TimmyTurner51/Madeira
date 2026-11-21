@@ -548,6 +548,50 @@ no object and the refcount CAS then dereferences `NULL+0x18`. It occurs in
 recovers, so it is **not proven** to be the game's window blocker — but it is a fault
 inside the exact syscall that creates windows and should be guarded regardless.
 
+### 4l. A/B: the census faults are gone, and they were NOT what ends the session
+
+Hypothesis from 4k: the census probe's Mach exceptions fault the desktop and end
+the session. Tested without a rebuild by `env.MADEIRA_DOCK_HIDE_DESKTOP = 0` in
+`madeira.cfg`, which also switches the window census off (DockStartScreen.swift
+returns before `winios_window_census_enable(1)`).
+
+| | before (census on) | after (census off) |
+|---|---|---|
+| `get_user_handle_ptr` faults | 4 of 5 unhandled exceptions | **0** |
+| unhandled Mach exceptions | 5 | 5, at *different* PCs |
+| `wine client error:0: write: Bad file descriptor` | 1 | **3** |
+| desktop exit | code 1 at 10.8 s | **code 1 at 10.6 s** |
+| `Invalid instruction in entry block` | 0 | 0 |
+
+So the census guard (this repo, `winios_drv_census_owner`) removes a real fault —
+it is worth keeping — but the census was **not** what ends the session. The desktop
+dies either way, with an identical signature and at the identical moment relative
+to the game's start.
+
+**The session-ending defect, now isolated.** Immediately before the desktop goes:
+
+```
+wine client error:0: write: Bad file descriptor
+err:thread:abort_process abort_process: status=0x1 — tearing down this pseudo-process only
+[Wine ntdll/server] process_exit_wrapper(1)
+[WineProc] Wine exited with code 1 (caught by longjmp)
+```
+
+The client cannot write to the wineserver on its server fd, calls
+`abort_process(0x1)`, and because explorer.exe *is* the session's initial process
+this ends the whole session (`g_wine_running = 0`, then `wineserver_stop()`). The
+game — started by the Steam client in `dockhost.exe` — keeps running with no
+desktop, so nothing can ever be presented.
+
+The three failures come in a burst right after a pair of 64 KB
+`VirtualAlloc`/`VirtualFree` from one thread. The wineserver connection is the
+thing to instrument, and that lives in the **unix half**, which is component-
+overridable — so this is a `.wcp` push, not an IPA rebuild.
+
+The 5 remaining unhandled exceptions are unrelated addresses
+(`0x111f59bfc` `addr=0x8` twice, `0x198e1ff94` `addr=0x0` twice — the known wild
+pointer from 4b — and `0x1106c59ac` `type=6`).
+
 ### 4e. Scope note
 
 Per the objective's boundary: this is a memory-layout / loader-fidelity question
