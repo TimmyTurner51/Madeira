@@ -220,7 +220,39 @@ The fix is working, its logging is capped at 24 (`N < 24`), and the count is
 therefore an artefact of the cap rather than a runaway. The steady
 `[iOS-xrem]` interleave is the same mechanism.
 
-### 4d. Scope note
+### 4d. MEASURED NEGATIVE — the host exception address is reconstructed correctly
+
+The guest-visible record starts out carrying the **host** pc, which looks like a
+fidelity bug and is not one:
+
+```
+[exc-disp] raise tid=00e8 code=c000001d flags=0 addr=0x13ed444e8 pc=13ed444e8 nparams=0 p0=0 p1=0
+D E8 Exception: Code: C000001D Address: 13ED444E8
+D E8 Reconstructing context
+D E8 pc: 13ED444E8 rip: 165EC099C
+[set-ctx] ml946 distinct#10 ... is_ec(frame.pc)=1 ec_cur=1
+D E8 Exception: Code: C000001D Address: 165EC099C
+D E8 Passing through exception
+```
+
+The reconstruction path repairs `ExceptionAddress` and `Rip` to the guest VA
+before the record reaches managed code, so the `#UD` is delivered to the guest at
+`0x165EC099C` as Windows would deliver it. Do not re-open this.
+
+What the tail actually shows is that **nothing handles it**: `Passing through
+exception` is immediately followed by
+
+```
+wine: Unhandled illegal instruction at address 0000000165EC099C (thread 00e8), starting debugger...
+... process_exit_wrapper(-1073741795)
+```
+
+So at the moment of the first protected call there is no handler for `#UD` in
+this process — not a handler that declined. That is a different question from
+"the decryptor rejected the exception", and it is the one worth asking next: on
+the reference platform the same call decrypts *before* it ever executes.
+
+### 4e. Scope note
 
 Per the objective's boundary: this is a memory-layout / loader-fidelity question
 and is in scope. Nothing here indicates an anti-tamper verdict about emulation,
@@ -253,14 +285,19 @@ and the fault is at `image+0x537099c`.
 
 ## 6. Next experiments, cheapest first
 
-1. **Instrument the protector's self-view, not its verdict.** We now know the
-   arena request succeeds, so the decision that skips decryption happens
-   somewhere else. The cheapest next input is *what the protector reads back*
-   about its own arena and image: the `NtProtectVirtualMemory`/
-   `NtQueryVirtualMemory` returns for the arena's own range and for
-   `image+0x537099c`. One IPA build, one launch.
+1. **Ask whether the protected page was ever written, not why a handler
+   declined.** §4d shows no `#UD` handler exists at first call, so "the
+   decryptor declined" is the wrong question. The right one: before the jump to
+   `image+0x537099c`, did anything write to that page? Two cheap observations,
+   both from the unix half and therefore shippable by package push:
+   `NtProtectVirtualMemory`/`NtWriteVirtualMemory` calls whose range covers the
+   page, and the page's dirty-vs-on-disk contents at fault time. If nothing ever
+   wrote it, decryption was skipped upstream and the search moves to the
+   protector's init; if something wrote it through a *different* mapping than
+   the one that executes, that is a dual-map coherence bug on our side.
 2. **Fix the two probe defects in §4a** so a future fault is not mislabelled as
-   a wild store. No device needed to write; needs one IPA to run.
+   a wild store. Already written and packaged (`dist/unixhalf-ml2026-native.wcp`);
+   needs the phone.
 3. **Port FEX 0002/0004** (block-level CRC validation, JIT stability) so
    `FEX_SMCCHECKS=full` can be restored without breaking Steam. Not expected to
    fix §4 on its own; it removes a variable from every later comparison.
