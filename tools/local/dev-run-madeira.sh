@@ -23,6 +23,12 @@ export PATH="$HOME/bin:$PATH"
 TARGET_ID="com.willfaust.madeora"
 ROW=120   # max px between a name line and its Run button
 
+# Shared start/stop for LiveContainer. Defines LC_BUNDLE's helpers, which is why the
+# list is opened through open_livecontainer_list below rather than a bare launch.
+REPO_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+LC_BUNDLE="com.kdt.livecontainer.4CDWTGR84Z"
+. "$REPO_ROOT/tools/local/lc-control.sh"
+
 # Print the reason text of a launch-error dialog, or nothing if none is up.
 launch_error() {
     local see="$1"
@@ -39,7 +45,16 @@ if [ "${1:-}" = "--check-error" ]; then
 fi
 
 iosdev launch com.kdt.livecontainer.4CDWTGR84Z >/dev/null 2>&1
-sleep 7
+sleep 1
+
+# Starting from a live session is not a fresh start: LiveContainer resumes wherever it
+# was left, which can be inside Madeira, where the list and its Run button do not exist.
+# If a tap sequence below were to run against that, it would press controls in a game
+# launcher. Release first, then require LiveContainer's list before going further.
+if ! open_livecontainer_list; then
+    echo "ABORT: Madeira is still on screen; cannot reach LiveContainer's list." >&2
+    exit 1
+fi
 
 # Fail fast if the previous launch left an error modal up: nothing on the list
 # is reachable behind it.

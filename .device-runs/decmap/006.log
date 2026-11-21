@@ -1,0 +1,5 @@
+ERROR: The specified file could not be transferred. (com.apple.dt.CoreDeviceError error 7000 (0x1B58))
+       NSURL = file:///tmp/madeira-log.txt
+       ----------------------------------------
+           The operation couldn’t be completed. The file service client failed to read data from the network socket because the socket was closed unexpectedly. (NSPOSIXErrorDomain error 60 (0x3C))
+           NSLocalizedFailureReason = The file service client failed to read data from the network socket because the socket was closed unexpectedly.

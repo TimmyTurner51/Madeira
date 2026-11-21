@@ -1,0 +1,229 @@
+[00:51:21.954] [INFO] [bg-run] Metal background gate: 1 command buffer class(es)
+[00:51:22.339] [INFO] [external] steam libraries=0 install=drive_c
+[00:51:22.340] [INFO] [xinput] ml1920 physical controllers enabled=1
+[00:51:22.341] [INFO] [touch-xinput] ml1930 enabled=1
+[00:51:22.457] [INFO] [library-sections] native-steam=1 sections=1 collapse=1
+[00:51:22.457] [INFO] CS_DEBUGGED flag: SET (flags=0x32003005)
+[00:51:22.458] [INFO] Debugger attached — installing SIGTRAP handler anyway (fallback only)
+[00:51:22.458] [INFO] SIGTRAP handler installed (no debugger)
+[00:51:22.459] [INFO] Checking entitlements...
+[00:51:22.459] [ERR]   allow-jit: false
+[00:51:22.460] [OK]   increased-memory-limit: true
+[00:51:22.460] [DBG]   extended-virtual-addressing: false
+[00:51:22.460] [INFO] [build] v0.2.0 (48)
+[00:51:22.461] [INFO] [device] model=iPhone18,1 idiom=phone os=iOS Version 27.0.1 (Build 24A446) ram=11722MB available=6104MB cores=6
+[00:51:22.462] [INFO] [device] address-map=[0x102e58000,0x8000000000) 512GB increased-memory=1 extended-va=0
+[00:51:22.463] [INFO] [device] signing: cs-flags=0x32003005 get-task-allow=1 cs-debugged=1 debugger-attached=1 profile=none
+[00:51:22.518] [INFO] [device] settings: low-power=0 thermal=serious screen=1206x2622@3.0x max-fps=120 utc-offset=-06:00 free-disk=593GB stikdebug-url=0
+[00:51:22.520] [INFO] [frontend] choice=library source=setting
+[00:51:22.749] [INFO] [steam-library] start signed-in=1 cached=100
+[00:51:22.912] [INFO] [steam-games] installed=2 ready=2
+[00:51:23.159] [INFO] MetalLayer: displaySyncEnabled=false (private API, MeloNX pattern)
+[00:51:23.189] [INFO] [epic-library] start signed-in=0 cached=0 installed=0
+[00:51:23.190] [INFO] [gog-library] start signed-in=0 cached=0 installed=0
+[00:51:23.235] [INFO] [itch-library] start signed-in=0 cached=0 installed=0
+[00:51:24.162] [INFO] [steam-playtime] apps=77
+[00:51:24.167] [INFO] [steam-cloud] sync games=2 automatic=1
+[00:51:25.368] [INFO] [steam-cloud] app=2483190 cloud-change=0 cloud-files=0 same=0 differ=0 missing-local=0 local-only=0 unmapped=0 patterns=0 roots=- overrides=0 | plan download=0 upload=0 ask=0
+[00:51:26.360] [INFO] [steam-cloud] app=5215640 cloud-change=0 cloud-files=0 same=0 differ=0 missing-local=0 local-only=0 unmapped=0 patterns=0 roots=- overrides=0 | plan download=0 upload=0 ask=0
+[00:51:34.023] [INFO] [touch-xinput] connected=0 accepting=0 controls=0
+[00:51:34.075] [INFO] [steam-games] play app=2483190
+[00:51:34.078] [INFO] [bcd] library launch ForzaHorizon6: avx=0 wine-vcrt=0 nvidia=0 older-nvidia=0 gpu-card=- japanese=0 game-config=1
+[00:51:38.723] [INFO] [madeira-dock] launch option 0
+[00:51:38.725] [INFO] [steam-depot] paused for a game session count=0
+[00:51:38.975] [INFO] [steam-library] connection closed for Madeira Dock
+[00:51:38.987] [INFO] [dock-handoff] protected-file-ready=1
+[00:51:38.988] [INFO] [dock-launch] image-retire=1
+[00:51:38.989] [INFO] [dock-launch] image-map-guard=1
+[00:51:38.989] [INFO] [dock-offline] enabled=1 network=up request=0 account-saved=1 game-started-online=1
+[00:51:39.222] [INFO] [dock-installers] app=2483190 registry values=5 written=0
+[00:51:39.222] [INFO] [dock-installers] app=2483190 scripts=0 programs=0
+[00:51:39.845] [INFO] [dock-game-scm] mode=auto services=0 third-party-installs=0 service-manager=off
+[00:51:39.856] [INFO] [dock-wow] the game's largest program is 64-bit: its memory takes donor RAM first, then the swap file (MADEIRA_SWAP_X64_TITLE=1; env.MADEIRA_DOCK_X64_TITLE = 0 keeps the file first)
+[00:51:39.857] [INFO] [madeira-dock] starting the host for app 2483190; Valve's client authenticates and authorizes the launch
+[00:51:39.872] [INFO] [promote] pacing mode 1: display intent 60 Hz (panel max 120, hold-maximum false, floor true)
+[00:51:39.873] [INFO] [promote] display link armed min=60Hz preferred=60Hz panel_max=120Hz
+[00:51:39.876] [INFO] [steam-launch-view] hold app=2483190 auto-reveal=1
+[00:51:39.877] [INFO] CS_DEBUGGED flag: SET (flags=0x32003005)
+[00:51:39.885] [INFO] [hid-pad] ml2100 session mode=xinput source=default
+[00:51:39.885] [INFO] [hidpad-out] ml2106 session env.MADEIRA_PAD_OUTPUT=1 xinput-rumble=1 dualsense-output=0
+[00:51:39.886] [INFO] madeira.cfg: env.-MADEIRA_SWAP_COVERAGE=wide env.MADEIRA_JIT_SHORTCUT=1 env.MADEIRA_ONE_SESSION_PER_RUN=0 env.MADEIRA_SWAP_COVERAGE=wide pool=512 swap-mb=2048
+[00:51:39.887] [INFO] Running full Wine sequence...
+[00:51:39.887] [INFO] [device] launch: cs-flags=0x32003005 get-task-allow=1 cs-debugged=1 debugger-attached=1 address-map=[0x102e58000,0x8000000000) 512GB available=5984MB low-power=0 thermal=serious
+[00:51:39.889] [INFO] [wcp-env] FEX_SMCCHECKS=full FEX_SMC_WRITABLE_ONLY=1 PROTON_NO_ESYNC=1 PROTON_NO_NTSYNC=1 VKD3D_FEATURE_LEVEL=12_2 VKD3D_SHADER_MODEL=6_9 WINE_FAST_YIELD=1
+[00:51:39.893] [INFO] [game-cfg] env.MADEIRA_EC_HOOK_TRACE=0 env.MADEIRA_POOL_BIG_SLOT_BELOW=1 env.MADEIRA_POOL_BIG_SLOT_MB=80 env.WINEDEBUG=err+all,trace+file exe-window-mb=192 pool=896 pool-low=1 pool-low-margin=32 pool-mid=1 pool-page-fit=1 pool-pair=1 pool-split=1
+[00:51:39.894] [INFO] [display-shape] resolution=1408x648 mode=fit
+[00:51:39.894] [INFO] [launch-route] library profile applied
+[00:51:39.899] [INFO] JIT pool overridden to 896MB via the game's settings pool
+[00:51:39.907] [INFO] Allocating 896MB JIT pool (BRK will suspend process)...
+[00:51:39.908] [INFO] Allocating 896MB JIT pool via debugger...
+[00:51:39.915] [INFO] [jit-debugger] attached=1 at the pool request
+[00:51:39.915] [INFO] JIT-pool frontier already at 0x125de4000 — no pin needed
+[00:51:39.916] [OK] ml1040: executable window [0x140000000,+128MB) held since image load
+[00:51:39.917] [INFO] [pool-split] page-fit=1: A/B requests fit 16KB pages within the requested 896MB budget; C retains pool-low-margin
+[00:51:39.917] [INFO] ml1040: released the early pool placeholder 0x148000000+576MB for the debugger
+[00:51:39.918] [INFO] ml1135: the placeholder ended at the mapping 0x16cea8000+0MB (VM tag 30, prot 0), already there at image load
+[00:51:39.918] [OK] [exe-window] widened to [0x140000000,0x14c000000) 192MB for a large fixed-base image (exe-window-mb); the pool is placed above it
+[00:51:39.920] [INFO] ml1036: free holes >=64MB in [0x119000000,0x7000000000) with the window held: 0x125de4000+127MB 0x1339ac000+198MB 0x14c000000+526MB 0x16d408000+299MB
+[00:51:39.921] [OK] [pool-split] ml1036 pair above the window: A=0x14c000000+526MB B=0x16d408000+299MB total=826MB (single best was 526MB at 0x14c000000, above the window, with a run below it the split could not reach; pool-pair = 0 turns this off)
+[00:51:42.666] [INFO] [pool-split] second debugger region 0x16d408000+299MB (free runs above the pool: 0x16d408000+299MB); between the regions: 5504KB, 560KB of it free and now held PROT_NONE
+[00:51:42.666] [OK] [pool-split] ml1036 pair placed: region A 0x14c000000+526MB, region B 0x16d408000+299MB, 826MB in all (the single-region pool would have been 526MB)
+[00:51:42.667] [INFO] RX pool at 0x14c000000
+[00:51:43.553] [INFO] [pool-low] region C 0x1339ac000+198MB (free runs below the window: 0x125de4000+127MB 0x1339ac000+198MB; 0MB of the run left free for the low images, pool-low-margin = 32, held by a lower run, margin yielded to keep region C useful)
+[00:51:43.554] [INFO] [pool-low] page-fit C=203088KB; run remainder=0KB, pool-low-margin=32768KB
+[00:51:43.554] [INFO] [pool-split] page-fit A=539296KB B=307168KB usable=846464KB budget=917504KB; native mappings retained
+[00:51:43.603] [OK] ml977: RX=[0x14c000000,0x180000000) RW=[0x7018654000,0x704c654000) offset=0x6ecc654000 windowHeld=true rwOverlap=false
+[00:51:43.603] [INFO] [no-footprint] pool-RW-alias: [plain/TASK_NULL] entry covers only 16384 of 552239104 bytes (partial)
+[00:51:43.603] [INFO] [no-footprint] pool-RW-alias: [plain/TASK_NULL] ownership failed kr=4 ((os/kern) invalid argument) rev=ml458
+[00:51:43.604] [INFO] [no-footprint] pool-RW-alias: [plain/self] entry covers only 16384 of 552239104 bytes (partial)
+[00:51:43.604] [INFO] [no-footprint] pool-RW-alias: [plain/self] ownership failed kr=4 ((os/kern) invalid argument) rev=ml458
+[00:51:43.618] [INFO] [no-footprint] pool-RW-alias: [share/self] ownership failed kr=4 ((os/kern) invalid argument) rev=ml458
+[00:51:43.631] [INFO] [no-footprint] pool-RW-alias: [share/TASK_NULL] ownership failed kr=4 ((os/kern) invalid argument) rev=ml458
+[00:51:43.632] [INFO] [no-footprint] pool-RW-alias: ALL 4 variants refused — pool stays jetsam-counted rev=ml458
+[00:51:43.632] [INFO] [no-footprint] pool-RW-alias-2: [plain/TASK_NULL] entry covers only 16384 of 314540032 bytes (partial)
+[00:51:43.632] [INFO] [no-footprint] pool-RW-alias-2: [plain/TASK_NULL] ownership failed kr=4 ((os/kern) invalid argument) rev=ml458
+[00:51:43.633] [INFO] [no-footprint] pool-RW-alias-2: [plain/self] entry covers only 16384 of 314540032 bytes (partial)
+[00:51:43.633] [INFO] [no-footprint] pool-RW-alias-2: [plain/self] ownership failed kr=4 ((os/kern) invalid argument) rev=ml458
+[00:51:43.637] [INFO] [no-footprint] pool-RW-alias-2: [share/self] ownership failed kr=4 ((os/kern) invalid argument) rev=ml458
+[00:51:43.641] [INFO] [no-footprint] pool-RW-alias-2: [share/TASK_NULL] ownership failed kr=4 ((os/kern) invalid argument) rev=ml458
+[00:51:43.641] [INFO] [no-footprint] pool-RW-alias-2: ALL 4 variants refused — pool stays jetsam-counted rev=ml458
+[00:51:43.642] [ERR] [no-footprint] pool applied=false
+[00:51:43.645] [OK] [pool-split] JIT pool = RX [0x14c000000,0x16cea8000) 526MB + [0x16d408000,0x180000000) 299MB as one 826MB span; pool offsets [0x20ea8000,0x21408000) (5MB, the main thread's stack) are never handed out
+[00:51:43.646] [INFO] [no-footprint] pool-RW-alias-low: [plain/TASK_NULL] entry covers only 16384 of 207962112 bytes (partial)
+[00:51:43.646] [INFO] [no-footprint] pool-RW-alias-low: [plain/TASK_NULL] ownership failed kr=4 ((os/kern) invalid argument) rev=ml458
+[00:51:43.646] [INFO] [no-footprint] pool-RW-alias-low: [plain/self] entry covers only 16384 of 207962112 bytes (partial)
+[00:51:43.647] [INFO] [no-footprint] pool-RW-alias-low: [plain/self] ownership failed kr=4 ((os/kern) invalid argument) rev=ml458
+[00:51:43.650] [INFO] [no-footprint] pool-RW-alias-low: [share/self] ownership failed kr=4 ((os/kern) invalid argument) rev=ml458
+[00:51:43.653] [INFO] [no-footprint] pool-RW-alias-low: [share/TASK_NULL] ownership failed kr=4 ((os/kern) invalid argument) rev=ml458
+[00:51:43.653] [INFO] [no-footprint] pool-RW-alias-low: ALL 4 variants refused — pool stays jetsam-counted rev=ml458
+[00:51:43.653] [ERR] [pool-low] region C RX [0x1339ac000,0x140000000) 198MB, RW [0x7000000000,0x700c654000) at the pool's distance 0x6ecc654000 (one RW reservation from 0x7000000000); FEX code buffers come from C first, the pool span is left to the image copies (no-footprint REFUSED)
+[00:51:43.654] [OK] JIT pool ready (debugger still attached).
+[00:51:43.654] [INFO] BRK suspension lasted 3.75s
+[00:51:43.657] [DBG] madeira-d3d12: gate off (madeira.cfg d3d12 unset)
+[00:51:43.661] [OK] JIT pool: RX=0x14c000000, RW=0x7018654000, size=832MB
+[00:51:43.661] [OK] [pool-low] WINE_IOS_JIT_TAIL_REGION=1339ac000:c654000 (198MB for FEX code buffers)
+[00:51:43.662] [INFO] Detaching debugger...
+[00:51:43.668] [OK] Debugger detached.
+[00:51:43.671] [OK] [early-detach] rev=ml524 took 9 ms
+[00:51:43.688] [OK] MetalLayer registered with DXMT shim (window-hosted singleton)
+[00:51:43.788] [INFO] Starting wineserver...
+[00:51:43.788] [INFO] Wine prefix: /var/mobile/Containers/Data/Application/BD038598-DE0F-4AA5-B8F3-6AC778939190/Documents/Data/Application/EDAFB512-48D7-4839-98DA-E66816D6174E/Documents/wine
+[00:51:43.791] [INFO] [external] steam libraries=0 install=drive_c
+[00:51:43.795] [wineserver-bridge] ws_log test - log file set up OK
+[00:51:43.796] [Wine] Wineserver thread started
+[00:51:43.796] [Wine] WINEPREFIX=/var/mobile/Containers/Data/Application/BD038598-DE0F-4AA5-B8F3-6AC778939190/Documents/Data/Application/EDAFB512-48D7-4839-98DA-E66816D6174E/Documents/wine
+[00:51:43.796] [Wine] Wineserver thread created
+[00:51:43.796] [Wine] NLS dir=/private/var/mobile/Containers/Data/Application/BD038598-DE0F-4AA5-B8F3-6AC778939190/Documents/Applications/com.willfaust.madeora.app/nls
+[00:51:43.796] [Wine] Calling wineserver_main...
+[00:51:43.796] [wineserver] starting init...
+[00:51:43.796] [wineserver] master_socket_timeout set to INFINITE (9223372036854775807)
+[00:51:43.796] [wineserver] init_limits...
+[00:51:43.796] [wineserver] sock_init...
+[00:51:43.796] [wineserver] open_master_socket...
+[00:51:43.796] [OK] Wineserver thread launched successfully
+[phase] wineserver-up          t+  3.889s rev=ml526
+[00:51:43.797] [wineserver] acquire_lock: listening on fd=31 (NONBLOCK), server_dir=/var/mobile/Containers/Data/Application/BD038598-DE0F-4AA5-B8F3-6AC778939190/Documents/Data/Application/EDAFB512-48D7-4839-98DA-E66816D6174E/Documents/wine/.wineserver/server-1000006-1fa950f
+[madsync] ml1058 in-process synchronisation disabled (madeira.cfg inproc-sync = 1 enables; fastsync is the default)
+[madsync] config inproc-sync=unset cfg=present dir=env (MADEIRA_CFG_EARLY_DOCS=0 restores the old lookup)
+[00:51:43.798] [wineserver-fd] init_epoll: SKIPPING kqueue on iOS, using poll()
+[00:51:43.798] [wineserver-fd] add_poll_user: user=0 unix_fd=-1 active_users=1
+[00:51:43.798] [wineserver] acquire_lock: master_socket->fd unix_fd=31
+[00:51:43.798] [wineserver] init_signals...
+[00:51:43.798] [wineserver-fd] add_poll_user: user=1 unix_fd=-1 active_users=2
+[00:51:43.798] [wineserver-fd] add_poll_user: user=2 unix_fd=-1 active_users=3
+[00:51:43.798] [wineserver-fd] add_poll_user: user=3 unix_fd=-1 active_users=4
+[00:51:43.798] [wineserver-fd] add_poll_user: user=4 unix_fd=-1 active_users=5
+[00:51:43.798] [wineserver-fd] add_poll_user: user=5 unix_fd=-1 active_users=6
+[00:51:43.798] [wineserver] init_memory...
+[00:51:43.798] [wineserver] load_intl_file + init_directories...
+[00:51:43.798] [wineserver] get_nls_dir: using bridge path '/private/var/mobile/Containers/Data/Application/BD038598-DE0F-4AA5-B8F3-6AC778939190/Documents/Applications/com.willfaust.madeora.app/nls'
+[00:51:43.798] [wineserver] load_intl_file: trying path[0]='/private/var/mobile/Containers/Data/Application/BD038598-DE0F-4AA5-B8F3-6AC778939190/Documents/Applications/com.willfaust.madeora.app/nls/l_intl.nls' (access=0)
+[00:51:43.798] [wineserver-fd] add_poll_user: user=6 unix_fd=-1 active_users=7
+[00:51:43.799] [wineserver] load_intl_file: SUCCESS with path='/private/var/mobile/Containers/Data/Application/BD038598-DE0F-4AA5-B8F3-6AC778939190/Documents/Applications/com.willfaust.madeora.app/nls/l_intl.nls'
+[00:51:43.800] [wineserver-fd] add_poll_user: user=7 unix_fd=-1 active_users=8
+[00:51:43.800] [usd-map] ml731c create alias=0x10c86c000 region=0x10c86c000+0x4000 prot=3/3 shared=0
+[00:51:43.800] [usd-map] ml731c create store test: plain=OK release=OK (size=4096)
+[00:51:43.800] [wineserver-fd] add_poll_user: user=8 unix_fd=-1 active_users=9
+[00:51:43.800] [wineserver] init_threading...
+[00:51:43.800] [wineserver] init_registry...
+[storage-device] v1 prefix disk bytes=1023367663616 bus=virtual serial=unavailable metadata-only PhysicalDrive0=ready
+[00:51:43.852] [wineserver] entering main_loop!
+[00:51:43.852] [wineserver-fd] main_loop_epoll: kqueue_fd=-1 active_users=9
+[00:51:43.852] [wineserver-fd] main_loop_epoll: kqueue_fd=-1, falling back to poll
+[00:51:43.852] [wineserver-fd] main_loop: blocked all signals on wineserver thread
+[00:51:43.852] [wineserver-fd] main_loop: stack=0x704c7f2e80 (wineserver thread stack location)
+[00:51:43.852] [wineserver-fd] main_loop: iOS poll workaround active. active_users=9 master_fd=31
+[00:51:43.852] [wineserver-fd] iOS poll loop: master_fd=31 nb_users=9 active=9
+[00:51:43.852] [wineserver-fd] coalesced request wake: on (MADEIRA_SRV_WAKE_COALESCE=0 disables)
+[00:51:43.853] [wineserver-fd] request doorbell: on, read of every client fd every 10 ms (MADEIRA_SRV_DOORBELL=0 disables, MADEIRA_SRV_FULLSCAN_MS)
+[00:51:43.853] [wineserver-fd] request-wake semaphore: kr=0 sem=0x612b
+[srv-queues] ---- 0 threads ----
+[00:51:43.853] [srv-poll] MADEIRA_SRV_NOSEM=0 (default semaphore wake path)
+[00:51:43.859] [INFO] [launch] wineserver ready after 61 ms
+[phase] wine-start             t+  3.952s rev=ml526
+[00:51:43.859] [INFO] Starting Wine process...
+[00:51:43.859] [wineserver] inject_client_fd: fd=44
+[00:51:43.860] [OK] Wine process thread launched
+[00:51:43.860] [wineserver-fd] INJECTED client fd=44 at iter=7 client_start=9 — calling master_socket_handle_client
+[00:51:43.860] [wineserver] master_socket_handle_client: fd=44
+[00:51:43.860] [wineserver] calling create_process...
+[00:51:43.860] [wineserver-fd] add_poll_user: user=9 unix_fd=-1 active_users=10
+[00:51:43.860] [wineserver] create_process returned 0x12ed16080
+[00:51:43.860] [INFO] Waiting for Wine to finish PE loading...
+[00:51:43.860] [wineserver] calling create_thread...
+[00:51:43.860] [wineserver] send_client_fd: fd=47 handle=0x3a2 msg_fd_unix=44 proc=0020 tid=0000
+[00:51:43.860] [wineserver] send_client_fd: sendmsg returned 4 (expected 4) errno=38
+[00:51:43.860] [wineserver-fd] add_poll_user: user=10 unix_fd=-1 active_users=11
+[00:51:43.860] [wineserver] create_thread done, releasing...
+[00:51:43.860] [wineserver] client fully connected!
+[00:51:43.860] [wineserver-fd] master_socket_handle_client returned, nb_users=11
+[00:51:43.860] [wineserver-fd]   POST-INJECT [0] fd=31 ev=0x1 bytes=0
+[00:51:43.860] [wineserver-fd]   POST-INJECT [1] fd=27 ev=0x1 bytes=0
+[00:51:43.860] [wineserver-fd]   POST-INJECT [2] fd=33 ev=0x1 bytes=0
+[00:51:43.860] [wineserver-fd]   POST-INJECT [3] fd=35 ev=0x1 bytes=0
+[00:51:43.860] [wineserver-fd]   POST-INJECT [4] fd=37 ev=0x1 bytes=0
+[00:51:43.860] [wineserver-fd]   POST-INJECT [5] fd=39 ev=0x1 bytes=0
+[00:51:43.860] [wineserver-fd]   POST-INJECT [6] fd=-1 ev=0x0 bytes=-1
+[00:51:43.860] [wineserver-fd]   POST-INJECT [7] fd=-1 ev=0x0 bytes=-1
+[00:51:43.860] [wineserver-fd]   POST-INJECT [8] fd=-1 ev=0x0 bytes=-1
+[00:51:43.860] [wineserver-fd]   POST-INJECT [9] fd=44 ev=0x1 bytes=0
+[00:51:43.860] [wineserver-fd]   POST-INJECT [10] fd=46 ev=0x1 bytes=0
+[00:51:43.861] [wineserver-fd] POST iter=7 act=11 nb=11 ef=1
+[00:51:43.862] [wineserver-fd] POST iter=8 act=11 nb=11 ef=1
+[00:51:43.863] [wineserver-fd] POST iter=9 act=11 nb=11 ef=1
+[00:51:43.865] [wineserver-fd] POST iter=10 act=11 nb=11 ef=3
+[00:51:43.866] [wineserver-fd] POST iter=11 act=11 nb=11 ef=3
+[00:51:43.867] [wineserver-fd] POST iter=12 act=11 nb=11 ef=3
+[00:51:43.868] [wineserver-fd] POST iter=13 act=11 nb=11 ef=3
+[00:51:43.869] [wineserver-fd] POST iter=14 act=11 nb=11 ef=3
+[00:51:43.870] [wineserver-fd] POST iter=15 act=11 nb=11 ef=3
+[00:51:43.872] [wineserver-fd] POST iter=16 act=11 nb=11 ef=3
+[00:51:43.873] [wineserver-fd] POST iter=17 act=11 nb=11 ef=3
+[00:51:43.874] [wineserver-fd] POST iter=18 act=11 nb=11 ef=3
+[00:51:43.875] [wineserver-fd] POST iter=19 act=11 nb=11 ef=5
+[steam-env] Madeira Dock session: no fixed Steam game identity published
+[config-dir] early MADEIRA_DOCS_DIR=set; native madeira.cfg readers that run before this point (wineserver start: madsync inproc-sync) use it (MADEIRA_CFG_EARLY_DOCS=0 disables)
+[freeze] detector started gen=1 (sleep=0.25s gap>2.0s) rev=ml525
+[00:51:43.876] [wineserver-fd] POST iter=20 act=11 nb=11 ef=5
+[00:51:43.877] [wineserver-fd] POST iter=21 act=11 nb=11 ef=5
+[00:51:43.880] [wineserver-fd] POST iter=22 act=11 nb=11 ef=5
+[swap] ml1077 app: backing file /private/var/mobile/Containers/Data/Application/BD038598-DE0F-4AA5-B8F3-6AC778939190/tmp/madeira-swap.bin, cap 2048 MB
+[00:51:43.881] [wineserver-fd] POST iter=23 act=11 nb=11 ef=5
+[madeira-env] ml1062 MADEIRA_JIT_SHORTCUT=1
+[madeira-env] ml1062 MADEIRA_SWAP_COVERAGE=wide
+[madeira-env] ml1062 -MADEIRA_SWAP_COVERAGE=wide
+[madeira-env] ml1062 MADEIRA_ONE_SESSION_PER_RUN=0
+[madeira-env] game MADEIRA_EC_HOOK_TRACE=0
+[madeira-env] game MADEIRA_POOL_BIG_SLOT_MB=80
+[madeira-env] game MADEIRA_POOL_BIG_SLOT_BELOW=1
+[madeira-env] game WINEDEBUG=err+all,trace+file
+[00:51:43.882] [wineserver-fd] POST iter=24 act=11 nb=11 ef=5
+[madeira-env] DXMT_IOS_CACHE_DIR=1 (default: shader caches under Library/Caches)
+[00:51:43.884] [wineserver-fd] POST iter=25 act=11 nb=11 ef=5
+[WineProc] PE probe: machine=0xaa64
+[WineProc] PE routing: machine=0xaa64 bundle=aarch64-windows i386-set=1 force-ec=0
+[WineProc] Target exe: explorer.exe (bundle=aarch64-windows)
+[00:51:43.885] [wineserver-fd] POST iter=26 act=11 nb=11 ef=5
+[WineProc] Symlinked 149 DLLs from aarch64-windows -> sys32
+[WineProc] system32\wbem: 0/5 links
+[WineProc] Cross-linked 0 non-colliding files from arm64ec-windows -> sys32

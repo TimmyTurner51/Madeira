@@ -1,0 +1,68 @@
+[00:49:42.314] [INFO] [bg-run] Metal background gate: 1 command buffer class(es)
+[00:49:42.693] [INFO] [external] steam libraries=0 install=drive_c
+[00:49:42.694] [INFO] [xinput] ml1920 physical controllers enabled=1
+[00:49:42.695] [INFO] [touch-xinput] ml1930 enabled=1
+[00:49:42.810] [INFO] [library-sections] native-steam=1 sections=1 collapse=1
+[00:49:42.811] [INFO] CS_DEBUGGED flag: SET (flags=0x32003005)
+[00:49:42.811] [INFO] Debugger attached — installing SIGTRAP handler anyway (fallback only)
+[00:49:42.812] [INFO] SIGTRAP handler installed (no debugger)
+[00:49:42.812] [INFO] Checking entitlements...
+[00:49:42.813] [ERR]   allow-jit: false
+[00:49:42.813] [OK]   increased-memory-limit: true
+[00:49:42.813] [DBG]   extended-virtual-addressing: false
+[00:49:42.814] [INFO] [build] v0.2.0 (48)
+[00:49:42.815] [INFO] [device] model=iPhone18,1 idiom=phone os=iOS Version 27.0.1 (Build 24A446) ram=11722MB available=6104MB cores=6
+[00:49:42.816] [INFO] [device] address-map=[0x100834000,0x8000000000) 512GB increased-memory=1 extended-va=0
+[00:49:42.816] [INFO] [device] signing: cs-flags=0x32003005 get-task-allow=1 cs-debugged=1 debugger-attached=1 profile=none
+[00:49:42.871] [INFO] [device] settings: low-power=0 thermal=serious screen=1206x2622@3.0x max-fps=120 utc-offset=-06:00 free-disk=593GB stikdebug-url=0
+[00:49:42.873] [INFO] [frontend] choice=library source=setting
+[00:49:43.104] [INFO] [steam-library] start signed-in=1 cached=100
+[00:49:43.264] [INFO] [steam-games] installed=2 ready=2
+[00:49:43.563] [INFO] MetalLayer: displaySyncEnabled=false (private API, MeloNX pattern)
+[00:49:43.580] [INFO] [epic-library] start signed-in=0 cached=0 installed=0
+[00:49:43.580] [INFO] [gog-library] start signed-in=0 cached=0 installed=0
+[00:49:43.625] [INFO] [itch-library] start signed-in=0 cached=0 installed=0
+[00:49:44.645] [INFO] [steam-playtime] apps=77
+[00:49:44.650] [INFO] [steam-cloud] sync games=2 automatic=1
+[00:49:45.756] [INFO] [steam-cloud] app=2483190 cloud-change=0 cloud-files=0 same=0 differ=0 missing-local=0 local-only=0 unmapped=0 patterns=0 roots=- overrides=0 | plan download=0 upload=0 ask=0
+[00:49:46.828] [INFO] [steam-cloud] app=5215640 cloud-change=0 cloud-files=0 same=0 differ=0 missing-local=0 local-only=0 unmapped=0 patterns=0 roots=- overrides=0 | plan download=0 upload=0 ask=0
+[00:49:54.783] [INFO] [touch-xinput] connected=0 accepting=0 controls=0
+[00:49:54.852] [INFO] [steam-games] play app=2483190
+[00:49:54.855] [INFO] [bcd] library launch ForzaHorizon6: avx=0 wine-vcrt=0 nvidia=0 older-nvidia=0 gpu-card=- japanese=0 game-config=1
+[00:49:59.388] [INFO] [madeira-dock] launch option 0
+[00:49:59.391] [INFO] [steam-depot] paused for a game session count=0
+[00:49:59.641] [INFO] [steam-library] connection closed for Madeira Dock
+[00:49:59.652] [INFO] [dock-handoff] protected-file-ready=1
+[00:49:59.653] [INFO] [dock-launch] image-retire=1
+[00:49:59.654] [INFO] [dock-launch] image-map-guard=1
+[00:49:59.654] [INFO] [dock-offline] enabled=1 network=up request=0 account-saved=1 game-started-online=1
+[00:49:59.864] [INFO] [dock-installers] app=2483190 registry values=5 written=0
+[00:49:59.864] [INFO] [dock-installers] app=2483190 scripts=0 programs=0
+[00:50:00.355] [INFO] [dock-game-scm] mode=auto services=0 third-party-installs=0 service-manager=off
+[00:50:00.367] [INFO] [dock-wow] the game's largest program is 64-bit: its memory takes donor RAM first, then the swap file (MADEIRA_SWAP_X64_TITLE=1; env.MADEIRA_DOCK_X64_TITLE = 0 keeps the file first)
+[00:50:00.368] [INFO] [madeira-dock] starting the host for app 2483190; Valve's client authenticates and authorizes the launch
+[00:50:00.382] [INFO] [promote] pacing mode 1: display intent 60 Hz (panel max 120, hold-maximum false, floor true)
+[00:50:00.383] [INFO] [promote] display link armed min=60Hz preferred=60Hz panel_max=120Hz
+[00:50:00.386] [INFO] [steam-launch-view] hold app=2483190 auto-reveal=1
+[00:50:00.387] [INFO] CS_DEBUGGED flag: SET (flags=0x32003005)
+[00:50:00.395] [INFO] [hid-pad] ml2100 session mode=xinput source=default
+[00:50:00.395] [INFO] [hidpad-out] ml2106 session env.MADEIRA_PAD_OUTPUT=1 xinput-rumble=1 dualsense-output=0
+[00:50:00.396] [INFO] madeira.cfg: env.-MADEIRA_SWAP_COVERAGE=wide env.MADEIRA_JIT_SHORTCUT=1 env.MADEIRA_ONE_SESSION_PER_RUN=0 env.MADEIRA_SWAP_COVERAGE=wide pool=512 swap-mb=2048
+[00:50:00.397] [INFO] Running full Wine sequence...
+[00:50:00.397] [INFO] [device] launch: cs-flags=0x32003005 get-task-allow=1 cs-debugged=1 debugger-attached=1 address-map=[0x100834000,0x8000000000) 512GB available=5985MB low-power=0 thermal=serious
+[00:50:00.399] [INFO] [wcp-env] FEX_SMCCHECKS=full FEX_SMC_WRITABLE_ONLY=1 PROTON_NO_ESYNC=1 PROTON_NO_NTSYNC=1 VKD3D_FEATURE_LEVEL=12_2 VKD3D_SHADER_MODEL=6_9 WINE_FAST_YIELD=1
+[00:50:00.404] [INFO] [game-cfg] env.MADEIRA_DEBUG_VERBOSE=1 env.MADEIRA_EC_HOOK_TRACE=0 env.MADEIRA_POOL_BIG_SLOT_BELOW=1 env.MADEIRA_POOL_BIG_SLOT_MB=80 exe-window-mb=192 pool=896 pool-low=1 pool-low-margin=32 pool-mid=1 pool-page-fit=1 pool-pair=1 pool-split=1
+[00:50:00.404] [INFO] [display-shape] resolution=1408x648 mode=fit
+[00:50:00.404] [INFO] [launch-route] library profile applied
+[00:50:00.406] [INFO] JIT pool overridden to 896MB via the game's settings pool
+[00:50:00.415] [INFO] Allocating 896MB JIT pool (BRK will suspend process)...
+[00:50:00.415] [INFO] Allocating 896MB JIT pool via debugger...
+[00:50:00.417] [INFO] [jit-debugger] attached=1 at the pool request
+[00:50:00.417] [INFO] JIT-pool frontier already at 0x128da0000 — no pin needed
+[00:50:00.418] [OK] ml1040: executable window [0x140000000,+128MB) held since image load
+[00:50:00.419] [INFO] [pool-split] page-fit=1: A/B requests fit 16KB pages within the requested 896MB budget; C retains pool-low-margin
+[00:50:00.419] [INFO] ml1040: released the early pool placeholder 0x148000000+624MB for the debugger
+[00:50:00.419] [INFO] ml1135: the placeholder ended at the mapping 0x16f4cc000+0MB (VM tag 30, prot 0), already there at image load
+[00:50:00.420] [OK] [exe-window] widened to [0x140000000,0x14c000000) 192MB for a large fixed-base image (exe-window-mb); the pool is placed above it
+[00:50:00.422] [INFO] ml1036: free holes >=64MB in [0x119000000,0x7000000000) with the window held: 0x128da0000+370MB 0x14c000000+564MB 0x16fc5c000+259MB
+[00:50:00.423] [OK] [pool-split] ml1036 pair above the window: A=0x14c000000+564MB B=0x16fc5c000+259MB total=824MB (single best was 564MB at 0x14c000000, above the window, with a run below it the split could not reach; pool-pair = 0 turns this off)

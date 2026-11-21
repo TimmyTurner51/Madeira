@@ -52,11 +52,17 @@ struct WCPComponent: Identifiable, Codable, Equatable {
     enum Kind: String, Codable {
         case fex
         case wine
+        /// A Mach-O half of the runtime that is loaded at launch rather than linked in.
+        /// Today that is the Wine unix half (see `UnixHalf`): it stays in the component's
+        /// `files/` folder and is `dlopen`ed, so it never enters the prefix's DLL folders,
+        /// which only hold PE images.
+        case native
 
         var label: String {
             switch self {
             case .fex: return "FEX"
             case .wine: return "Wine"
+            case .native: return "Runtime (Mach-O)"
             }
         }
     }
@@ -281,6 +287,10 @@ enum WCPInstaller {
 
     static func kind(type: String, files: [String]) -> WCPComponent.Kind? {
         let lower = type.lowercased()
+        // A Mach-O package declares itself: its files are dylibs rather than PE images, so
+        // it is checked before the FEX/Wine inference, which would otherwise misfile it.
+        if lower.contains("unixhalf") || lower.contains("native") || lower.contains("unix") { return .native }
+        if files.contains(where: { ($0 as NSString).pathExtension.lowercased() == "dylib" }) { return .native }
         if lower.contains("fex") { return .fex }
         if lower.contains("wine") || lower.contains("proton") { return .wine }
         // Unknown label: infer from what the package carries. A FEX package is
@@ -342,6 +352,17 @@ enum WCPInstaller {
             }
             guard !items.isEmpty else {
                 throw WCPError.message("This Wine package has no Windows libraries (.dll) to link.")
+            }
+        case .native:
+            // Nothing is linked into the prefix: these are Mach-O images, and the prefix only
+            // holds PE files. The library keeps its own name inside the component folder, which
+            // is where `UnixHalf` looks for it, so a later install replaces it by file name and
+            // nothing else in the bundle has to move.
+            for file in files where (file as NSString).pathExtension.lowercased() == "dylib" {
+                add(file, "files/" + (file as NSString).lastPathComponent)
+            }
+            guard !items.isEmpty else {
+                throw WCPError.message("This runtime package carries no .dylib to load.")
             }
         }
         return items
@@ -664,6 +685,30 @@ final class WCPComponentsModel: ObservableObject {
             ? "Installing \(newest.lastPathComponent) — \(waiting.count - 1) more waiting."
             : "Installing \(newest.lastPathComponent)…"
         install(from: newest)
+    }
+
+    /// Installs everything waiting in the Import folder, then moves each package aside.
+    ///
+    /// This is the launch-time entry point, and it exists so a component release needs no
+    /// UI interaction: push a `.wcp` into `Documents/Import`, launch, and it is installed.
+    /// Packages are moved into `Import/installed/` before installing rather than deleted, so
+    /// a failed install can be retried by moving one back, and a successful one is never
+    /// scanned twice.
+    func installInboxAtLaunch() {
+        let fm = FileManager.default
+        let waiters = Self.waitingPackages()
+        guard !waiters.isEmpty else { return }
+        let done = Self.inbox.appendingPathComponent("installed", isDirectory: true)
+        try? fm.createDirectory(at: done, withIntermediateDirectories: true)
+        var consumed: [URL] = []
+        for url in waiters {
+            let destination = done.appendingPathComponent(url.lastPathComponent)
+            try? fm.removeItem(at: destination)
+            if (try? fm.moveItem(at: url, to: destination)) != nil { consumed.append(destination) }
+        }
+        LogStore.shared.log("[wcp] \(consumed.count) package(s) waiting in Import; installing")
+        guard !consumed.isEmpty else { return }
+        install(from: consumed)
     }
 
     /// Downloads a `.wcp` over http(s) and installs it. Needs no file access at

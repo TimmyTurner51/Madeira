@@ -4,6 +4,13 @@ import SwiftUI
 @main
 struct MadeiraApp: App {
     init() {
+        // A component may ship the Wine unix half as a dylib; when it does, this loads it
+        // and hands its dispatch table to the PE ntdll. Must run before Wine starts, and it
+        // is a no-op (one log line) when no component provides one.
+        UnixHalf.install()
+        // A package pushed into Documents/Import is installed on the next launch, so a
+        // component release takes no UI interaction at all.
+        Task { @MainActor in WCPComponentsModel.shared.installInboxAtLaunch() }
         // Opt-in iPhone pointer experiments (PhonePointer.m): before any scene exists.
         madeira_phone_pointer_setup()
         // madeira-bcd: the Metal Performance HUD's performance insights (the

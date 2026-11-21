@@ -101,6 +101,7 @@
 		A1000518 /* SwiftSteam/Helpers/SteamDevice.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000518 /* SteamDevice.swift */; };
 		A1000519 /* SwiftSteam/Helpers/SteamLog.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000519 /* SteamLog.swift */; };
 		A1000001 /* MadeiraApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000001 /* MadeiraApp.swift */; };
+		A100D001 /* UnixHalf.swift in Sources */ = {isa = PBXBuildFile; fileRef = A200D001 /* UnixHalf.swift */; };
 		A1000002 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000002 /* ContentView.swift */; };
 		A1000003 /* LogStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000003 /* LogStore.swift */; };
 		A1000077 /* MadeiraConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000077 /* MadeiraConfig.swift */; };
@@ -388,6 +389,7 @@
 		A2000518 /* SteamDevice.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SwiftSteam/Helpers/SteamDevice.swift"; sourceTree = "<group>"; };
 		A2000519 /* SteamLog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SwiftSteam/Helpers/SteamLog.swift"; sourceTree = "<group>"; };
 		A2000001 /* MadeiraApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MadeiraApp.swift; sourceTree = "<group>"; };
+		A200D001 /* UnixHalf.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UnixHalf.swift; sourceTree = "<group>"; };
 		A2000002 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		A2000003 /* LogStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LogStore.swift; sourceTree = "<group>"; };
 		A2000077 /* MadeiraConfig.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MadeiraConfig.swift; sourceTree = "<group>"; };
@@ -720,6 +722,7 @@
 				A2000518 /* SteamDevice.swift */,
 				A2000519 /* SteamLog.swift */,
 				A2000001 /* MadeiraApp.swift */,
+				A200D001 /* UnixHalf.swift */,
 				A2000245 /* TouchGamepad.swift */,
 				A2000F01 /* GestureZones.swift */,
 				A2000246 /* TouchControlPresets.swift */,
@@ -1188,6 +1191,7 @@
 				A1000518 /* SwiftSteam/Helpers/SteamDevice.swift in Sources */,
 				A1000519 /* SwiftSteam/Helpers/SteamLog.swift in Sources */,
 				A1000001 /* MadeiraApp.swift in Sources */,
+				A100D001 /* UnixHalf.swift in Sources */,
 				A1000245 /* TouchGamepad.swift in Sources */,
 				A1000F01 /* GestureZones.swift in Sources */,
 				A1000246 /* TouchControlPresets.swift in Sources */,
@@ -1365,7 +1369,7 @@
 				CODE_SIGN_ENTITLEMENTS = Madeira/Madeira.entitlements;
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 11;
+				CURRENT_PROJECT_VERSION = 14;
 				DEVELOPMENT_TEAM = V8NU3FX3TL;
 				GENERATE_INFOPLIST_FILE = NO;
 				HEADER_SEARCH_PATHS = (
@@ -1417,7 +1421,7 @@
 				"OTHER_LDFLAGS[sdk=iphoneos*]" = ("$(inherited)", "$(MADEIRA_VULKAN_LDFLAGS)");
 				CODE_SIGN_ENTITLEMENTS = Madeira/Madeira.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 11;
+				CURRENT_PROJECT_VERSION = 14;
 				DEVELOPMENT_TEAM = V8NU3FX3TL;
 				GENERATE_INFOPLIST_FILE = NO;
 				HEADER_SEARCH_PATHS = (
@@ -1467,7 +1471,7 @@
 				APPLICATION_EXTENSION_API_ONLY = YES;
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 11;
+				CURRENT_PROJECT_VERSION = 14;
 				DEVELOPMENT_TEAM = V8NU3FX3TL;
 				"FRAMEWORK_SEARCH_PATHS[sdk=iphoneos*]" = "$(SRCROOT)/Frameworks/StikJIT.xcframework/ios-arm64";
 				GENERATE_INFOPLIST_FILE = NO;
@@ -1498,7 +1502,7 @@
 			buildSettings = {
 				APPLICATION_EXTENSION_API_ONLY = YES;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 11;
+				CURRENT_PROJECT_VERSION = 14;
 				DEVELOPMENT_TEAM = V8NU3FX3TL;
 				"FRAMEWORK_SEARCH_PATHS[sdk=iphoneos*]" = "$(SRCROOT)/Frameworks/StikJIT.xcframework/ios-arm64";
 				GENERATE_INFOPLIST_FILE = NO;

@@ -40,6 +40,10 @@ set -u
 export PATH="$HOME/bin:$PATH"
 REPO_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 DFILE="$REPO_ROOT/tools/local/device-file.sh"
+# device-file.sh takes the same overrides, so one definition here keeps both halves
+# of a run pointed at the same phone.
+DEVID="${IOSDEV_UDID:-00008150-001564AE3407801C}"
+IOSDEV_PMD3="${IOSDEV_PMD3:-$HOME/.local/bin/pymobiledevice3}"
 
 # A preflight that costs seconds and prevents a silent half-hour stall. On
 # 2026-11-21 this script ran 23 minutes and exited 0 having uploaded the IPA and
@@ -123,10 +127,13 @@ elif [ -n "${1:-}" ]; then
 fi
 
 # Read CFBundleVersion currently installed on the device (empty if unreadable).
+# Through device-file.sh, which bounds every route: a bare `iosdev app-get` has no
+# timeout and wedged here for minutes on a dropped USB link, during which the phone
+# sat on the home screen looking like the script had done nothing at all.
 installed_version() {
     local tmp v
     tmp=$(mktemp -d)
-    iosdev app-get "$BUNDLE_REMOTE/Info.plist" "$tmp/p" >/dev/null 2>&1
+    "$DFILE" get "$BUNDLE_REMOTE/Info.plist" "$tmp/p" >/dev/null 2>&1
     v=$(plutil -extract CFBundleVersion raw "$tmp/p" 2>/dev/null)
     rm -rf "$tmp"
     printf '%s' "$v"
@@ -136,11 +143,26 @@ version_of_ipa() {
     unzip -p "$1" Payload/Madeira.app/Info.plist 2>/dev/null | plutil -extract CFBundleVersion raw - 2>/dev/null
 }
 
+# Terminate before launching. `iosdev launch` on a running LiveContainer only
+# foregrounds it, and LiveContainer resumes wherever it was left -- if Madeira was in
+# the foreground, the session resumes INSIDE MADEIRA, the import-menu tap below lands in
+# Madeira's library, and the run aborts with "no 'Install IPA File'" while the phone is
+# visibly showing a game launcher. lc-control.sh holds the measured details (kill-bundle
+# cannot see the app; a dead bundle reports pid 0) and is shared with the run script.
+. "$REPO_ROOT/tools/local/lc-control.sh"
+
+echo "==> releasing LiveContainer so the install starts at its own list"
+if ! open_livecontainer_list; then
+    echo "ABORT: still inside Madeira after a release; cannot reach LiveContainer's list." >&2
+    iosdev see 2>/dev/null | head -8 >&2
+    exit 1
+fi
+
+# Probed only once the app list is up: this is a bounded read now, but it is still the
+# slowest step before the first tap, and doing it behind a launched LiveContainer is
+# what makes the screen show progress instead of a stalled home screen.
 before=$(installed_version)
 echo "==> installed build before: ${before:-unknown}"
-
-iosdev launch "$LC_BUNDLE" >/dev/null 2>&1
-sleep 7
 
 # A leftover launch-error modal blocks the list; clear it before interacting.
 if iosdev see 2>/dev/null | grep -qiE 'missing code signature|code signature invalid'; then
@@ -209,7 +231,9 @@ done
 
 echo "==> verifying the installed bundle"
 tmp=$(mktemp -d)
-iosdev app-get "$BUNDLE_REMOTE/Madeira.debug.dylib" "$tmp/d" >/dev/null 2>&1
+# Bounded, like every other device read here: this pulls ~100 MB, and an unbounded
+# `iosdev app-get` on a dropped link hangs with no output and no timeout.
+"$DFILE" get "$BUNDLE_REMOTE/Madeira.debug.dylib" "$tmp/d" >/dev/null 2>&1
 after=$(installed_version)
 # Did we actually install the thing we meant to? The default form installs
 # Documents/Madeira.ipa from the phone, which is whatever was pushed last,
@@ -246,3 +270,19 @@ else
     echo "    WARNING: could not read the installed dylib." >&2
 fi
 rm -rf "$tmp"
+
+# Leave the phone in a state where the new build is what runs: the bundle swap
+# replaces files under a process that is still mapping the old ones. Relaunching
+# from a released LiveContainer means the next thing on screen is the new build at
+# its own list, instead of the previous session still running the previous image.
+if [ "${INSTALL_RELAUNCH:-1}" = "1" ]; then
+    echo "==> relaunching LiveContainer on the new bundle"
+    release_livecontainer
+    launch_livecontainer
+    sleep 7
+    if iosdev see 2>/dev/null | grep -qi 'Search your library'; then
+        echo "    WARNING: the session came back inside Madeira; release and relaunch by hand." >&2
+    else
+        echo "    LiveContainer is at its list."
+    fi
+fi

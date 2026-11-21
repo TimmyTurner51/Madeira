@@ -926,6 +926,10 @@ static void madeira_apply_wcp_components(NSFileManager *fm, NSString *prefix, BO
 
             NSString *resolved = [dest stringByReplacingOccurrencesOfString:@"${aarch64}"
                                     withString:(use_arm64ec ? @"${sysaa64}" : @"${system32}")];
+            // A native (Mach-O) component is not linked into the prefix: its libraries stay in
+            // the component folder and are dlopen'ed at launch (UnixHalf). Skipping it here is
+            // what keeps it out of the link count instead of reporting it as a failure.
+            if ([resolved hasPrefix:@"files/"]) continue;
             NSString *folder = nil;
             for (NSString *token in tokens) {
                 NSString *marker = [NSString stringWithFormat:@"${%@}", token];
