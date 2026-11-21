@@ -420,10 +420,29 @@ int winios_drv_census_owner( HWND hwnd, unsigned int *pid, unsigned int *style )
 
     *pid = 0;
     *style = 0;
+    /* ml1380: ask the server first, and never ask it for a style through the
+     * client-object path until it has answered.
+     *
+     * This runs from the WindowPosChanged hook, which Wine also calls from
+     * inside NtUserCreateWindowEx while the window is still being built
+     * (bt: NtUserCreateWindowEx+0xb44 -> apply_window_pos+0x970 ->
+     *  winios_drv_window_pos_changed+0x388 -> winios_window_frame ->
+     *  winios_census_note_frame -> here). On 2026-11-21 get_window_long on such
+     * a handle resolved no object and the code walked it anyway: five Mach
+     * exceptions at one PC (get_user_handle_ptr+0x68) with fault addresses
+     * 0x18, 0x98 and 0xd8 -- NULL plus list offsets -- all in explorer.exe,
+     * ten seconds before the desktop process died with
+     * "wine client error:0: write: Bad file descriptor" and took the Dock
+     * session (and the game's chance of ever being presented) with it.
+     * get_window_thread() only reads the server-side entry (get_user_entry) and
+     * never touches client_objects[], so it is safe to ask first: a handle with
+     * no window entry is skipped instead of faulted, and the pid comes back
+     * with the answer we needed anyway. */
+    if (!hwnd || !get_window_thread( hwnd, &process )) return 0;
     bits = get_window_long( hwnd, GWL_STYLE );
     if (bits & WS_CHILD) return 0;
     if (!NtUserGetAncestor( hwnd, GA_PARENT )) return 0;   /* the desktop window */
-    if (!get_window_thread( hwnd, &process )) return 0;
+    if (!process) return 0;
     *pid = process;
     *style = bits;
     return 1;
