@@ -18614,8 +18614,32 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                      (unix_prot & PROT_EXEC)  ? 'x' : '-',
                      (unix_prot & PROT_READ)  ? 'r' : '-',
                      (unix_prot & PROT_WRITE) ? 'w' : '-' );
-        unix_prot &= ~PROT_EXEC;
-        if (!unix_prot) unix_prot = PROT_READ;
+        /* ml1372 A/B: honour the guest's PROT_EXEC instead of dropping it.
+         *
+         * Dropping is the long-standing behaviour and the reason is in the ml1030
+         * note above: the guest's *visible* protection is unchanged either way (Wine's
+         * page tables already hold VPROT_EXEC, and [prot-img] reads it back after this
+         * point), so this bit only selects the HOST mprotect arm. Worth one measured
+         * run because Forza Horizon 6 allocates its 16 MB decrypt arena with
+         * PAGE_EXECUTE_READWRITE and the invalid-instruction fault follows one line
+         * after the strip. MADEIRA_GUEST_RWX_EXEC=1 enables; default keeps the strip. */
+        {
+            static int rwx_exec_on = -1;
+            if (rwx_exec_on < 0)
+            {
+                const char *e = getenv( "MADEIRA_GUEST_RWX_EXEC" );
+                rwx_exec_on = (e && e[0] == '1');
+            }
+            if (rwx_exec_on)
+                dprintf( 2, "[guest-rwx] #%lu %p+0x%lx HONOURING guest EXEC "
+                            "(MADEIRA_GUEST_RWX_EXEC=1; guest-visible protection unchanged)\n",
+                         grd_n, base, (unsigned long)size );
+            else
+            {
+                unix_prot &= ~PROT_EXEC;
+                if (!unix_prot) unix_prot = PROT_READ;
+            }
+        }
     }
 
     /* madeira-bcd [x64-image]: see ios_x64_image_is_host_data. Same contract as
@@ -36134,6 +36158,45 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
                      prot_img_n, (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread, base,
                      (unsigned long)size, (unsigned long)((char *)base - (char *)view->base),
                      (unsigned)new_prot, status ? 0u : (unsigned)old, status, sec );
+        }
+
+        /* ml1372: answer "was this address ever decrypted" directly instead of
+         * inferring it. Whenever a protect on an SEC_IMAGE view covers
+         * view->base + MADEIRA_PROBE_RVA, dump the first 8 bytes there. A
+         * protector that decrypts in place will make a later sample differ from
+         * the file's bytes; if every sample matches the file, nothing wrote it.
+         * Bounded, and independent of the [prot-img] gating above. */
+        if (view && (view->protect & SEC_IMAGE))
+        {
+            static long probe_rva = -2;
+            if (probe_rva == -2)
+            {
+                const char *e = getenv( "MADEIRA_PROBE_RVA" );
+                probe_rva = (e && *e) ? strtol( e, NULL, 0 ) : -1;
+            }
+            if (probe_rva >= 0)
+            {
+                uintptr_t tgt = (uintptr_t)view->base + (uintptr_t)probe_rva;
+                if (tgt >= (uintptr_t)base && tgt < (uintptr_t)base + size)
+                {
+                    static int probe_n;
+                    if (probe_n < 32)
+                    {
+                        unsigned char pb[8];
+                        mach_vm_size_t pg = 0;
+                        probe_n++;
+                        if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)tgt, 8,
+                                                    (mach_vm_address_t)pb, &pg ) == KERN_SUCCESS && pg == 8)
+                            dprintf( 2, "[rva-probe] #%d tid=%04x pe=%p+0x%lx new_prot=%#x "
+                                        "bytes: %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                                     probe_n, (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread,
+                                     (void *)tgt, (unsigned long)probe_rva, (unsigned)new_prot,
+                                     pb[0], pb[1], pb[2], pb[3], pb[4], pb[5], pb[6], pb[7] );
+                        else
+                            dprintf( 2, "[rva-probe] #%d %p UNREADABLE\n", probe_n, (void *)tgt );
+                    }
+                }
+            }
         }
     }
 #endif
