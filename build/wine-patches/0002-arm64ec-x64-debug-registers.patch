@@ -1,0 +1,118 @@
+diff --git a/dlls/ntdll/signal_arm64ec.c b/dlls/ntdll/signal_arm64ec.c
+index 9ed09f7e..1bf99c61 100644
+--- a/dlls/ntdll/signal_arm64ec.c
++++ b/dlls/ntdll/signal_arm64ec.c
+@@ -41,6 +41,11 @@ WINE_DECLARE_DEBUG_CHANNEL(relay);
+ 
+ /* xtajit64.dll functions */
+ static void     (WINAPI *pBTCpu64FlushInstructionCache)(const void*,SIZE_T);
++/* MADEIRA: the x64 debug registers are the emulator's to keep. The host has no copy of Dr0-Dr7,
++ * so NtGet/SetContextThread with CONTEXT_DEBUG_REGISTERS consults the emulator through these two
++ * (see the get/set paths below). Absent exports leave the pointers NULL and the calls skipped. */
++static void     (WINAPI *pBTCpu64GetContext)(HANDLE,ARM64_NT_CONTEXT*);
++static void     (WINAPI *pBTCpu64SetContext)(HANDLE,const ARM64_NT_CONTEXT*);
+ static BOOLEAN  (WINAPI *pBTCpu64IsProcessorFeaturePresent)(UINT);
+ /* iOS-only xtajit64 export — see BTInterface.h. On non-iOS hosts the
+  * export doesn't exist and the GET_PTR call below returns NULL; the
+@@ -773,6 +778,8 @@ NTSTATUS arm64ec_process_init_dispatchers( HMODULE module )
+ #define GET_PTR(name) p ## name = arm64ec_redirect_ptr( module, \
+                                       RtlFindExportedRoutineByName( module, #name ), metadata )
+     GET_PTR( BTCpu64FlushInstructionCache );
++    GET_PTR( BTCpu64GetContext );  /* MADEIRA: x64 debug registers live in the emulator. */
++    GET_PTR( BTCpu64SetContext );  /* MADEIRA: and are applied by it, not by the host. */
+     GET_PTR( BTCpu64IosAddAliasMapping );  /* iOS-only; NULL on non-iOS hosts. */
+     GET_PTR( BTCpu64IosReleaseThreadHolds );  /* iOS-only; ml618 leaked-hold release. */
+     GET_PTR( BTCpu64IosSetMonoBridge );  /* iOS-only; ml648 Mono backpatcher bridge. */
+@@ -1809,6 +1816,16 @@ NTSTATUS SYSCALL_API NtGetContextThread( HANDLE handle, CONTEXT *context )
+     ARM64_NT_CONTEXT arm_ctx = { .ContextFlags = ctx_flags_x64_to_arm( context->ContextFlags ) };
+     NTSTATUS status = syscall_NtGetContextThread( handle, &arm_ctx );
+ 
++    /* MADEIRA: x64 debug registers live in the emulator's thread state and the host has no copy
++     * of them, so ask the emulator to fill them into arm_ctx before the conversion below. This
++     * mirrors the reference fix: a caller that sets Dr0-Dr7 and reads them back must get the same
++     * values, and the host-side conversion alone can only ever return zeros. */
++    if (!status && (context->ContextFlags & CONTEXT_AMD64_DEBUG_REGISTERS) &&
++        pBTCpu64GetContext && enter_syscall_callback())
++    {
++        pBTCpu64GetContext( handle, &arm_ctx );
++        leave_syscall_callback();
++    }
+     if (!status) context_arm_to_x64( (ARM64EC_NT_CONTEXT *)context, &arm_ctx );
+ 
+     /* ml715: WHAT THE CALLER ACTUALLY RECEIVES.
+@@ -2296,6 +2313,16 @@ NTSTATUS SYSCALL_API NtSetContextThread( HANDLE handle, const CONTEXT *context )
+     ARM64_NT_CONTEXT arm_ctx;
+ 
+     context_x64_to_arm( &arm_ctx, (ARM64EC_NT_CONTEXT *)context );
++
++    /* MADEIRA: the x64 debug registers are the emulator's thread state, not the host's. Hand it the
++     * update before the syscall so the emulator has them from the moment the thread resumes; the
++     * unix half has no storage for them and cannot carry them itself. */
++    if ((context->ContextFlags & CONTEXT_AMD64_DEBUG_REGISTERS) &&
++        pBTCpu64SetContext && enter_syscall_callback())
++    {
++        pBTCpu64SetContext( handle, &arm_ctx );
++        leave_syscall_callback();
++    }
+     return syscall_NtSetContextThread( handle, &arm_ctx );
+ }
+ 
+diff --git a/dlls/ntdll/unwind.h b/dlls/ntdll/unwind.h
+index faca8a25..347023e9 100644
+--- a/dlls/ntdll/unwind.h
++++ b/dlls/ntdll/unwind.h
+@@ -36,6 +36,11 @@ static inline ULONG ctx_flags_x64_to_arm( ULONG flags )
+     if (flags & CONTEXT_AMD64_CONTROL) ret |= CONTEXT_ARM64_CONTROL;
+     if (flags & CONTEXT_AMD64_INTEGER) ret |= CONTEXT_ARM64_INTEGER;
+     if (flags & CONTEXT_AMD64_FLOATING_POINT) ret |= CONTEXT_ARM64_FLOATING_POINT;
++    /* MADEIRA: keep the debug-register half of the request. Without it a caller that asks for
++     * Dr0-Dr7 gets a successful call carrying no debug state at all, which anti-tamper code reads
++     * as "the platform silently dropped what I set". The values themselves come from the
++     * emulator via BTCpu64GetContext/SetContext (see signal_arm64ec.c). */
++    if (flags & CONTEXT_AMD64_DEBUG_REGISTERS) ret |= CONTEXT_ARM64_DEBUG_REGISTERS;
+     return ret;
+ }
+ 
+@@ -47,6 +52,7 @@ static inline ULONG ctx_flags_arm_to_x64( ULONG flags )
+     if (flags & CONTEXT_ARM64_CONTROL) ret |= CONTEXT_AMD64_CONTROL;
+     if (flags & CONTEXT_ARM64_INTEGER) ret |= CONTEXT_AMD64_INTEGER;
+     if (flags & CONTEXT_ARM64_FLOATING_POINT) ret |= CONTEXT_AMD64_FLOATING_POINT;
++    if (flags & CONTEXT_ARM64_DEBUG_REGISTERS) ret |= CONTEXT_AMD64_DEBUG_REGISTERS;
+     return ret;
+ }
+ 
+@@ -166,6 +172,19 @@ static inline void context_x64_to_arm( ARM64_NT_CONTEXT *arm_ctx, const ARM64EC_
+     fpcsr = mxcsr_to_fpcsr( ec_ctx->AMD64_MxCsr );
+     arm_ctx->Fpcr = fpcsr;
+     arm_ctx->Fpsr = fpcsr >> 32;
++
++    /* MADEIRA: carry the x64 debug registers. ARM64_NT_CONTEXT has no Dr fields, so the x64 ones
++     * ride in its breakpoint and watchpoint slots: Bvr[0..3] hold Dr0..Dr3, and Wvr[0]/Wvr[1] hold
++     * Dr6/Dr7. That is lossless, unlike re-encoding Dr7's control bits as Bcr, and it costs nothing
++     * because a 64-bit guest has no ARM64 watchpoints. Both ends of the trip are ours (this header
++     * and BTCpu64GetContext/SetContext in the emulator), so the convention is private to the pair.
++     * This must stay after the memset above, which zeroes the slots. */
++    arm_ctx->Bvr[0] = ec_ctx->AMD64_Dr0;
++    arm_ctx->Bvr[1] = ec_ctx->AMD64_Dr1;
++    arm_ctx->Bvr[2] = ec_ctx->AMD64_Dr2;
++    arm_ctx->Bvr[3] = ec_ctx->AMD64_Dr3;
++    arm_ctx->Wvr[0] = ec_ctx->AMD64_Dr6;
++    arm_ctx->Wvr[1] = ec_ctx->AMD64_Dr7;
+ }
+ 
+ static inline void context_arm_to_x64( ARM64EC_NT_CONTEXT *ec_ctx, const ARM64_NT_CONTEXT *arm_ctx )
+@@ -216,6 +235,14 @@ static inline void context_arm_to_x64( ARM64EC_NT_CONTEXT *ec_ctx, const ARM64_N
+     ec_ctx->X17_3 = arm_ctx->X17 >> 48;
+ 
+     memcpy( ec_ctx->V, arm_ctx->V, sizeof(ec_ctx->V) );
++
++    /* MADEIRA: the other half of the debug-register carry; see context_x64_to_arm. */
++    ec_ctx->AMD64_Dr0 = arm_ctx->Bvr[0];
++    ec_ctx->AMD64_Dr1 = arm_ctx->Bvr[1];
++    ec_ctx->AMD64_Dr2 = arm_ctx->Bvr[2];
++    ec_ctx->AMD64_Dr3 = arm_ctx->Bvr[3];
++    ec_ctx->AMD64_Dr6 = arm_ctx->Wvr[0];
++    ec_ctx->AMD64_Dr7 = arm_ctx->Wvr[1];
+ }
+ 
+ #endif /* __aarch64__ || __arm64ec__ */

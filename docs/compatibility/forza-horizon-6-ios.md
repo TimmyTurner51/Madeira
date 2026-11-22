@@ -693,6 +693,23 @@ taken automatically. Never write it blind:
    native-steam=1` and `PE routing: ... force-ec=0` before concluding anything
    about a game.
 
+**c. The two keys a component unix half NEEDS (not a hazard — a prerequisite).**
+`§4ac` proves a component half leaves the app's statically linked copy of the half
+uninitialised, and the first direct call into it writes to fd 0 and aborts the
+calling pseudo-process (usually `explorer.exe`, the session's main process). Until
+the app-side fix lands, any run with a component half needs:
+
+```
+env.MADEIRA_SRV_CLOSED_IS_EPIPE = 1
+env.MADEIRA_WAIT_CHILDREN = 1
+```
+
+Measured with them: dock host started, `forzahorizon6.exe` spawned at `t+8.043s`,
+session stayed up through the game's fault. Without them: no spawn, or a session torn
+down at ~11 s. These two are the only additions this project's probes require, and
+they are *not* part of the 104/104 stock baseline — remove them to compare against
+stock behaviour.
+
 ### 4v. Iteration win: a dylib change is one push, effective next launch
 
 The two-launch cost seen in §4s was an artefact of deploying through the `Import`
@@ -1326,6 +1343,102 @@ Two fixes landed and are deployed:
 
 ---
 
+### 4ac. MEASURED — a component unix half kills the session, and the reason is that the *static* copy still runs
+
+This is a platform defect, not an FH6 finding, and it was blocking every probe that
+ships as a component. Recorded first because it cost this session's opening hour.
+
+**The failure.** With any component unix half enabled, every dock launch printed:
+
+```
+[srv-wfail] #1 tid=0000 errno=9 request_fd=0 fcntl(F_GETFD)=0 fcntl_errno=9
+            sections=0 abortflag=0 peb=0x0 treat_ebadf_as_epipe=0 rev=ml1382
+wine client error:0: write: Bad file descriptor
+err:thread:abort_process abort_process: status=0x1 — tearing down this pseudo-process only
+[madeira-dock] session ended without a host result
+```
+
+`request_fd=0` is stdin. `tid=0000` and `peb=0x0` mean the caller has no TEB. So a
+thread that is not a Wine client wrote to the wineserver, and the protocol-error path
+took the whole pseudo-process down. With no component enabled the same launch is clean.
+
+**Why it is the static copy.** The probe was rebuilt with a changed marker
+(`rev=ml2122`) and pushed into the component slot (`Components/ml2120-srvbt-native-native/
+files/libntdll_unix.dylib`, verified read-back). The run still printed `rev=ml1382`,
+and the new `[srv-wfail-bt]` backtrace never appeared. That is conclusive: the code
+executing this path is the copy linked into the app binary, not the component. UnixHalf
+redirects the work, but the app still holds direct references into the statically linked
+half — and that copy's `server_request_fd` is never initialised once a component owns
+the real connection, so the first such call writes to fd 0.
+
+**Working configuration until the app-side fix lands** (measured this turn):
+
+```
+env.MADEIRA_SRV_CLOSED_IS_EPIPE = 1     # spurious EBADF ends a thread, not the process
+env.MADEIRA_WAIT_CHILDREN = 1           # session outlives explorer while the game runs
+```
+
+With both: the dock host started, `forzahorizon6.exe` spawned at `t+8.043s`, and the
+game reached its documented fault while the session stayed up. Without them the game
+either never spawned or the session was torn down at ~11 s with
+`the main process exited while 5 child process(es) it started still run`.
+
+The real fix is app-side: those direct references must go through the component's
+dispatch table like the rest of UnixHalf. Until then, **a component half is only usable
+with the two keys above**, and that caveat belongs in every future probe run.
+
+**Separate collateral damage, same shape as the dock bug that was already recorded:**
+`FH6-iOS-1.6-ntdll-builtin` (the PE `ntdll.dll` override carrying the 0002 and
+`[ec-openthread]` probes) breaks the dock *on its own*. With it enabled the log shows
+`[builtin-override] using .../FH6-iOS-1.6-ntdll-builtin-builtin/pe/arm64ec-windows/ntdll.dll`
+and the session dies before the game spawns; disabling it restored
+`host finished (result 0)` and a spawn at `t+6.2s` with every other component still off.
+Treat a global PE `ntdll` override as a test-only setting, never a default.
+
+### 4ad. Four hypotheses falsified this turn (do not re-run these)
+
+Measured on the clean stock run that reproduced `0xC000001D` at `image+0x537099c`:
+
+1. **"The 16MB RWX arena is a staging copy of the image and the copy-back failed."**
+   `[arena-needle] stub@0x537099c = ea e9 6b e6 14; scanning 16.0MB arena for it` →
+   `NOT FOUND: the arena is not a copy of the image around the faulting stub`.
+   `[arena-content] … 0xEA in arena[0,4K)=11 of 4096 (ciphertext ~16, code ~0) | arena==image:NO`.
+   The arena holds high-entropy data that is neither image bytes nor guest code.
+2. **"The arena hunt's 28,416 refusals are the input to the decrypt decision."**
+   This run refused **13** hinted allocations (`STAGE=none err=3` ×12, `err=1` ×1) and the
+   arena was granted, with a byte-identical fault. The hunt's length follows the pool
+   layout, not the protector's decision.
+3. **"The protector's decryptor is a TLS callback we skip."** It runs:
+   `[tls-life] ml704 RUN callbacks module=000000016C2A0000 reason=1 count=2
+   first=0000000172694588`. That address is rva `0x63f4588`, matching the PE TLS
+   directory exactly (below), and `reason=2`/`reason=3` follow for thread attach/detach.
+4. **"The arena is the protector's."** It is a guest `NtAllocateVirtualMemory`
+   (`type=0x3000 prot=0x40`, `req_addr=0x178663000 size=0x1001000`) that FEX then marks as
+   code (`Add SMC interval`), and we downgrade to `rw-` (`[guest-rwx] … applying rw- instead`).
+   That downgrade was already falsified as a fix; the point here is that the buffer is
+   ordinary guest memory, so its contents describe the guest's own unpacking, not ours.
+
+**Offline PE facts about `Reference/forzahorizon6.exe`** (cheap, reusable, no device):
+
+```
+ImageBase 0x140000000  entry 0x5a66394  .text rva 0x1000 vs 0x639ace3
+TLS dir rva 0x7756180 size 0x28, AddressOfCallBacks rva 0x63f4588
+callback[0] rva 0x5a658c0  (83 fa 02 75 … = cmp edx,2; jne)  plaintext
+callback[1] rva 0x5a65e98  (48 8b c4 …)                       plaintext
+```
+So the protected range and the protector's own scaffolding are in the same section, and
+the scaffolding is not encrypted. Whatever was supposed to decrypt `0x537099c` was
+supposed to run before the first call into it.
+
+**Build trap, hit again (the script exists for this):** `build/ntdll-unix/build.sh` builds
+only the static archive. The `.dylib` a component ships comes from `build-dylib.sh`, and
+packaging without it ships the *previous* build silently — the first `[srv-wfail-bt]`
+attempt did exactly that (dylib timestamp 00:53, source edited 01:28, probe string absent
+from the artifact). Always use `tools/local/build-half.sh <version> <desc>`; it refuses a
+dylib older than its newest source.
+
+---
+
 ## 5. Premise corrections
 
 The objective carries "established facts" that no longer match measurement. They
@@ -1343,6 +1456,14 @@ falsified starting point.
 3. **"Dies within ~1 s."** Now ~6 s of real execution (`t+7.633s` spawn,
    `+13.86` at the fault). The longer life is a consequence of §3, not of the
    fault changing.
+4. **"The arena hunt rejects 28,416 consecutive hinted VirtualAllocs (~1GB) — the
+   single most Windows-unlike input."** Re-measured on a stock run: **13** refusals,
+   arena granted, byte-identical fault (§4ad item 2). The count tracks the pool
+   layout, so it is a symptom to correlate, not a decision input.
+5. **"The protector allocates a 16MB+64KB RWX arena"** is true but not protective
+   machinery: it is a plain guest `NtAllocateVirtualMemory`, and its contents do not
+   match the image (§4ad items 1 and 4). Do not model the decrypt as "copy the arena
+   into `.text`".
 
 Still standing and re-confirmed: the faulting bytes are ciphertext at fault time,
 and the fault is at `image+0x537099c`.

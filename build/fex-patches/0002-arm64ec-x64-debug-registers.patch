@@ -1,0 +1,155 @@
+diff --git a/FEXCore/include/FEXCore/Debug/InternalThreadState.h b/FEXCore/include/FEXCore/Debug/InternalThreadState.h
+index edad382e2..bd5f46cfa 100644
+--- a/FEXCore/include/FEXCore/Debug/InternalThreadState.h
++++ b/FEXCore/include/FEXCore/Debug/InternalThreadState.h
+@@ -158,6 +158,16 @@ struct alignas(FEXCore::Utils::FEX_PAGE_SIZE) InternalThreadState : public FEXCo
+   uint64_t JITGuardOverflowArgument {};
+   FEXCore::UncheckedLongJump::JumpBuf RestartJump;
+ 
++  /* MADEIRA: the guest's x64 debug registers. The host has no copy of Dr0-Dr7, so this thread
++   * state is the store of record; ntdll publishes them through BTCpu64GetContext/SetContext, and
++   * their trip through an ARM64 context is described in wine's dlls/ntdll/unwind.h. Plain POD and
++   * deliberately not thread_local: the ARM64EC module has no implicit TLS (see the module's notes). */
++  struct {
++    uint64_t dr[4] {};
++    uint64_t dr6 {};
++    uint64_t dr7 {};
++  } GuestDebugRegisters;
++
+   // BaseFrameState should always be at the end, directly before the interrupt fault page
+   FEXCore::Core::CpuStateFrame BaseFrameState {};
+ 
+diff --git a/Source/Windows/ARM64EC/BTInterface.h b/Source/Windows/ARM64EC/BTInterface.h
+index d57603079..f9c24feb2 100644
+--- a/Source/Windows/ARM64EC/BTInterface.h
++++ b/Source/Windows/ARM64EC/BTInterface.h
+@@ -18,6 +18,9 @@ NTSTATUS STDMETHODCALLTYPE NotifyMapViewOfSection(void* Unk1, void* Address, voi
+ void STDMETHODCALLTYPE NotifyUnmapViewOfSection(void* Address, BOOL After, NTSTATUS Status);
+ void STDMETHODCALLTYPE FlushInstructionCacheHeavy(const void* Address, SIZE_T Size);
+ void STDMETHODCALLTYPE BTCpu64FlushInstructionCache(const void* Address, SIZE_T Size);
++/* MADEIRA: x64 debug registers live in the emulator's thread state; ntdll asks for them here. */
++void STDMETHODCALLTYPE BTCpu64GetContext(HANDLE ThreadHandle, ARM64_NT_CONTEXT* Context);
++void STDMETHODCALLTYPE BTCpu64SetContext(HANDLE ThreadHandle, const ARM64_NT_CONTEXT* Context);
+ void STDMETHODCALLTYPE BTCpu64NotifyMemoryDirty(void* Address, SIZE_T Size);
+ void STDMETHODCALLTYPE BTCpu64NotifyReadFile(HANDLE Handle, void* Address, SIZE_T Size, BOOL After, NTSTATUS Status);
+ BOOLEAN STDMETHODCALLTYPE BTCpu64IsProcessorFeaturePresent(UINT Feature);
+diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+index 7190ed04e..fb6c5df81 100644
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -1829,6 +1829,89 @@ void BTCpu64FlushInstructionCache(const void* Address, SIZE_T Size) {
+   InvalidationTracker->InvalidateAlignedInterval(reinterpret_cast<uint64_t>(Address), static_cast<uint64_t>(Size), false);
+ }
+ 
++/* MADEIRA: the guest's x64 debug registers.
++ *
++ * There are no x64 debug registers on the host, so the emulator's thread state is where they live
++ * (see GuestDebugRegisters in InternalThreadState.h) and ntdll asks for them here whenever a caller
++ * passes CONTEXT_DEBUG_REGISTERS to NtGet/SetContextThread. The transport is the native ARM64
++ * context's breakpoint and watchpoint slots — Bvr[0..3] carry Dr0..Dr3, Wvr[0]/Wvr[1] carry
++ * Dr6/Dr7 — which is lossless and costs nothing, because a 64-bit guest never uses ARM64
++ * watchpoints. wine's dlls/ntdll/unwind.h maps the two layouts; the pair of conventions is private
++ * to this emulator and that header.
++ *
++ * Only the calling thread is serviced. Reaching another thread's GuestDebugRegisters needs a
++ * TID-keyed lookup this build does not have, and answering with the wrong thread's values would be
++ * worse than answering with none: it is exactly the kind of internally-inconsistent state that
++ * anti-tamper code treats as hostile. A miss is reported once and leaves the context untouched. */
++static bool IsCurrentThreadHandle(HANDLE ThreadHandle) {
++  if (ThreadHandle == GetCurrentThread()) {
++    return true;
++  }
++
++  THREAD_BASIC_INFORMATION Info;
++  if (NtQueryInformationThread(ThreadHandle, ThreadBasicInformation, &Info, sizeof(Info), nullptr)) {
++    return false;
++  }
++  return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(Info.ClientId.UniqueThread)) == GetCurrentThreadId();
++}
++
++static void LogForeignDebugRegisterAccess(const char* What, HANDLE ThreadHandle) {
++  static std::atomic<unsigned> Reported {0};
++  if (Reported.fetch_add(1, std::memory_order_relaxed) < 8) {
++    LogMan::Msg::EFmt("[dbgregs] {} for handle {:p} is not the calling thread: this build keeps x64 debug "
++                      "registers per thread and has no cross-thread lookup, so the request is not answered",
++                      What, ThreadHandle);
++  }
++}
++
++void STDMETHODCALLTYPE BTCpu64GetContext(HANDLE ThreadHandle, ARM64_NT_CONTEXT* Context) {
++  if (!Context) {
++    return;
++  }
++
++  if (!IsCurrentThreadHandle(ThreadHandle)) {
++    LogForeignDebugRegisterAccess("get", ThreadHandle);
++    return;
++  }
++
++  auto* Thread = GetCPUArea().ThreadState();
++  if (!Thread) {
++    return;
++  }
++
++  const auto& Debug = Thread->GuestDebugRegisters;
++  Context->Bvr[0] = Debug.dr[0];
++  Context->Bvr[1] = Debug.dr[1];
++  Context->Bvr[2] = Debug.dr[2];
++  Context->Bvr[3] = Debug.dr[3];
++  Context->Wvr[0] = Debug.dr6;
++  Context->Wvr[1] = Debug.dr7;
++}
++
++void STDMETHODCALLTYPE BTCpu64SetContext(HANDLE ThreadHandle, const ARM64_NT_CONTEXT* Context) {
++  if (!Context) {
++    return;
++  }
++
++  if (!IsCurrentThreadHandle(ThreadHandle)) {
++    LogForeignDebugRegisterAccess("set", ThreadHandle);
++    return;
++  }
++
++  auto* Thread = GetCPUArea().ThreadState();
++  if (!Thread) {
++    return;
++  }
++
++  auto& Debug = Thread->GuestDebugRegisters;
++  Debug.dr[0] = Context->Bvr[0];
++  Debug.dr[1] = Context->Bvr[1];
++  Debug.dr[2] = Context->Bvr[2];
++  Debug.dr[3] = Context->Bvr[3];
++  Debug.dr6 = Context->Wvr[0];
++  Debug.dr7 = Context->Wvr[1];
++}
++
+ void BTCpu64NotifyMemoryDirty(void* Address, SIZE_T Size) {
+   if (!InvalidationTracker || ProcessTerminating.load(std::memory_order_relaxed) || !GetCPUArea().ThreadState()) {
+     return;
+diff --git a/Source/Windows/ARM64EC/libarm64ecfex.def b/Source/Windows/ARM64EC/libarm64ecfex.def
+index 05650ac9e..1afd6ea9d 100644
+--- a/Source/Windows/ARM64EC/libarm64ecfex.def
++++ b/Source/Windows/ARM64EC/libarm64ecfex.def
+@@ -2,6 +2,8 @@ LIBRARY libarm64ecfex.dll
+ 
+ EXPORTS
+   BTCpu64FlushInstructionCache
++  BTCpu64GetContext
++  BTCpu64SetContext
+   BTCpu64IosReleaseThreadHolds
+   BTCpu64IsProcessorFeaturePresent
+   BTCpu64NotifyMemoryDirty
+diff --git a/Source/Windows/ARM64EC/libarm64ecfex_ios.def b/Source/Windows/ARM64EC/libarm64ecfex_ios.def
+index af71a6841..661455b1f 100644
+--- a/Source/Windows/ARM64EC/libarm64ecfex_ios.def
++++ b/Source/Windows/ARM64EC/libarm64ecfex_ios.def
+@@ -5,6 +5,8 @@ LIBRARY libarm64ecfex.dll
+ 
+ EXPORTS
+   BTCpu64FlushInstructionCache
++  BTCpu64GetContext
++  BTCpu64SetContext
+   BTCpu64IosAddAliasMapping
+   BTCpu64IosRipFromHostPC
+   BTCpu64IosSetMonoBridge

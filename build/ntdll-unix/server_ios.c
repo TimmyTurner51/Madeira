@@ -30,6 +30,7 @@
 #include <os/log.h>
 #include <pthread.h>
 #include <dlfcn.h>
+#include <execinfo.h>   /* ml2120: backtrace() on the failing server write */
 #include <mach/mach.h>
 #include <mach/mach_time.h>
 #include <mach/mach_vm.h>
@@ -708,6 +709,7 @@ static unsigned int send_request( const struct __server_request_info *req )
     {
         static int closed_is_epipe = -1;
         static int logged;
+        static int bt_logged;   /* ml2120 */
         int w_errno = errno;
         int fd_state = fcntl( request_fd, F_GETFD );
         int fcntl_errno = errno;
@@ -720,10 +722,34 @@ static unsigned int send_request( const struct __server_request_info *req )
         }
         if (__sync_fetch_and_add( &logged, 1 ) < 8 )
             dprintf( 2, "[srv-wfail] #%d tid=%04x errno=%d request_fd=%d fcntl(F_GETFD)=%d "
-                     "fcntl_errno=%d sections=%u abortflag=%u peb=%p treat_ebadf_as_epipe=%d rev=ml1382\n",
+                     "fcntl_errno=%d sections=%u abortflag=%u peb=%p treat_ebadf_as_epipe=%d rev=ml2122\n",
                      logged, (unsigned)GetCurrentThreadId(), w_errno, request_fd, fd_state, fcntl_errno,
                      (unsigned)(sec & IOS_SECTION_DEPTH), (sec & IOS_SECTION_ABORT) ? 1u : 0u,
                      (void *)NtCurrentTeb()->Peb, closed_is_epipe );
+        /* ml2120: WHO is writing. The probe above says a thread with no TEB
+         * (tid=0000, peb=0x0) wrote to fd 0, which is stdin; a real Wine client
+         * thread never looks like that. Two copies of this half can be live in
+         * one process (the app links libntdll_unix.a AND dlopen's the component
+         * dylib), so the question is which copy -- and which caller -- reaches
+         * this write. Print a native backtrace once: the addresses resolve
+         * against libntdll_unix.dylib plus the app binary, and the second copy
+         * shows up as a different module in the same frame list. */
+        if (__sync_fetch_and_add( &bt_logged, 1 ) < 2 )
+        {
+            void *bt[24];
+            int n = backtrace( bt, 24 ), k;
+            dprintf( 2, "[srv-wfail-bt] #%d frames=%d\n", bt_logged, n );
+            for (k = 0; k < n; k++)
+            {
+                Dl_info di;
+                if (dladdr( bt[k], &di ) && di.dli_fbase)
+                    dprintf( 2, "[srv-wfail-bt]   %2d %p %s+0x%lx\n", k, bt[k],
+                             di.dli_fname ? di.dli_fname : "?", 
+                             (unsigned long)((uintptr_t)bt[k] - (uintptr_t)di.dli_fbase) );
+                else
+                    dprintf( 2, "[srv-wfail-bt]   %2d %p (no module)\n", k, bt[k] );
+            }
+        }
         errno = w_errno;
         if (w_errno == EBADF && closed_is_epipe)
         {

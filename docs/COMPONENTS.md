@@ -38,6 +38,7 @@ next launch. A session already running keeps the files it started with.
 | `profile.json` type | Treated as | Files linked |
 |---|---|---|
 | contains `FEXCore` | FEX | `libarm64ecfex.dll` → `system32/xtajit64.dll`, `libwow64fex.dll` → `system32/xtajit.dll` |
+| contains `Builtin` | Wine builtins (PE override) | staged in the component, ahead of the bundle on `WINEDLLPATH` — see below |
 | contains `Wine` or `Proton` | Wine | `.dll`, `.drv` and `.cpl` files, by their architecture folder |
 | anything else with a `libarm64ecfex.dll` | FEX | as above |
 | anything else with DLLs | Wine | as above |
@@ -55,6 +56,32 @@ The package's own `files[].target` paths (DroidDeck writes `${proton}/...` and
 `${system32}/...`) are not required; the importer resolves each file by its name
 and architecture folder. A `.so` in a FEX package is kept but not linked:
 Madeira runs the PE modules, not a Linux host.
+
+## PE builtins that must come from a package (`Wine-Builtin`)
+
+Most Wine PE files live in the prefix and are linked there. `ntdll.dll` does not: Wine's
+loader takes it from `WINEDLLPATH`, and the app points that at its own bundle. A package whose
+type contains `Builtin` is therefore not linked into the prefix at all — its arch-folder DLLs
+are staged into the component folder and that folder is put **in front of the bundle**:
+
+| | |
+|---|---|
+| staged at | `Documents/Components/<id>/pe/arm64ec-windows/ntdll.dll` |
+| `WINEDLLPATH` becomes | `<that pe directory>:<app bundle>` |
+| switching the component off | the bundle's own copy is used again |
+| the bundle or its signature | unchanged |
+
+```json
+{ "type": "Wine-Builtin", "versionName": "ntdll-1.5", "versionCode": 1,
+  "files": [ { "source": "files/lib/wine/arm64ec-windows/ntdll.dll",
+               "target": "${system32}/ntdll.dll" } ] }
+```
+
+`tools/wcp/make-builtin-wcp.sh <version-name> <dll>...` builds one, and the log line
+`WINEDLLPATH=... (builtin override first)` confirms the ordering took effect. Only the newest
+enabled builtin package contributes, so a replacement release needs no manual removal of the
+previous one. A DLL outside `arm64ec-windows`, `aarch64-windows` or `i386-windows` is refused:
+landing a module in an architecture it was not built for is worse than not installing it.
 
 ## Environment variables
 
