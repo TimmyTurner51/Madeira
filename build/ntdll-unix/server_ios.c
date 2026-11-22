@@ -5740,6 +5740,55 @@ void process_exit_wrapper( int status )
          * hook with one integer argument: no names, no allocation, no logging;
          * helpers and anything the program starts have a slot and never call it. */
         extern void wine_launched_process_did_exit( int status ) __attribute__((weak));
+
+        /* ml2027: THE LAUNCHER-STUB WAIT, DONE WHERE THE CHILD TABLE LIVES.
+         * WineProcessBridge.m has this wait (MADEIRA_WAIT_CHILDREN), but it reads
+         * madeira_live_game_children through the app's linked archive copy of this
+         * half. spawn_process fills the child table from the unix side, so with a
+         * unix-half component installed (the normal case for this project) the app's
+         * copy is a different array that is always empty and the wait never fires.
+         * Measured, FH6 on device: dockhost.exe -- the session's first program, a
+         * launcher that hands the client to Steam and exits -- ended at 15 s, the
+         * game Steam had started was still loading, and the session ended with it.
+         *
+         * Doing it here has the table, so a launcher's exit keeps the session while
+         * a game it started runs. Same opt-in as the app-side wait: a child that ends
+         * from a worker thread can leave its slot counted (process_ios.c), so a
+         * session without the switch behaves exactly as before. */
+        {
+            extern int madeira_live_game_children( char *buf, int len, double max_age );
+            extern int madeira_live_user_processes( char *buf, int len );
+            const char *wc = getenv( "MADEIRA_WAIT_CHILDREN" );
+            char names[256], all[256];
+            int n = madeira_live_game_children( names, sizeof names, 60.0 );
+            int seen = madeira_live_user_processes( all, sizeof all );
+
+            /* ml2029: unconditional, once per session end. Without it a silent run
+             * cannot be told from "the table never had the game" -- ml2028 was silent
+             * with forzahorizon6.exe demonstrably alive in the same second. */
+            dprintf( 2, "[child-census] ml2029 session end status=%d wc=%s games=%d(%s) used=%d(%s) "
+                     "session=%p caller=%p\n", status, wc ? wc : "(unset)", n, names, seen, all,
+                     ios_session_peb_get(), ios_jit_current_peb() );
+
+            if (wc && wc[0] == '1' && n > 0)
+            {
+                unsigned ticks = 0;
+                dprintf( 2, "[Wine ntdll/server] ml2027: the session's first program ended but %d "
+                         "child process(es) it started still run (%s) -- keeping the session "
+                         "(MADEIRA_WAIT_CHILDREN=1)\n", n, names );
+                wine_log_write( "[Wine ntdll/server] ml2027 session held for %d child process(es): %s",
+                                n, names );
+                while ((n = madeira_live_game_children( names, sizeof names, -1.0 )) > 0)
+                {
+                    usleep( 200 * 1000 );
+                    if ((++ticks % 300) == 0)
+                        dprintf( 2, "[Wine ntdll/server] ml2027 still running: %d child process(es) "
+                                 "(%s), %u s\n", n, names, ticks / 5 );
+                }
+                wine_log_write( "[Wine ntdll/server] ml2027 the last child exited after %u s", ticks / 5 );
+            }
+        }
+
         if (wine_launched_process_did_exit) wine_launched_process_did_exit( status );
         close( fd_socket );
     }

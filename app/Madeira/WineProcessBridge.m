@@ -346,6 +346,18 @@ extern void wine_log_set_file(const char *path);
 extern int madeira_unix_half_start(int argc, char *argv[]);
 extern int madeira_unix_half_set_log_file(const char *path);
 extern int madeira_unix_half_set_main_i386(int value);
+/* Returns the count the loaded half sees, or -1 when no component is loaded. The child
+ * table is filled by the unix side, so it lives in the half's image: asking the linked
+ * archive instead reads an array nothing fills and answers 0 for a running game. */
+extern int madeira_unix_half_live_game_children(char *buf, int len, double max_age);
+extern int madeira_live_game_children(char *buf, int len, double max_age);
+
+/* The child table of whichever half is running. */
+static int madeira_live_children(char *buf, int len, double max_age)
+{
+    int n = madeira_unix_half_live_game_children(buf, len, max_age);
+    return n >= 0 ? n : madeira_live_game_children(buf, len, max_age);
+}
 
 /* madeira-bcd: env.MADEIRA_SRV_FGETPATH of the launch in progress, read by the in-app
  * wineserver (build/wineserver/fd_ios.c), which is running before a game's env lines
@@ -2886,10 +2898,9 @@ static void *wine_process_thread(void *arg) {
          * own config): a child that ends from a worker thread never releases its
          * slot (process_ios.c), and the session would then wait forever. */
         {
-            extern int madeira_live_game_children(char *buf, int len, double max_age);
-            const char *wc = getenv("MADEIRA_WAIT_CHILDREN");
             char names[256];
-            int n = madeira_live_game_children(names, sizeof names, 60.0);
+            int n = madeira_live_children(names, sizeof names, 60.0);
+            const char *wc = getenv("MADEIRA_WAIT_CHILDREN");
             if (n > 0 && !(wc && wc[0] == '1')) {
                 dprintf(STDERR_FILENO, "[WineProc] the main process exited while %d child process(es) it started "
                         "still run (%s); the session ends with it (MADEIRA_WAIT_CHILDREN=1 keeps it while they run)\n",
@@ -2899,7 +2910,7 @@ static void *wine_process_thread(void *arg) {
                         "it started still run (%s) -- a launcher started the game; the session goes on until "
                         "they exit (MADEIRA_WAIT_CHILDREN=1)\n", n, names);
                 unsigned ticks = 0;
-                while ((n = madeira_live_game_children(names, sizeof names, -1.0)) > 0) {
+                while ((n = madeira_live_children(names, sizeof names, -1.0)) > 0) {
                     usleep(200 * 1000);
                     if ((++ticks % 300) == 0)
                         dprintf(STDERR_FILENO, "[WineProc] still running: %d child process(es) (%s), %u s\n",

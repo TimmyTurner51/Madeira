@@ -592,6 +592,62 @@ The 5 remaining unhandled exceptions are unrelated addresses
 (`0x111f59bfc` `addr=0x8` twice, `0x198e1ff94` `addr=0x0` twice — the known wild
 pointer from 4b — and `0x1106c59ac` `type=6`).
 
+### 4n. The session-ending exit is not in the copy a `.wcp` can patch
+
+Four consecutive unix-half packages were pushed, verified loaded on device, and produced no
+output at all on the path that ends the session:
+
+| package | probe | result |
+|---|---|---|
+| `unixhalf-ml1381-ebadf` | `[srv-ebadf]`, EBADF only | silent |
+| `unixhalf-ml1382-wfail` | `[srv-wfail]`, **any** failed server write | silent |
+| `unixhalf-ml2027/2028-sessionhold` | hold the session while a spawned game runs (unconditional on entry to the else-branch) | silent |
+| `unixhalf-ml2029-census` | **unconditional** `[child-census]` line at every session exit | silent |
+
+Each was confirmed to be the loaded half (`[unix-half] component half INSTALLED from
+…unixhalf-ml2029-census-native…`, and the strings are in the pushed dylib), and each run
+still ended with the same sequence:
+
+```
+wine client error:0: write: Bad file descriptor
+err:thread:abort_process abort_process: status=0x1 — tearing down this pseudo-process only
+[Wine ntdll/server] process_exit_wrapper(1)
+[WineProc] Wine exited with code 1 (caught by longjmp)
+```
+
+The exception backtrace names the image, and it is the app, not the component:
+
+```
+bt[0] Madeira.debug.dylib`__wine_main / init_options
+bt[2] Madeira.debug.dylib`abort_process+0x58
+bt[3] Madeira.debug.dylib`abort_thread
+bt[5] Madeira.debug.dylib`wait_select
+```
+
+So the half that reaches `server_protocol_perror("write")` → `abort_thread` → `abort_process`
+→ `process_exit_wrapper` → `exit()` is the **static archive linked into
+`Madeira.debug.dylib`**. That is why every probe in the component was silent: none of them
+was on the failing path. `GetCurrentThreadId()` printing **0** in the message (`wine client
+error:0:`) agrees — the writer has no TEB.
+
+Consequence, and it retracts an earlier conclusion: **unix-half instrumentation is not
+sufficient to diagnose or fix this path, whatever the packaging says.** A change to
+`server_ios.c` reaches it only through an app rebuild. `app/Madeira/libntdll_unix.a` is
+already rebuilt from the current sources, so the next app build carries the probes, the
+holder and the entry-surface reader together.
+
+What the run also shows is that the game is no longer failing at the fault this document
+was opened for. In the same run the game loaded its own code:
+
+```
+00e8: NtProtectVirtualMemory(orig=0x131851000 sz=0x639ae00 prot=0x4)
+[rva-probe] #1 tid=00e8 pe=0x136bc099c+0x537099c new_prot=0x4 bytes: ea e9 6b e6 14 48 89 7c
+```
+
+i.e. it committed and protected 104 MB of `.text`, and the stub at image+0x537099c is still
+ciphertext, as §4g says it should be at that moment. The remaining blocker before any window
+can appear is now this exit path, not the protection.
+
 ### 4m. The failing write is NOT in the component half — it needs an app rebuild
 
 Two probes were pushed as `native` components and measured on device:
@@ -628,6 +684,35 @@ The probes are kept in the source (behind `#ifdef WINE_IOS`, no behaviour change
 default) so the next app rebuild answers the fd question immediately, and
 `MADEIRA_SRV_CLOSED_IS_EPIPE=1` is available to test the "closed pipe is the
 killed-thread case" hypothesis in that same rebuild.
+
+### 4o. What the dock session looks like end to end (measured, JIT on)
+
+A clean run with JIT, `env.MADEIRA_DOCK_HIDE_DESKTOP = 0`, `env.MADEIRA_WAIT_CHILDREN = 1`,
+`unixhalf-ml2029-census`:
+
+```
+t+0.67s  spawn dockhost.exe          (the session's first program after explorer.exe is the
+                                      desktop: argv[1]=explorer.exe /desktop=…, argv[3]=dockhost.exe)
+t+0.76s  spawn conhost.exe
+t+0.82s  spawn rpcss.exe
+t+5.15s  spawn forzahorizon6.exe     (Steam's launch, from dockhost's client hand-off)
+t+5.2s   game commits/protects 104 MB of its own .text; rva-probe sees the stub still `ea`
+t+~13s   a TEB-less thread writes to a torn-down server pipe → EBADF → abort_process(1)
+         → process_exit_wrapper(1) → exit() → longjmp → [WineProc] stopping wineserver
+```
+
+So `dockhost.exe` is a launcher stub in the sense `MADEIRA_WAIT_CHILDREN` was written for,
+and the game it starts is a *grandchild* (dockhost → Steam client → game). `[dock-report]
+launch-client-error=0` is dockhost saying the hand-off worked, seconds before the session
+ends.
+
+`MADEIRA_WAIT_CHILDREN=1` did not hold it, and the reason is not the value: the check is in
+`WineProcessBridge.m`, which calls `madeira_live_game_children` through the app's linked
+copy of the half, while `spawn_process` fills the child table from the unix side. With a
+unix-half component installed those are different arrays, so the app's copy is always empty
+and both the launcher-stub wait and the program-end watch silently do nothing. That is why
+ml2027 moved the wait into the half (`server_ios.c`, where the table is) and ml2029 logs the
+table unconditionally — but per §4n neither ran, because the exit is in the archive copy.
 
 ### 4e. Scope note
 

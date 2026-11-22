@@ -39,6 +39,7 @@ cat > "$EXPORTS" <<'LIST'
 _madeira_unix_half_main
 _madeira_unix_half_log_set_file
 _madeira_unix_half_main_i386_addr
+_madeira_unix_half_live_game_children
 LIST
 
 # The archive's object list, in the same order build.sh passes it.

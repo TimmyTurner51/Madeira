@@ -46,16 +46,21 @@ enum UnixHalf {
     private static let mainSymbol = "madeira_unix_half_main"
     private static let logSetFileSymbol = "madeira_unix_half_log_set_file"
     private static let mainI386Symbol = "madeira_unix_half_main_i386_addr"
+    /// Optional: a component built before this existed has no child-table reader, and the
+    /// caller then falls back to the linked archive's copy as before.
+    private static let liveGameChildrenSymbol = "madeira_unix_half_live_game_children"
 
     /// Signature of the loaded half's `__wine_main`, as the app calls it.
     private typealias MainFn = @convention(c) (Int32, UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?) -> Void
     private typealias LogSetFileFn = @convention(c) (UnsafePointer<CChar>?) -> Void
     private typealias MainI386AddrFn = @convention(c) () -> UnsafeMutablePointer<Int32>?
+    private typealias LiveGameChildrenFn = @convention(c) (UnsafeMutablePointer<CChar>?, Int32, Double) -> Int32
 
     private static var handle: UnsafeMutableRawPointer?
     private static var mainFn: MainFn?
     private static var logSetFileFn: LogSetFileFn?
     private static var mainI386AddrFn: MainI386AddrFn?
+    private static var liveGameChildrenFn: LiveGameChildrenFn?
 
     /// Whether a component's half is in use. When false, the linked archive is.
     static private(set) var componentLoaded = false
@@ -128,6 +133,9 @@ enum UnixHalf {
         mainFn = unsafeBitCast(main, to: MainFn.self)
         logSetFileFn = unsafeBitCast(logSetFile, to: LogSetFileFn.self)
         mainI386AddrFn = unsafeBitCast(mainI386Addr, to: MainI386AddrFn.self)
+        if let children = dlsym(loaded, liveGameChildrenSymbol) {
+            liveGameChildrenFn = unsafeBitCast(children, to: LiveGameChildrenFn.self)
+        }
         componentLoaded = true
         return report("[unix-half] component half INSTALLED from \(path)")
     }
@@ -154,6 +162,22 @@ enum UnixHalf {
         guard let mainI386AddrFn, let address = mainI386AddrFn() else { return false }
         address.pointee = value
         return true
+    }
+
+    /// Ask the running half which child pseudo-processes it started are still alive.
+    ///
+    /// The table is filled by `spawn_process`, which is unix side, so it exists in the
+    /// loaded half's image. The linked archive's copy is a different array and is empty
+    /// while a component runs — reading it made `MADEIRA_WAIT_CHILDREN` and the
+    /// launcher-stub protection silently do nothing (a Dock session ended when
+    /// `dockhost.exe` exited even though the game it had started was still loading).
+    ///
+    /// Returns `nil` when no component is loaded or it predates this accessor: the caller
+    /// then uses the linked symbol, which is correct when the archive is what runs.
+    static func liveGameChildren(_ buffer: UnsafeMutablePointer<CChar>?,
+                                 _ length: Int32, _ maxAge: Double) -> Int32? {
+        guard let liveGameChildrenFn else { return nil }
+        return liveGameChildrenFn(buffer, length, maxAge)
     }
 
     /// One line to both channels: the app log, which is what a session is read from, and
@@ -197,4 +221,14 @@ public func madeiraUnixHalfSetLogFile(_ path: UnsafePointer<CChar>?) -> Int32 {
 @_cdecl("madeira_unix_half_set_main_i386")
 public func madeiraUnixHalfSetMainI386(_ value: Int32) -> Int32 {
     UnixHalf.setMainImageI386(value) ? 1 : 0
+}
+
+/// Count the child pseudo-processes the loaded half started that are still alive, and write
+/// their names into `buffer`. Returns -1 when no component is loaded (the caller then reads
+/// the linked archive's table), which is why 0 is a real answer here and not "unavailable".
+@_cdecl("madeira_unix_half_live_game_children")
+public func madeiraUnixHalfLiveGameChildren(_ buffer: UnsafeMutablePointer<CChar>?,
+                                            _ length: Int32,
+                                            _ maxAge: Double) -> Int32 {
+    UnixHalf.liveGameChildren(buffer, length, maxAge) ?? -1
 }
