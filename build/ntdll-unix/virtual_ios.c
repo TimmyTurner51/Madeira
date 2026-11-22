@@ -2237,10 +2237,30 @@ static void ios_stub_census_once_init( void )
 {
     pthread_t t;
     int rc;
-    if (getenv( "MADEIRA_STUB_CENSUS_OFF" ))
+    /* ml2126 (regression sweep): OPT-IN, not opt-out.
+     *
+     * This sampler started for EVERY session and every title, because when it was
+     * written the quickest way to get samples was to run it unconditionally. Two
+     * things make that the wrong default: it creates a detached thread inside the
+     * loader path, and that thread walks OTHER images' memory -- the 2026-11-21 run
+     * died in it on a 1MB stack frame. No title outside this investigation wants
+     * either, and nothing should pay for it silently.
+     *
+     * MADEIRA_STUB_CENSUS=1 now enables it, and the component that needs it sets
+     * that itself, so a stock session never starts the thread. MADEIRA_STUB_CENSUS_OFF
+     * still wins, so a run that sets both keeps the behaviour it asked for. */
     {
-        dprintf( 2, "[stub-census] ml2037 disabled by MADEIRA_STUB_CENSUS_OFF\n" );
-        return;
+        static int enabled = -1;
+        if (enabled < 0)
+        {
+            const char *e = getenv( "MADEIRA_STUB_CENSUS" );
+            enabled = (e && e[0] == '1' && !e[1]);
+        }
+        if (!enabled || getenv( "MADEIRA_STUB_CENSUS_OFF" ))
+        {
+            dprintf( 2, "[stub-census] ml2126 not enabled (set MADEIRA_STUB_CENSUS=1); no samples this run\n" );
+            return;
+        }
     }
     rc = pthread_create( &t, NULL, ios_stub_census_thread_start, NULL );    if (rc)
     {
@@ -27347,9 +27367,20 @@ static unsigned int virtual_map_section( HANDLE handle, PVOID *addr_ptr, ULONG_P
             prev = NtCurrentTeb64()->Tib.ArbitraryUserPointer;
             NtCurrentTeb64()->Tib.ArbitraryUserPointer = PtrToUlong(NtCurrentTeb()->Tib.ArbitraryUserPointer);
         }
-        /* ml2117: name the file this view is coming from, before builtin replacement. */
-        if (image_info)
+        /* ml2117: name the file this view is coming from, before builtin replacement.
+         *
+         * ml2126 (regression sweep): OPT-IN. Resolving the unix path costs a wineserver
+         * round trip plus an fcntl for EVERY builtin image, on the loader path, only to
+         * write a log line. MADEIRA_MAP_NAME=1 enables it. */
         {
+            static int map_name_on = -1;
+            if (map_name_on < 0)
+            {
+                const char *e = getenv( "MADEIRA_MAP_NAME" );
+                map_name_on = (e && e[0] == '1' && !e[1]);
+            }
+            if (map_name_on)
+            {
             char nb[260]; int ni = 0;
             if (nt_name.Buffer)
                 for (; ni < nt_name.Length / 2 && ni < 255; ni++) nb[ni] = (char)nt_name.Buffer[ni];
@@ -27366,6 +27397,7 @@ static unsigned int virtual_map_section( HANDLE handle, PVOID *addr_ptr, ULONG_P
                     close( ufd );
                 }
                 dprintf( 2, "[map-name] '%s' machine=0x%x\n    file=%s\n", nb, machine, up );
+            }
             }
         }
         /* check if we can replace that mapping with the builtin */
@@ -36644,13 +36676,50 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
                                 if (differ)
                                 {
                                     text_sync_n++;
-                                    dprintf( 2, "[text-sync] ml2039 #%u %p region=0x%lx off=0x%lx: .text differ=%lu of %lu "
-                                             "bytes at protect-to-exec (guest view has edits the pool copy "
-                                             "does NOT get) | first offs:", text_sync_n, base,
+                                    dprintf( 2, "[text-sync] ml2127 #%u %p (%s) region=0x%lx off=0x%lx: .text differ=%lu of %lu "
+                                             "bytes at protect-to-exec (guest view and pool copy DISAGREE; "
+                                             "the runs below say which side holds what) | first offs:", text_sync_n, base,
+                                             ios_pe_module_name( (void *)pe_start, (size_t)size ),
                                              (unsigned long)size, (unsigned long)off,
                                              (unsigned long)differ, (unsigned long)(hi - lo) );
                                     for (i = 0; i < nfirst; i++) dprintf( 2, " 0x%x", first[i] );
                                     dprintf( 2, "\n" );
+                                    /* ml2125: WHAT did the guest actually write?
+                                     *
+                                     * "10 bytes differ" is the one observed guest edit to .text, and
+                                     * everything said about it so far was inferred from offsets. Dump
+                                     * the bytes instead: for each contiguous differing run (up to 6),
+                                     * print the guest view and the pool copy. An `e9 rel32` or `eb rel8`
+                                     * at a run start names its own target, so a hook can be decoded
+                                     * offline; plaintext replacing ciphertext names a decryption.
+                                     * Bounded: 6 runs x 24 bytes per line, at most 40 lines a run. */
+                                    {
+                                        unsigned runs = 0;
+                                        size_t k = 0;
+                                        while (k < hi - lo && runs < 6)
+                                        {
+                                            size_t start, e, n, cl;
+                                            unsigned char gc[24], pc[24];
+                                            if (g[k] == p[k]) { k++; continue; }
+                                            start = k; e = k;
+                                            while (e < hi - lo && g[e] != p[e]) { e++; k++; }
+                                            /* ml2127: 24 bytes FROM THE RUN START, not the run
+                                             * length. A 1-byte difference in the middle of an
+                                             * instruction cannot be decoded from that byte
+                                             * alone -- the first run of this probe printed
+                                             * `guest=44 pool=84` and nothing else, which is
+                                             * not enough to say which side re-encoded what. */
+                                            cl = (hi - start < sizeof(gc)) ? hi - start : sizeof(gc);
+                                            for (n = 0; n < cl; n++) { gc[n] = g[start + n]; pc[n] = p[start + n]; }
+                                            dprintf( 2, "[text-sync]   run +0x%lx len=%lu guest=",
+                                                     (unsigned long)(off + start), (unsigned long)(e - start) );
+                                            for (n = 0; n < cl; n++) dprintf( 2, "%02x", gc[n] );
+                                            dprintf( 2, " pool=" );
+                                            for (n = 0; n < cl; n++) dprintf( 2, "%02x", pc[n] );
+                                            dprintf( 2, "\n" );
+                                            runs++;
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -38825,6 +38894,60 @@ NTSTATUS WINAPI NtReadVirtualMemory( HANDLE process, const void *addr, void *buf
 }
 
 
+/* ml2128: distinguish "the protector declined to write" from "it wrote somewhere
+ * that is not the image".
+ *
+ * §4ah measured that FH6's protector takes .text from PAGE_EXECUTE_READ to
+ * PAGE_READWRITE -- the first step of an in-place decrypt -- and then never
+ * writes a byte: the census finds all 4,538 watched entries still ciphertext at
+ * t=5.0/7.4/9.8s. Those are two different bugs with two different fixes, and the
+ * two APIs an in-place decryptor must use separate them:
+ *
+ *   - NtWriteVirtualMemory  -> wrote through the kernel, or never called it
+ *   - NtFlushInstructionCache -> it *thinks* it patched code
+ *
+ * Log every range that overlaps a registered image AT ALL, not just .text,
+ * because "it wrote to the wrong copy" is the answer worth having, and print the
+ * first bytes of a small write so a decrypted block is recognisable on sight.
+ * Bounded: 24 lines per API per process. */
+static void ios_watch_image_write( const char *api, const void *addr, size_t size,
+                                   const void *src )
+{
+    static unsigned n_write, n_flush;
+    unsigned *n = api[0] == 'w' ? &n_write : &n_flush;
+    uintptr_t a = (uintptr_t)addr;
+    int i;
+
+    if (!a || !size || *n >= 24) return;
+    for (i = 0; i < ios_jit_mapping_count; i++)
+    {
+        uintptr_t base = (uintptr_t)ios_jit_mappings[i].pe_base;
+        size_t sz = ios_jit_mappings[i].size;
+        size_t t0 = ios_jit_mappings[i].text_offset, t1 = t0 + ios_jit_mappings[i].text_size;
+
+        if (!base || !sz) continue;
+        if (a + size <= base || a >= base + sz) continue;
+        (*n)++;
+        dprintf( 2, "[img-write] ml2128 %s #%u tid=%u addr=%p+0x%lx size=0x%lx module=%s | "
+                 "image rva=0x%lx %s .text(0x%lx+0x%lx)",
+                 api, *n, (unsigned)GetCurrentThreadId(), (void *)a,
+                 (unsigned long)(a - base), (unsigned long)size,
+                 ios_pe_module_name( (void *)base, sz ),
+                 (unsigned long)(a - base),
+                 (a >= base + t0 && a < base + t1) ? "IN" : "outside",
+                 (unsigned long)t0, (unsigned long)(t1 - t0) );
+        if (src && size <= 0x1000)
+        {
+            const unsigned char *b = src;
+            size_t k, lim = size < 16 ? size : 16;
+            dprintf( 2, " data=" );
+            for (k = 0; k < lim; k++) dprintf( 2, "%02x", b[k] );
+        }
+        dprintf( 2, "\n" );
+        return;
+    }
+}
+
 /***********************************************************************
  *             NtWriteVirtualMemory   (NTDLL.@)
  *             ZwWriteVirtualMemory   (NTDLL.@)
@@ -38833,6 +38956,7 @@ NTSTATUS WINAPI NtWriteVirtualMemory( HANDLE process, void *addr, const void *bu
                                       SIZE_T size, SIZE_T *bytes_written )
 {
     unsigned int status;
+    SIZE_T asked = size;
 
     if (virtual_check_buffer_for_read( buffer, size ))
     {
@@ -38851,6 +38975,7 @@ NTSTATUS WINAPI NtWriteVirtualMemory( HANDLE process, void *addr, const void *bu
         status = STATUS_PARTIAL_COPY;
         size = 0;
     }
+    if (NT_SUCCESS(status) && size) ios_watch_image_write( "write", addr, size, buffer );
     if (bytes_written) *bytes_written = size;
     return status;
 }
@@ -38997,6 +39122,10 @@ NTSTATUS WINAPI NtSetInformationVirtualMemory( HANDLE process,
 NTSTATUS WINAPI NtFlushInstructionCache( HANDLE handle, const void *addr, SIZE_T size )
 {
 #ifdef WINE_IOS
+    /* ml2128: a protect-to-write followed by a flush and no write means the
+     * protector believes it patched code. Log the guest range before the
+     * sub-floor translation below rewrites `addr`. */
+    ios_watch_image_write( "flush", addr, size, NULL );
     /* ml1202: nothing is mapped below 4GB on iOS, and __clear_cache's `ic ivau`
      * on such an address faults (the sub-floor service cannot emulate cache
      * maintenance). A Delphi program at 0x400000 patched 5 bytes of its own
@@ -39311,6 +39440,7 @@ NTSTATUS WINAPI NtWow64WriteVirtualMemory64( HANDLE process, ULONG64 addr, const
         status = STATUS_PARTIAL_COPY;
         size = 0;
     }
+    if (NT_SUCCESS(status) && size) ios_watch_image_write( "write", addr, size, buffer );
     if (bytes_written) *bytes_written = size;
     return status;
 }

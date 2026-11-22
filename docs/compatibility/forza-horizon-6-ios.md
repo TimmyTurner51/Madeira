@@ -1514,24 +1514,96 @@ protected range: `rva 0x1b226ca` and `rva 0x3cbeb92` sit inside functions starti
 `b0 75 3b` / `5a f4 40` and are themselves high-entropy. Do not treat "all 4538 entry bytes
 unchanged" as "no byte of `.text` changed".
 
-### 4ag. The one `.text` divergence the guest actually made, and why it is not the decrypt
+### 4ag. CORRECTED — the `.text` divergence was in the POOL, not the guest; the guest never wrote `.text`
 
-`[text-sync] ml2039 #9 … base=0x1607a1000 region=0x639ace3: .text differ=10 of 104443107
-bytes at protect-to-exec (guest view has edits the pool copy does NOT get) | first offs:
-0x1b126ca 0x1b126cb 0x3cadb92 0x3cadb93 …`
+The `ml2039` probe printed **only the differing bytes**, which for a 1-byte run is a single
+byte. That is not enough to say which side of the comparison changed, and I read the result
+the wrong way round. `[text-sync] ml2127` prints 24 bytes *from the run start* on both
+sides, and in the same event (`differ=10`, protect-to-exec, image `0x170a41000`,
+`region=0x639b000 off=0x1000`) the six runs are:
 
-So the guest wrote **10 bytes** into FH6's `.text` (two 5-byte patches, at image RVAs
-`0x1b226ca` and `0x3cbeb92`) and the pool copy — the one FEX executes — never received
-them, because `NtProtectVirtualMemory`'s sync deliberately skips `.text`. This is the only
-such event in the run (9 total `[text-sync]` lines, and it is the only one for this image).
+| image RVA | guest view | pool copy | file |
+|---|---|---|---|
+| `0x5a08e9` | `44` | `84` | `44` |
+| `0x5a08eb` | `78` | `5b` | `78` |
+| `0x1661999` | `c6 87 78` | `06 88 5b` | `c6 87 78` |
+| `0x1fcfb49` | `c6 81 78` | `06 82 5b` | `c6 81 78` |
+| `0x4b8f649` | `80` | `c0` | `80` |
+| `0x4b8f64b` | `7a` | `5d` | `7a` |
 
-It is a real fidelity bug with a designed fix (a pristine per-image baseline plus a
-diff-apply of guest-changed bytes into the pool, *not* a wholesale copy that would clobber
-our thunks). But it is **not** the decrypt: 10 bytes, once, long before the arena is
-filled, and the census shows the target entry untouched at the fault. Rank it as a
-correctness fix, not as the boot fix, and note that a whole-`.text` baseline copy for this
-title would cost another 104MB of address space, so if it is built it should snapshot only
-the writable window at protect-to-RW.
+**The guest view equals the file in all six runs.** The pool copy — the one FEX executes —
+is the side that differs. So:
+
+- The guest did **not** write `.text` here. There is no measured guest `.text` write in
+  FH6 at all.
+- The RVAs previously published (`0x1b226ca`, `0x3cbeb92`) were also wrong: the region
+  base was applied twice. The correct offsets are the ones in the table.
+- The 10 bytes are a **pool-side** difference. What writes them is not identified; they
+  did not recur in the `ml2127` run (`differ=0` for the same protect event), so they are
+  not a fixed property of the image.
+
+Consequence: the "guest edits `.text`, the pool never gets it" fidelity bug is **not
+measured**. The diff-apply fix described here is still reasonable in principle (two copies
+of one module is a real divergence), but nothing observed so far needs it, and the 104MB
+whole-`.text` baseline it implies is not worth building on this evidence. Retire it as a
+lead; keep it only if a guest write is ever actually caught.
+
+---
+
+### 4ah. MEASURED — the protector DOES unlock `.text`, then writes nothing; and two copies of the unix half run at once
+
+The `[prot-img]` line for the game's own code:
+
+```
+[prot-img] #45 tid=00e4 0x16c491000+0x639b000 (rva 0x1000) new_prot=0x4 old=0x20 status=0
+           | rva 0x1000, section #0 '.text' rva 0x1000+0x639ace3 chars 0x60000020 (R-X CODE)
+```
+
+`0x20` is `PAGE_EXECUTE_READ` and `0x4` is **`PAGE_READWRITE`** (my earlier note in this
+document said 0x4 was read-only; it is not — `0x2` is). So the protector does the first
+step of an in-place decrypt: it takes the entire 104MB `.text` from execute-read to
+**read-write, dropping execute**, exactly as `[prot-img]` #48 does for `.pdata`
+(`0x2` → `0x4`). Then:
+
+- **No later protect on that range.** #45 is the only event for `0x16c491000+0x639b000`;
+  `.text` is left read-write and non-executable for the rest of the run.
+- **Nothing is written.** The census samples the watched set three times —
+  `t=5.0s`, `t=7.4s`, `t=9.8s` — and every time reports `image=4538 pool=4538` entries
+  still `0xEA`, with the sampled entry (`rva=0x1500`) byte-identical in both copies.
+  So the unlock happens and the decrypt does not.
+
+Timeline for this run (single session: one `Wine exited`, one `Invalid instruction`):
+
+| t | event |
+|---|---|
+| 4.5 s | `.text` RX → RW, `.pdata` R → RW (`prot-img` #45, #48) |
+| 5.0 s | census arms; 4538/4538 still ciphertext in both copies |
+| 5.0 s | **static** half's server write fails: `[srv-wfail] errno=9 request_fd=0 … peb=0x0 treat_ebadf_as_epipe=1` → `abort_process(0)`; the Wine main process exits and orphans 5 children (incl. `forzahorizon6.exe`) |
+| 5.0–8.5 s | FH6 keeps running hard — `cpu=1143`, `cpu=333` per 300ms sample, IPC 5–6 |
+| 8.5 s | first call into `0x537099c` → `#UD`; VEH returns 0; exit `0xC000001D` |
+
+So the teardown did **not** stop the game: it kept executing for another 3.5 s. The `#UD`
+is not "the protector died with the parent".
+
+**Two copies of the unix half run in one process — proven, not inferred.** In this single
+session the log contains both:
+
+```
+[stub-census] ml2126 not enabled (set MADEIRA_STUB_CENSUS=1); no samples this run
+[stub-census] v2 armed at t=5.0s: image=0x16c490000 pool=0x1263a8000 …
+```
+
+`ml2126` is the component I installed, whose census is gated off. `v2 armed` can only be
+printed by `ios_stub_census_thread_start`, which has exactly one starter
+(`ios_stub_census_ensure` → `pthread_once`). One `pthread_once` cannot both return early
+and start the thread, so these lines come from **two loaded copies**: the component, and
+the half statically linked into the app (an older build, census still always-on).
+
+That is the `comp-half-fix` defect (§4ac) seen directly rather than through its symptom.
+It is no longer only a cleanliness issue: **probe output cannot be attributed to a build**
+while both copies print, and a fix shipped in a `.wcp` is only half-applied. Any future
+measurement that depends on a half-side gate must either eliminate the static copy or
+prove which one answered.
 
 ---
 
@@ -1568,20 +1640,30 @@ and the fault is at `image+0x537099c`.
 
 ## 6. Next experiments, cheapest first
 
-1. **Find out whether the stub decryptor ran at all.** §4c/§4g establish that the
-   5-byte stub was never written as of the fault. So the single highest-value
-   question is whether the protector's own decrypt/init path executed. The
-   decisive observation is cheap: catch the *first* guest write whose range
-   touches any of the 4,538 stub RVAs (the set is enumerable from `.pdata` +
-   `byte==0xEA`, so a probe can be preloaded with it). Then:
-   - never written → the decryptor never ran; search upstream in the protector's
-     init, and compare against a run where `FEX_SMCCHECKS` is default rather than
-     `full` (§3 shows the env genuinely matters).
-   - written, but the executed bytes are stale → SMC invalidation, see item 3.
-2. **Fix the two probe defects in §4a** so a future fault is not mislabelled as
+1. **Catch the guest stack at the moment `.text` is unlocked (§4ah).**
+   The decrypt question has narrowed to one moment: `prot-img` #45 takes `.text`
+   from `PAGE_EXECUTE_READ` to `PAGE_READWRITE` at t≈4.5 s, and nothing ever
+   writes it. So the gate is *upstream of the write*, inside the code that just
+   unlocked the section. Walking the guest stack at that protect event names that
+   code as guest RVAs, which can then be read offline with
+   `tools/local/pe-calltree.py` — no guessing about which `Nt*` it "must" be
+   calling. This is strictly cheaper than an API census and it produces the
+   actual function.
+   Do **not** re-run these: they are closed. `.text` is not written by the guest
+   (§4ag), `NtWriteVirtualMemory`/`NtFlushInstructionCache` never touch any image
+   (§4ah), the VEH receives and declines the `#UD` (§4ae), and the 16 MB buffer
+   holds neither `.text` nor decrypted output (§4af/§4aa).
+2. **Attribute the two halves before trusting any probe (§4ah).** One process
+   runs the app's static half and the component's half simultaneously, so a gate
+   added to a `.wcp` is only half-applied (`ml2126`'s census gate printed both
+   "not enabled" and "v2 armed" in one session). Either finish `comp-half-fix`
+   (route the app's direct references through the component's dispatch) or, for
+   every future measurement, print a per-copy build id so the answering copy is
+   known.
+3. **Fix the two probe defects in §4a** so a future fault is not mislabelled as
    a wild store. Already written and packaged (`dist/unixhalf-ml2026-native.wcp`);
    needs the phone.
-3. **Port the remaining SMC patch, `fh6-fex 0004`, and be precise about what is
+4. **Port the remaining SMC patch, `fh6-fex 0004`, and be precise about what is
    left.** An earlier note claimed 0001/0002/0004 were all unported. That is
    wrong: **0001 and 0002 are already in** (`1774c2fd9`, then `01161827e`
    re-ported 0001 properly onto the FULL path), and 0003 is ported
@@ -1596,7 +1678,7 @@ and the fault is at `image+0x537099c`.
    patches are SMC **correctness**, not evasion: making FEX notice code writes
    lets the game's own self-checks pass honestly. That is in scope under
    boundary rule 2; faking detection results would not be.
-4. **DroidDeck comparison (north star).** Compare what DroidDeck's FEX does with
+5. **DroidDeck comparison (north star).** Compare what DroidDeck's FEX does with
    the same two VirtualAllocs — the count of refusals and the granted protection
    are directly comparable from its logs, and that is the one measurement that
    says whether our allocator is Windows-like where it matters.
