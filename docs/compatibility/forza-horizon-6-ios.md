@@ -2109,6 +2109,31 @@ another NULL call. The game that did spawn was still ciphertext at 85 s (4538/45
 `0xEA`, no `#UD` in that window). Decrypt has not started. The component file was put back
 to the bundle's bare `kernel32` afterwards; `1.14` and `ml2136` were left enabled.
 
+### 4as. The pool slot is not zero — instruction fetch does not see the store
+
+A volatile read of ucrtbase's pool slot, after the NtProtect that is supposed to
+mirror it, returns the exit thunk (`jit@…=…1C44`, not 0). The fault handler's own
+load of the same address (`JIT *slot`) returns that same pointer. `x16` at the
+`blr` is still 0, and the branch goes to `pc=0`. The bytes the CPU was supposed to
+execute and the bytes a data load sees are not the same view.
+
+Rewriting that `blr` to a `bl` in the pool copy does land in memory: the fault dump
+shows `97eb034b` where the file has `d63f0200`. The CPU still takes the old `blr`
+(`x16=0`, `pc=0`) after `NtFlushInstructionCache` of the whole section and again
+after a 4-byte invalidate of that instruction plus an `isb`. The x18 patcher is the
+path that does change what the CPU executes, and it writes the RW alias, then
+invalidates the RX address. A store to the RX address, which is what
+`xlate_ios_jit` returns, updates the view a data load reads and not the view
+instruction fetch uses.
+
+A plain `b` (no link) instead of `bl` does not return. One run with that encoding
+left `dockhost` spinning at full speed for the whole wait, and never spawned the
+game. The branch rewriter was taken back out of `signal_arm64ec.c`. The on-device
+`kernel32` is the bundle's bare copy again, and the ntdll component is the build
+that only does the volatile read, not the rewriter. Unix half `ml261-rxmirror`
+(it also copies the NtProtect sync onto the RX data pages) was left enabled; it
+did not change this crash.
+
 ---
 
 ## 5. Premise corrections
