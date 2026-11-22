@@ -2172,10 +2172,12 @@ in x10, and branches to a shared stub. The stub does `blr` through
 `__os_arm64x_dispatch_icall` (metadata + `0x20`, ucrtbase slot RVA `0xe1508`,
 11 sites). The file qword there is 0. `arm64ec_update_hybrid_metadata` fills it
 with `arm64x_check_call` after the copy, so a direct branch into the thunk
-still dies at the stub if that load returns 0. ntdll is copied first, and
-`arm64x_check_call` is the only place in it that starts with `lsr x16, x11,
-#39` / `cbnz x16` / `ldr x16, [x18, #0x60]`. The copy records that pool address
-and rewrites the stub's `blr` to `bl` it, in the same pre-fetch window. The
+still dies at the stub if that load returns 0. ntdll is copied first. `arm64x_check_call` is the only place that starts
+with `lsr x16, x11, #39` / `cbnz x16`, in both the tree's ntdll and the ntdll
+on the phone (RVA `0x56fe0`). The x18 patcher runs before this scan and has
+already replaced the following `ldr x16, [x18, #0x60]` with a branch, so the
+scan matches those two instructions. It records that pool address and rewrites
+the stub's `blr` to `bl` it, in the same pre-fetch window. The
 `bl` sets the link register the same way `blr` does, and the stub still
 returns into `br x11`. Packaged locally as `dist/ml265-exitexport-native.wcp`.
 It has not been on the phone. The phone is still on `ml264-copybl`, the
