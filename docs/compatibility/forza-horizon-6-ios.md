@@ -592,6 +592,36 @@ The 5 remaining unhandled exceptions are unrelated addresses
 (`0x111f59bfc` `addr=0x8` twice, `0x198e1ff94` `addr=0x0` twice — the known wild
 pointer from 4b — and `0x1106c59ac` `type=6`).
 
+### 4q. The session fix exposes the original bug cleanly: 0xC000001D at t+16.6 s
+
+With the session now held open, the game's own end is unambiguous in the log:
+
+```
+[jit-pool] image 0x132b50000+0xb3c0000 (forzahorizon6.exe) → pool 0x153a44000
+E E8 Invalid instruction in entry block: 137EC099C
+D E8 Exception: Code: C000001D Address: 137EC099C
+wine: Unhandled illegal instruction at address 0000000137EC099C (thread 00e8), starting debugger...
+[jit-pool] RECLAIM peb=0x107fec000: 90 ranges 0x167d4000 bytes freed, 85 mappings tombstoned
+[Wine ntdll/server] process_exit_wrapper(-1073741795)
+```
+
+`-1073741795` as a 32-bit status is **0xC000001D**, `STATUS_ILLEGAL_INSTRUCTION`, and
+`0x137EC099C − 0x132B50000 = 0x537099C` — the same `image+0x537099c` this document was
+opened for. So:
+
+* the game is not blocked, and not failing anywhere new: it runs 16.6 s, reaches the
+  protected stub, and dies exactly as §4 describes;
+* what the session fix changed is that the death is now **the game's own and observable**
+  instead of a five-second teardown that also killed it;
+* the trailing `[zombie] … faulted pc=0x71f38361c0 … ended this thread only` and the
+  `[store-noalias] … prot=1 … exec-downgraded page that never got dual-mapped` are
+  consequences of the pool reclaim that follows the exit (the thread's page was freed
+  under it), not the cause.
+
+Everything open therefore reduces again to §4: does the protector ever write the five bytes
+at `image+0x537099c` before control reaches them? The session-lifetime work is no longer in
+the way of answering that.
+
 ### 4p. FIXED: the session now outlives the launcher, and the game is blocked, not dead
 
 The app rebuild (Debug, incremental, ~100 s) carried three changes: the child-table reader
