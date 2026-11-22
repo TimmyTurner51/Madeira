@@ -1685,11 +1685,22 @@ static void *wine_process_thread(void *arg) {
         // Skip check_command_line / reexec_loader
         setenv("WINELOADERNOEXEC", "1", 1);
 
-        // Set DLL search path to app bundle (contains aarch64-windows/ with PE DLLs)
+        // Set DLL search path to app bundle (contains aarch64-windows/ with PE DLLs), with any
+        // imported builtin package in front of it. An import lives at
+        // Documents/Components/<id>/pe/, mirroring the bundle's arch folders, so it is found
+        // first and the bundle's own ntdll.dll never has to change for a Wine PE fix to land.
         {
             NSString *bundlePath = [[NSBundle mainBundle] bundlePath];
-            setenv("WINEDLLPATH", bundlePath.UTF8String, 1);
-            LOG("WINEDLLPATH=%{public}s", bundlePath.UTF8String);
+            extern const char *madeira_builtin_override_path(void);
+            const char *overrides = madeira_builtin_override_path();
+            if (overrides && *overrides) {
+                NSString *combined = [NSString stringWithFormat:@"%s:%@", overrides, bundlePath];
+                setenv("WINEDLLPATH", combined.UTF8String, 1);
+                LOG("WINEDLLPATH=%{public}s (builtin override first)", combined.UTF8String);
+            } else {
+                setenv("WINEDLLPATH", bundlePath.UTF8String, 1);
+                LOG("WINEDLLPATH=%{public}s", bundlePath.UTF8String);
+            }
         }
 
         /* Wine trace channels.

@@ -1632,6 +1632,58 @@ Nothing else in the half or the app changes behaviour by default: the other prob
 component side; #3, #8 and #9 remain active and are the ones to watch if a non-FH6 title
 regresses.
 
+### 4aj. DroidDeck port status, and two probes that had to be retracted
+
+The north star is the reference implementation, so the question "what has actually been
+ported from it" deserves a table rather than an impression. A port counts as *in* only if
+the change is in this tree and something has exercised it.
+
+| reference change | where it lands here | in tree? | exercised? |
+|---|---|---|---|
+| import-thunk hotpatch prologues (`8b ff 55 8b ec 5d`, `48 8d a4 24 …`, `ff 25`) | `build/wine-patches/0001`, rewrites `winebuild` output; applied at `wine/tools/winebuild/spec32.c:264,603,613` | **yes** | **no effect on this fault** — the fault is byte-identical with it applied |
+| x64 debug-register round trip | `build/wine-patches/0002` (`signal_arm64ec.c:44,1851`) + `build/fex-patches/0002` | **yes** | **DORMANT, measured** — every `NtOpenThread` asks `0x40` only and every failing `NtGetContextThread` passes `ContextFlags=0`, so the code never runs (§4ad) |
+| nested exception on the signal stack instead of `abort_thread(1)` | `virtual_ios.c:30034`, shipped as `ml2111-nestedexc` | **yes** | **never hit** — branch count 0 across the run that was meant to test it |
+| SMC traps per 16K host page | `build/fex-patches/0001` | **yes** | yes, as the FEX half of §4ac |
+| block-level SMC validation gated on writable code | `build/fex-patches/0002` (partial port of ref 0002/0004) | **yes** | yes — this is what makes `FEX_SMCCHECKS=full` stop returning launch-client-error 46; the full result is still a *different* failure, not a boot |
+| `FEX_POOL_CLONE` (ref 1.2 headline, `libarm64ecfex-poolclone.dll`) | — | **no** | 0 occurrences in `Config.json.in`; 4 in the reference's `0004` patch |
+| `FEX_FH6_FASTUD`, `FEX_FH6_SPINSAMPLE`, `FEX_FH6_STATS` | — | **no** | 0 occurrences anywhere in `FEX/`; they exist only in ref `0004` |
+| `FEX_DISKCACHEMAXFILESIZE` | — | **no** | absent from the schema |
+| hide FEX from file/module queries | — | **no, deliberately last** | the reference itself records that this went in *before* its root cause was found and may be unnecessary; test by removal if ever added |
+| cross-thread debug-register lookup | — | **no** | logged, never answered |
+
+Two things follow, and neither is comfortable:
+
+1. **The reference's load-bearing pieces are the ones we do not have.** Its own README says
+   FH6 gets through "with no checks disabled" because the FEX package makes
+   `FEX_SMCCHECKS=full` cheap (block invalidation plus a 255-byte chunk CRC) *and* the Wine
+   thunks stop looking hooked. We have the Wine half and a partial FEX half. The pool-clone
+   and `FEX_FH6_*` work is absent. Our 0002 is per-instruction gated validation, not the
+   reference's chunk CRC.
+2. **Every ported change targets a verdict class the reference names** — hooked imports,
+   hypervisor bit, SMC churn, debug registers. Our fault is in none of those classes: a
+   ciphertext `.text` is unlocked to RW, never written, and then executed (§4ah). Porting
+   more reference material cannot decrypt it unless one of those knobs happens to gate the
+   decryptor, and the one lever we did test (`FEX_SMCCHECKS=full`) changed the failure
+   without reaching a window.
+
+**Two retractions, so nobody inherits them:**
+
+- `[guest-stk] ml2129` read the CHPE guest context at `CPUArea+0x50` and got `rip=0 rsp=0`
+  for the very thread that performs the unlock. The guest CONTEXT chain is **not** populated
+  on this path; do not use it here.
+- `[guest-stk] ml2130` then read the ARM64 syscall frame (`TEB+0x378`, `x29@+0xe8`) and
+  printed frames labelled `ntdll.dll+0x5d9b8` and friends. **Those labels are not
+  trustworthy.** The values sit in FEX's JIT/pool domain, not in ntdll's image (its pool
+  starts at `0x11a9dc000`), so the ARM-level stack does not carry the guest's x64 return
+  addresses at all. The unlocker has **not** been named. That is why the probe moved to the
+  Wine PE side, where FEX packs the guest state into the ARM64EC context it hands to ntdll:
+  `prepare_exception_arm64ec()` has `arm_ctx->Pc`, which `dispatch_syscall()` already treats
+  as the guest return address. `[syscall-rip] ml2131` logs it when it lands inside the main
+  image (`MADEIRA_SYSCALL_RIP=1`, 3000 lines). First run: zero lines, ambiguous — a missing
+  line could mean "path not reached" or "gate off". An unconditional bounded entry marker
+  was added to separate those two, and the follow-up run aborted before reporting. **No
+  result yet.**
+
 ---
 
 ## 5. Premise corrections

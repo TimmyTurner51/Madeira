@@ -37,14 +37,23 @@ trap 'rm -rf "$WORK"' EXIT
 mkdir -p "$WORK/files/lib/wine/aarch64-windows"
 cp "$DLL" "$WORK/files/lib/wine/aarch64-windows/libarm64ecfex.dll"
 
-# FEX_SMCCHECKS=full is deliberately NOT set. The reference stack sets it, but its
-# FEX carries 0002/0004 (block-level CRC validation); this port has only the checks
-# that came before those, so "full" means a per-instruction check on every writable
-# page in EVERY process. Measured on device 2026-11-21: with it, Steam's own client
-# refuses the launch (launch-client-error=46, host result 45); remove that one key
-# and the same build gets launch-client-error=0 and launch-game-running=1. The DLL
-# was swapped for the stock build for that A/B, so the key is the cause, not the
-# module. Re-add it once 0002/0004 land.
+# FEX_SMCCHECKS=full is opt-in through MADEIRA_FEX_SMCCHECKS=full, never the default.
+# The reference stack sets it ("Denuvo preset -- it turns on full code checks"), and
+# matching the reference is the point, but the port could not afford it until 0002
+# landed. Measured on device 2026-11-21, BEFORE 0002: with "full", the only checks the
+# port had were per-instruction on every writable page in EVERY process, and Steam's own
+# client refused the launch (launch-client-error=46, host result 45); removing that one
+# key from the same DLL gave launch-client-error=0 and launch-game-running=1. Re-measured
+# 2026-11-21 22:29 AFTER 0002's writable-range gating landed: the same A/B still fails with
+# launch-client-error=46, so the key -- not the missing gating -- is what Steam's client
+# rejects. 0004 (255-byte chunk CRC for writable code) is the remaining candidate; until
+# that is ported this stays opt-in and the default run is the 14-key set.
+SMC_LINE=""
+if [ "${MADEIRA_FEX_SMCCHECKS:-}" = "full" ]; then
+    SMC_LINE=',
+    "FEX_SMCCHECKS": "full"'
+fi
+
 cat > "$WORK/profile.json" <<EOF
 {
   "type": "FEXCore",
@@ -71,7 +80,7 @@ cat > "$WORK/profile.json" <<EOF
     "VKD3D_FEATURE_LEVEL": "12_2",
     "VKD3D_SHADER_MODEL": "6_9",
     "WINE_FAST_YIELD": "1",
-    "WINEDEBUG": "-all"
+    "WINEDEBUG": "-all"$SMC_LINE
   }
 }
 EOF

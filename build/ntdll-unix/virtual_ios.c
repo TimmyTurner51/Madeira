@@ -36299,6 +36299,96 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
     }
 
 #ifdef WINE_IOS
+    /* ml2129: WHO unlocks .text?
+     *
+     * §4ah narrowed the decrypt question to one moment: the protector takes the
+     * whole .text from PAGE_EXECUTE_READ to PAGE_READWRITE at t~4.5s and then
+     * writes nothing, for 4 more seconds of heavy CPU, before calling the still
+     * ciphertext entry. So the gate is inside the code that just unlocked the
+     * section, and the cheapest way to name that code is to read the guest's own
+     * stack at the protect, rather than guessing which Nt* it "must" call.
+     *
+     * This must not produce a confident wrong answer, because two probes earlier
+     * this session did (see §4ag). So every value is labelled only through
+     * ios_jit_reverse_translate (arithmetic, not inference), `frames=none` is
+     * printed explicitly so "not visible here" differs from "somewhere else", and
+     * the whole dump is bounded to 4 events, firing only for an unlock (writable,
+     * not executable) of 1MB or more -- the .text/.pdata pattern.
+     *
+     * The guest CONTEXT is at CPUArea+0x50 ... -- measured NOT to work here: on
+     * this path both the guest Rip and Rsp read back as zero for the FH6 thread
+     * that performs the unlock, so that chain is a dead end for this probe and is
+     * not used again. The ARM64 syscall frame IS populated (the watchdog dump
+     * proves it): TEB+0x378 -> thread_data->syscall_frame, with x29 at +0xe8, lr
+     * at +0xf0, sp at +0xf8, pc at +0x100. That is the PE caller of the syscall
+     * we are inside, which is precisely "who asked to unlock .text". */
+    {
+        static int stk_n;
+        if (status == 0 && (new_prot & 0x04) && !(new_prot & 0x20) &&
+            size >= 0x100000 && stk_n < 4)
+        {
+            extern uint64_t ios_jit_reverse_translate( uint64_t addr, uint64_t *module_base );
+            extern const char *ios_pe_module_name_ext( uint64_t base );
+            TEB *teb = NtCurrentTeb();
+            uint64_t frame = teb ? *(uint64_t *)((char *)teb + 0x378) : 0;
+
+            stk_n++;
+            if (!frame)
+                dprintf( 2, "[guest-stk] ml2130 #%d unlock of %#lx at %p: no syscall frame "
+                         "(TEB+0x378 empty): guest callers not visible from here\n",
+                         stk_n, (unsigned long)size, base );
+            else
+            {
+                uint64_t regs[4] = { 0, 0, 0, 0 };   /* x29, lr, sp, pc */
+                uint64_t fp, sp, mod = 0, va;
+                int n, hits = 0;
+
+                memcpy( regs, (const void *)(uintptr_t)(frame + 0xe8), sizeof(regs) );
+                fp = regs[0]; sp = regs[2];
+                dprintf( 2, "[guest-stk] ml2130 #%d unlock of %#lx at %p: frame=%p fp=%#llx lr=%#llx "
+                         "sp=%#llx pc=%#llx\n", stk_n, (unsigned long)size, base, (void *)frame,
+                         (unsigned long long)fp, (unsigned long long)regs[1],
+                         (unsigned long long)sp, (unsigned long long)regs[3] );
+                for (n = 0; n < 2; n++)
+                {
+                    uint64_t v = n ? regs[1] : regs[3];
+                    mod = 0; va = ios_jit_reverse_translate( v, &mod );
+                    dprintf( 2, "[guest-stk]   %s %#llx = %s+0x%llx\n", n ? "lr" : "pc",
+                             (unsigned long long)v,
+                             va && mod ? ios_pe_module_name_ext( mod ) : "?",
+                             (unsigned long long)(va && mod ? va - mod : 0) );
+                }
+                for (n = 0; n < 24 && fp > 0x10000; n++)
+                {
+                    uint64_t rec[2] = { 0, 0 };
+                    memcpy( rec, (const void *)(uintptr_t)fp, sizeof(rec) );
+                    mod = 0; va = ios_jit_reverse_translate( rec[1], &mod );
+                    dprintf( 2, "[guest-stk]   fp#%d %#llx = %s+0x%llx\n", n,
+                             (unsigned long long)rec[1],
+                             va && mod ? ios_pe_module_name_ext( mod ) : "?",
+                             (unsigned long long)(va && mod ? va - mod : 0) );
+                    if (rec[0] <= fp) break;
+                    fp = rec[0];
+                }
+                for (n = 0; n < 512 && sp; n++)
+                {
+                    uint64_t slot = 0;
+                    memcpy( &slot, (const void *)(uintptr_t)(sp + 8ull * n), sizeof(slot) );
+                    mod = 0; va = ios_jit_reverse_translate( slot, &mod );
+                    if (va && mod && va != slot && hits < 20)
+                    {
+                        dprintf( 2, "[guest-stk]   sp+0x%x %#llx = %s+0x%llx\n", n * 8,
+                                 (unsigned long long)slot, ios_pe_module_name_ext( mod ),
+                                 (unsigned long long)(va - mod) );
+                        hits++;
+                    }
+                }
+                if (!hits)
+                    dprintf( 2, "[guest-stk] ml2130 frames=none\n" );
+            }
+        }
+    }
+
     /* madeira-bcd: [prot-img] -- protection changes of 64 KB or more on the
      * process's own main image, with the section they start in. GTA V Enhanced
      * died executing GTA5_Enhanced.exe+0x509a144, in sections the emulator was

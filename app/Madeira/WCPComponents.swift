@@ -57,12 +57,20 @@ struct WCPComponent: Identifiable, Codable, Equatable {
         /// `files/` folder and is `dlopen`ed, so it never enters the prefix's DLL folders,
         /// which only hold PE images.
         case native
+        /// PE images that must replace the bundle's own builtins rather than a prefix entry.
+        /// `ntdll.dll` is the reason this exists: Wine's loader takes it from `WINEDLLPATH`,
+        /// and until now that path was the app bundle, so a changed ntdll meant rebuilding and
+        /// reinstalling the app. The package's arch-folder DLLs are staged into the component
+        /// folder and that folder is put *in front of* the bundle on `WINEDLLPATH`, so the
+        /// import wins and nothing in the bundle or the code signature changes.
+        case builtin
 
         var label: String {
             switch self {
             case .fex: return "FEX"
             case .wine: return "Wine"
             case .native: return "Runtime (Mach-O)"
+            case .builtin: return "Wine builtins (PE override)"
             }
         }
     }
@@ -291,6 +299,10 @@ enum WCPInstaller {
         // it is checked before the FEX/Wine inference, which would otherwise misfile it.
         if lower.contains("unixhalf") || lower.contains("native") || lower.contains("unix") { return .native }
         if files.contains(where: { ($0 as NSString).pathExtension.lowercased() == "dylib" }) { return .native }
+        // Checked before the FEX/Wine inference: a builtin package carries ordinary DLLs, so
+        // without an explicit label it would be filed as a prefix Wine package and linked into
+        // system32, where ntdll would never be looked for.
+        if lower.contains("builtin") { return .builtin }
         if lower.contains("fex") { return .fex }
         if lower.contains("wine") || lower.contains("proton") { return .wine }
         // Unknown label: infer from what the package carries. A FEX package is
@@ -363,6 +375,25 @@ enum WCPInstaller {
             }
             guard !items.isEmpty else {
                 throw WCPError.message("This runtime package carries no .dylib to load.")
+            }
+        case .builtin:
+            // `pe/<arch>-windows/<name>`, mirroring the bundle's layout so the same
+            // `WINEDLLPATH` lookup finds it one directory earlier. The arch folder is taken
+            // from the package rather than guessed, and a DLL outside one is refused instead
+            // of landing in an arch it was not built for.
+            for file in files {
+                let parts = Set(file.lowercased().split(separator: "/").map(String.init))
+                let base = (file as NSString).lastPathComponent
+                guard (file as NSString).pathExtension.lowercased() == "dll", !base.isEmpty else { continue }
+                guard let face = ["arm64ec-windows", "aarch64-windows", "i386-windows"].first(where: parts.contains) else {
+                    continue // e.g. a Linux .so or a license file
+                }
+                add(file, "pe/" + face + "/" + base)
+            }
+            guard !items.isEmpty else {
+                throw WCPError.message("This builtin package has no DLL inside an arch folder "
+                                       + "(arm64ec-windows, aarch64-windows or i386-windows), "
+                                       + "so there would be nothing to put in front of the bundle.")
             }
         }
         return items
@@ -482,6 +513,21 @@ enum WCPInstaller {
         try fm.moveItem(at: payload, to: destination)
         try profileBytes.write(to: destination.appendingPathComponent("profile.json"))
 
+        // A builtin package has to be materialised where the loader is told to look,
+        // `pe/<arch>-windows/<name>`, whatever path the packager used for the source. A prefix
+        // package is only linked, so nothing else is moved.
+        if kind == .builtin {
+            for item in layout {
+                let from = destination.appendingPathComponent(item.source)
+                let to = destination.appendingPathComponent(item.dest)
+                guard fm.fileExists(atPath: from.path) else { continue }
+                try? fm.createDirectory(at: to.deletingLastPathComponent(), withIntermediateDirectories: true)
+                if from.standardizedFileURL != to.standardizedFileURL {
+                    try? fm.moveItem(at: from, to: to)
+                }
+            }
+        }
+
         let versionName = (profile["versionName"] as? String) ?? (package.deletingPathExtension().lastPathComponent)
         let versionCode = (profile["versionCode"] as? NSNumber)?.intValue
         let detail = (profile["description"] as? String) ?? ""
@@ -503,6 +549,66 @@ enum WCPInstaller {
             notes: notes
         )
     }
+}
+
+// MARK: - Builtin override search path
+
+/// Where the app should look for PE builtins *before* the bundle's own copies.
+///
+/// `WineProcessBridge.m` sets `WINEDLLPATH` to the app bundle, which is how Wine finds
+/// `arm64ec-windows/ntdll.dll`. An imported builtin package is staged under
+/// `Documents/Components/<id>/pe/`, and putting those directories in front of the bundle on that
+/// path is all it takes for the import to win: no bundle file changes, no re-sign, no reinstall.
+///
+/// Read from `state.json` for the same reason `UnixHalf` does — "enabled" and "kind" must mean
+/// the same thing to the installer, the list, and the loader. Only the newest enabled builtin
+/// component contributes, so a replacement release takes effect without the previous one having
+/// to be removed by hand.
+enum BuiltinOverrides {
+    static let kind = "builtin"
+
+    /// Colon-separated directories, newest enabled first. Empty when no package is installed.
+    static func searchPath() -> String {
+        let fm = FileManager.default
+        guard let docs = fm.urls(for: .documentDirectory, in: .userDomainMask).first else { return "" }
+        let components = docs.appendingPathComponent("Components", isDirectory: true)
+        guard let data = try? Data(contentsOf: components.appendingPathComponent("state.json")),
+              let state = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let entries = state["components"] as? [[String: Any]] else { return "" }
+
+        let enabled = entries
+            .filter { ($0["kind"] as? String) == kind }
+            .filter { ($0["enabled"] as? Bool) == true }
+            .sorted { ($0["installedAt"] as? Double ?? 0) > ($1["installedAt"] as? Double ?? 0) }
+
+        var paths: [String] = []
+        for entry in enabled {
+            guard let id = entry["id"] as? String, !id.isEmpty,
+                  !id.contains("/"), !id.contains("..") else { continue }
+            let pe = components.appendingPathComponent(id, isDirectory: true)
+                .appendingPathComponent("pe", isDirectory: true)
+            guard fm.fileExists(atPath: pe.path) else { continue }
+            paths.append(pe.path)
+        }
+        return paths.joined(separator: ":")
+    }
+
+    /// C entry point for `WineProcessBridge.m`. The string is allocated once and stays valid for
+    /// the process; an empty string (not NULL) means "use the bundle alone".
+    private static var cached: UnsafePointer<CChar>?
+
+    static func cSearchPath() -> UnsafePointer<CChar> {
+        if let cached { return cached }
+        let copy = strdup(searchPath()) ?? strdup("")
+        cached = UnsafePointer(copy)
+        return cached!
+    }
+}
+
+/// C entry point for `WineProcessBridge.m`; see `BuiltinOverrides`.
+@_cdecl("madeira_builtin_override_path")
+public func madeiraBuiltinOverridePath() -> UnsafePointer<CChar> {
+    BuiltinOverrides.cSearchPath()
 }
 
 // MARK: - Model

@@ -127,6 +127,10 @@ static void fatal_error( const char *err, ... ) __attribute__((noreturn, format(
 static const char *bin_dir;
 static const char *dll_dir;
 static const char *ntdll_dir;
+
+/* Defined far below; used by find_builtin_dll() to let a Wine-Builtin .wcp replace any
+ * PE builtin, not just ntdll (see builtin_override_dirs()). */
+static char *builtin_override_pe_file( const char *pe_dir, const char *file );
 static const char *alt_build_dir;
 static SIZE_T dll_path_maxlen;
 
@@ -1791,6 +1795,17 @@ static NTSTATUS open_builtin_pe_file( const char *name, OBJECT_ATTRIBUTES *attr,
     HANDLE mapping;
 
     *module = NULL;
+    {
+        /* iOS-Madeira: which file does the loader actually open for a builtin PE? The
+         * answer decides whether a .wcp can replace it at all, so log it. */
+        static int open_probe;
+        const char *base = strrchr( name, '/' );
+        base = base ? base + 1 : name;
+        if ((!strncmp( base, "kernel32", 8 ) || !strncmp( base, "user32", 6 ) ||
+             !strncmp( base, "advapi32", 8 ) || !strncmp( base, "kernelbase", 10 )) &&
+            open_probe++ < 24)
+            dprintf( 2, "[open-builtin] %s\n", name );
+    }
     status = open_dll_file( name, attr, &mapping );
     if (!status)
     {
@@ -1862,6 +1877,25 @@ static NTSTATUS find_builtin_dll( UNICODE_STRING *nt_name, ANSI_STRING *exp_name
     file[--pos] = '/';
 
     TRACE( "looking for %s for file %s\n", debugstr_a(file + pos + 1), debugstr_us(nt_name) );
+
+    /* iOS-Madeira: a Wine-Builtin .wcp must be able to replace ANY PE builtin, not just
+     * ntdll. set_dll_path() puts dll_dir (the app bundle) ahead of WINEDLLPATH, so an
+     * installed package could never win a system DLL; ask the override directory first. */
+    if (1)
+    {
+        static int override_probe;
+        char *ov = builtin_override_pe_file( pe_dir, file + pos );
+        if (override_probe++ < 24)
+            dprintf( 2, "[builtin-any] %s pe_dir=%s override=%s\n",
+                     file + pos, pe_dir, ov ? ov : "(miss)" );
+        if (ov)
+        {
+            status = open_builtin_pe_file( ov, &attr, module, size_ptr, image_info,
+                                           limit_low, limit_high, load_machine, prefer_native, offset );
+            free( ov );
+            if (status != STATUS_DLL_NOT_FOUND) goto done;
+        }
+    }
 
     if (build_dir)
     {
@@ -2649,6 +2683,69 @@ static void redirect_ntdll_functions( HMODULE module )
 }
 
 
+/***********************************************************************
+ * Imported PE-builtin override directory.
+ *
+ * The app owns component layout, so it is the only thing that can say where an
+ * imported Wine PE builtin (ntdll.dll today) is staged: Documents/Components/
+ * <id>/pe, mirroring the bundle's <arch>-windows folders. It exports that as
+ * madeira_builtin_override_path() and, for the standard loader, prepends the
+ * same directories to WINEDLLPATH.
+ *
+ * load_ntdll() and ios_load_child_ec_ntdll() build their ntdll path directly
+ * from ntdll_dir/dll_dir and never consult WINEDLLPATH, so a package installed
+ * that way was silently ignored: the app logged the override path while the
+ * guest kept mapping the bundle's ntdll.dll. Resolve it here instead, newest
+ * directory first, and only take a directory that actually holds the file so a
+ * stale entry cannot hide the bundle's copy.
+ */
+static const char *builtin_override_dirs(void)
+{
+    static const char *dirs;
+    static int resolved;
+
+    if (resolved) return dirs;
+    resolved = 1;
+
+    if (getenv( "MADEIRA_BUILTIN_PE_DIR" )) dirs = getenv( "MADEIRA_BUILTIN_PE_DIR" );
+    if ((!dirs || !*dirs))
+    {
+        const char *(*query)(void) = (const char *(*)(void))dlsym( RTLD_DEFAULT, "madeira_builtin_override_path" );
+        if (query) dirs = query();
+    }
+    if (!dirs || !*dirs) dirs = NULL;
+
+    dprintf( 2, "[builtin-override] dirs=%s\n", dirs ? dirs : "(none)" );
+    return dirs;
+}
+
+/* Path of an imported builtin, or NULL when no package provides it.
+ * `dirs` is colon-separated, newest component first, and each entry already
+ * ends in ".../pe" — the same layout WINEDLLPATH gets. */
+static char *builtin_override_pe_file( const char *pe_dir, const char *file )
+{
+    const char *dirs = builtin_override_dirs();
+    const char *p, *end;
+    char *name = NULL;
+
+    if (!dirs) return NULL;
+
+    for (p = dirs; *p; p = (*end == ':') ? end + 1 : end)
+    {
+        end = strchr( p, ':' );
+        if (!end) end = p + strlen( p );
+        if (end == p) continue;
+        if (asprintf( &name, "%.*s%s/%s", (int)(end - p), p, pe_dir, file ) < 0) return NULL;
+        if (!access( name, R_OK ))
+        {
+            dprintf( 2, "[builtin-override] using %s\n", name );
+            return name;
+        }
+        free( name );
+    }
+    return NULL;
+}
+
 #ifdef WINE_IOS
 /***********************************************************************
  * X3c: private ARM64EC ntdll for a cross-arch child pseudo-process.
@@ -2686,8 +2783,11 @@ static int ios_load_child_ec_ntdll( PEB *child_peb )
     init_unicode_string( &str, path );
     InitializeObjectAttributes( &attr, &str, 0, 0, NULL );
 
-    if (build_dir) asprintf( &name, "%s%s/ntdll.dll", ntdll_dir, pe_dir );
-    else asprintf( &name, "%s%s/ntdll.dll", dll_dir, pe_dir );
+    if (!(name = builtin_override_pe_file( pe_dir, "ntdll.dll" )))
+    {
+        if (build_dir) asprintf( &name, "%s%s/ntdll.dll", ntdll_dir, pe_dir );
+        else asprintf( &name, "%s%s/ntdll.dll", dll_dir, pe_dir );
+    }
 
     dprintf(2, "[ec-child-ntdll] loading %s for peb=%p\n", name, (void *)child_peb);
     status = open_builtin_pe_file( name, &attr, &module, &size, &info, 0, 0,
@@ -2880,8 +2980,11 @@ static void load_ntdll(void)
     init_unicode_string( &str, path );
     InitializeObjectAttributes( &attr, &str, 0, 0, NULL );
 
-    if (build_dir) asprintf( &name, "%s%s/ntdll.dll", ntdll_dir, pe_dir );
-    else asprintf( &name, "%s%s/ntdll.dll", dll_dir, pe_dir );
+    if (!(name = builtin_override_pe_file( pe_dir, "ntdll.dll" )))
+    {
+        if (build_dir) asprintf( &name, "%s%s/ntdll.dll", ntdll_dir, pe_dir );
+        else asprintf( &name, "%s%s/ntdll.dll", dll_dir, pe_dir );
+    }
 
     if (is_arm64ec()) machine = main_image_info.Machine;
     status = open_builtin_pe_file( name, &attr, &module, &size, &info, 0, 0, machine, FALSE, 0 );
