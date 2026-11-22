@@ -747,6 +747,62 @@ faulting RVA exactly.
 
 All three ship in one dylib (`ml2030` slot, sha `2d606889…` verified by read-back).
 
+### 4y. The configuration the reference *requires* is the one we could not afford
+
+The reference's troubleshooting table says, for an anti-tamper or integrity error:
+"the preset is **Denuvo** (it turns on full code checks)". Its per-game environment
+list includes `FEX_SMCCHECKS=full`, and the GameNative note repeats it. So the
+package that boots FH6 on Android runs FEX with **full self-modifying-code
+validation** — the anti-tamper depends on it.
+
+§3 records why we do not: with `full` on this port, Steam's own launch timed out
+(`launch-client-error=46`), and it was isolated to that single key with the DLL
+swapped for stock. The reference gets away with `full` because its FEX carries
+patch 0002 (block-level CRC validation). **This port did not.** My earlier note said
+0001/0002 were both ported; that is true of 0001 and false of 0002 — verified by
+`grep -r ContainsWritableCode` and `grep -r FEX_SMC_BLOCK` over `FEXCore/Source`,
+both empty before this change.
+
+`full` on unpatched code means a CRC per *instruction* on **every** decoded block in
+**every** process. That is why Steam's launch timed out; it is not an anti-tamper
+verdict and not a module problem.
+
+**Partial port of 0002 (this commit).** The patch is only 126 lines / 3 files, but
+its chunked-CRC half rides on 0004 (a `crc32` helper, patchable CRC,
+`_ThreadRemoveCodeEntry(entry, end)`), none of which exists here. The half that
+survives without 0004 is the one with the argument, and it is the reference's own
+reasoning:
+
+> Non-writable code can only change through a protection change or remap, which the
+> frontend invalidates, so FULL only needs per-instruction validation for writable
+> code.
+
+So: `DecodedBlockInformation` gains `ContainsWritableCode`, set from
+`RangeInfo.Writable` in `CheckRangeExecutable`, reset per decode, and the
+per-instruction CRC under `CONFIG_SMC_FULL` is gated on it. Code that cannot
+self-modify stops paying for validation; code that can still gets it.
+
+This is **behaviour-neutral for the configuration on the device** (`SMCChecks` is
+not `FULL`, so the condition reduces to `ForceFullSMCDetection || HotSMCBlock`
+exactly as before) and is therefore safe to stage ahead of the experiment that needs
+it. It also builds for the ARM64EC module the game actually runs
+(`build/fex-arm64ec/build.sh` → `app/Madeira/arm64ec-windows/xtajit64.dll`), which
+is the module that becomes `${system32}/xtajit64.dll`.
+
+**Sequencing, because the two halves of a `.wcp` land on different launches.** A
+package's *files* apply on the launch after it is imported; its *environment* applies
+at import. So turning on `full` in the same package as the gated DLL would run one
+launch of `full` against the ungated emulator — which is exactly the launch that
+times out. Order:
+
+1. Stage `FH6-iOS-1.4-fex.wcp` (gated DLL, unchanged 14-key environment) — **done**,
+   in `Documents/Import`, sha `acabb660…` verified by read-back.
+2. After it installs, add `FEX_SMCCHECKS=full` as an environment-only change. The
+   gated emulator is already in place, so that launch measures the thing we want.
+
+Not a claim that `full` will then boot the game. It is the precondition for the
+experiment, and it is the first time that experiment can be run at all.
+
 ### 4s. Reproduced, and the fault is RVA-invariant
 
 The 19:07 run (ml2029 still loaded — see below) died the same way, with the image
