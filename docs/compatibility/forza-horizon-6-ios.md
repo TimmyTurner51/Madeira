@@ -1969,6 +1969,48 @@ Next: find what fills the ucrtbase exec-relative slot at `+0x480` from the thunk
 target and why it is skipped for some exports, and look for a 13–16-entry table in that path
 (a fixed-size array is the shape the threshold implies).
 
+### 4aq. The reference's fix is BLOCKED by a known, unlandable landmine — and one test was void
+
+Two results, one of them a methodology trap worth writing down.
+
+**1. The `arm64x_check_call` landmine is what kills the dock.** The crash dump names the
+callee directly:
+
+```
+call_site@(lr-16): a9029be5 f9444d10 f90013e4 d63f0200   ; ... ldr x16,[x8,#0x898] ; blr x16
+callee prologue:   d10143ff a9047bfd 910103fd d0000288
+callee[+0x38]=9100c3fd  (LDR x11,[x18,#0x60] should be B-tramp if patched)
+__os_arm64x_check_call=0x0 (not set or bad)
+```
+
+The instruction that "should be a B-tramp if patched" is exactly the `ldr x11,[x18,#0x60]`
+that the `ml246` comment in `signal_arm64ec.c` records as **deliberately wrong and
+A/B-proven unlandable**: iOS clobbers `x18`, so the TEB read yields garbage, and the fix that
+would make it correct broke CEF for 8 consecutive runs. Prologues in `sysx64/kernel32` drive
+`dockhost.exe` into that path once enough thunks need it.
+
+So the reference's stated root-cause fix — give import thunks the hotpatch prologue — is
+**not landable on this stack** as things stand. That is a platform finding, not a tamper
+verdict, and it means the prologue thread cannot be used to reach the decryptor.
+
+**2. Adding the prologue-skip to `arm64x_check_call` does not prevent it.** A faithful port
+was added (`ml260`): if the first 8 bytes are `48 8d a4 24 00 00 00 00`, skip to the `ff 25`
+and re-check. It is a no-op for every DLL shipping today (the bundle's `kernel32` is bare),
+and it is correct per Windows. Measured with it genuinely loaded (`[builtin-override] using
+…1.12-htdisc…` present, 792 prologues): still `pc=0`, still
+`callee[+0x38]… should be B-tramp`, still `exit_code=0xc0000005`. So the skip is necessary but
+far from sufficient — the failure is in how the *checker* is entered, not in how it
+classifies a prologued thunk.
+
+**Methodology trap — a void A/B looks exactly like a valid negative.** One run in this series
+(`run-fix16`) enabled the fixed ntdll *without* restarting the app. The override path is
+`BuiltinOverrides.cSearchPath()`, cached per process and consulted only on the EC-child load
+path (`ios_load_child_ec_ntdll`), so the enabled flag had no effect: the log contained **zero**
+`[builtin-override]` lines and the bundle's ntdll ran. Read naively it says "the fix doesn't
+work"; in fact it says nothing. **Always grep `[builtin-override] using` before believing any
+ntdll A/B**, and restart the app after changing which builtin components are enabled.
+
+
 
 
 
