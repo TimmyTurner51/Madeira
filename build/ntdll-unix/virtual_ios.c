@@ -6484,6 +6484,52 @@ static int ios_iat_skip_exec_dest( void )
     return cached;
 }
 
+/* Guest code in a pool copy addresses the RX alias (`adrp` was relocated to
+ * jit_base). Content writes go to the RW alias. Those views share physical
+ * pages until the data-section mprotect splits them; after the split the
+ * guest still loads the RX page, which keeps the bytes from the initial
+ * copy. ucrtbase's __os_arm64x_dispatch_call_no_redirect is that case: the
+ * RW alias holds ExitToX64 and the RX page the `ldr` reads is still 0, so
+ * `blr x16` dies at pc=0. Mirror onto RX pages that are not executable.
+ * Skipping executable pages is deliberate: vm_protect without EXECUTE drops
+ * it from max_protection permanently (ml140). */
+static void ios_jit_mirror_rx( void *rx, const void *src, size_t size )
+{
+    uintptr_t start, end, page;
+    static int logged;
+
+    if (!rx || !src || !size) return;
+    start = (uintptr_t)rx;
+    end = start + size;
+    for (page = start & ~(uintptr_t)0x3fff; page < end; page += 0x4000)
+    {
+        mach_vm_address_t q = (mach_vm_address_t)page;
+        mach_vm_size_t sz = 0;
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t obj = MACH_PORT_NULL;
+        uintptr_t lo, hi;
+
+        if (mach_vm_region( mach_task_self(), &q, &sz, VM_REGION_BASIC_INFO_64,
+                            (vm_region_info_t)&info, &cnt, &obj ) != KERN_SUCCESS) continue;
+        if (q > page) continue;
+        if (info.protection & VM_PROT_EXECUTE) continue;
+        if (!(info.protection & VM_PROT_WRITE) &&
+            vm_protect( mach_task_self(), (vm_address_t)page, 0x4000,
+                        FALSE, VM_PROT_READ | VM_PROT_WRITE ) != KERN_SUCCESS)
+            continue;
+        lo = page < start ? start : page;
+        hi = (page + 0x4000) < end ? page + 0x4000 : end;
+        if (logged < 12 && memcmp( (void *)lo, (const char *)src + (lo - start), hi - lo ))
+        {
+            logged++;
+            dprintf( 2, "[rx-mirror] %p+0x%lx differed from the source (page prot=0x%x)\n",
+                     (void *)lo, (unsigned long)(hi - lo), info.protection );
+        }
+        memcpy( (void *)lo, (const char *)src + (lo - start), hi - lo );
+    }
+}
+
 void ios_jit_sync_write(void *addr, size_t size)
 {
     int i, fallback = -1;
@@ -6511,7 +6557,497 @@ void ios_jit_sync_write(void *addr, size_t size)
                               - (uintptr_t)ios_jit_rx_base_global;
         char *jit_rw_dest = (char *)ios_jit_rw_base_global + pool_offset + off;
         memcpy(jit_rw_dest, addr, size);
+        ios_jit_mirror_rx( (char *)ios_jit_mappings[fallback].jit_base + off, addr, size );
     }
+}
+
+/* ucrtbase calls __os_arm64x_dispatch_call_no_redirect with
+ * `adrp; ldr xN,[xN,#imm]; blr xN`. The slot holds the exit thunk, but a store
+ * to the executable address is redirected onto the writable alias and the CPU
+ * keeps fetching the old `blr` (it then branches through xN, which that fetch
+ * left at 0). The x18 patcher changes fetched instructions by storing through
+ * the writable alias and calling sys_icache_invalidate on the executable
+ * address. Do the same for this one slot: replace those `blr`s with `bl` to
+ * the pointer the slot holds. `bl` writes the link register, as `blr` does. */
+void ios_jit_retarget_blr( void *pe_slot )
+{
+    int i, idx = -1, s, seen = 0, patched = 0;
+    uintptr_t a = (uintptr_t)pe_slot;
+    void *cur_peb = ios_jit_current_peb();
+    uintptr_t pool_offset, off;
+    char *rw_image, *rx_image;
+    size_t image_size;
+    uint64_t target, rx_slot;
+    unsigned char *img, *sh;
+    int pe_off;
+    unsigned short num_sec, opt_size;
+
+    if (!pe_slot || !ios_jit_rw_base_global || !ios_jit_rx_base_global) return;
+    for (i = 0; i < ios_jit_mapping_count; i++)
+    {
+        uintptr_t base = (uintptr_t)ios_jit_mappings[i].pe_base;
+        if (a < base || a >= base + ios_jit_mappings[i].size) continue;
+        if (ios_jit_mappings[i].owner_peb == cur_peb) { idx = i; break; }
+        if (!ios_jit_mappings[i].owner_peb && idx < 0) idx = i;
+    }
+    if (idx < 0)
+    {
+        dprintf( 2, "[retarget] %p is not in a pool copy\n", pe_slot );
+        return;
+    }
+    off = a - (uintptr_t)ios_jit_mappings[idx].pe_base;
+    pool_offset = (uintptr_t)ios_jit_mappings[idx].jit_base
+                - (uintptr_t)ios_jit_rx_base_global;
+    rw_image = (char *)ios_jit_rw_base_global + pool_offset;
+    rx_image = (char *)ios_jit_mappings[idx].jit_base;
+    image_size = ios_jit_mappings[idx].size;
+    if (off + sizeof(uint64_t) > image_size) return;
+    memcpy( rw_image + off, pe_slot, sizeof(uint64_t) );
+    target = *(uint64_t *)(rw_image + off);
+    rx_slot = (uint64_t)(rx_image + off);
+    for (i = 0; i < ios_jit_mapping_count && target; i++)
+    {
+        uintptr_t base = (uintptr_t)ios_jit_mappings[i].pe_base;
+        if (target < base || target >= base + ios_jit_mappings[i].size) continue;
+        if (ios_jit_mappings[i].owner_peb != cur_peb && ios_jit_mappings[i].owner_peb) continue;
+        target = (uint64_t)ios_jit_mappings[i].jit_base + (target - base);
+        break;
+    }
+    if (image_size < 0x40) goto done;
+    img = (unsigned char *)rw_image;
+    pe_off = *(int *)(img + 0x3c);
+    if (pe_off < 0 || (size_t)pe_off + 0x18 > image_size) goto done;
+    num_sec = *(unsigned short *)(img + pe_off + 6);
+    opt_size = *(unsigned short *)(img + pe_off + 0x14);
+    sh = img + pe_off + 0x18 + opt_size;
+    if (num_sec > 96 || (size_t)(sh - img) + (size_t)num_sec * 40 > image_size) goto done;
+    for (s = 0; s < num_sec; s++, sh += 40)
+    {
+        uint32_t va = *(uint32_t *)(sh + 12);
+        uint32_t vsz = *(uint32_t *)(sh + 8);
+        uint32_t chars = *(uint32_t *)(sh + 36);
+        uint32_t p;
+        if (!(chars & 0x20000000)) continue;
+        if ((size_t)va >= image_size || vsz > image_size - va) continue;
+        for (p = 0; p + 12 <= vsz && patched < 32; p += 4)
+        {
+            uint32_t adrp = *(uint32_t *)(rw_image + va + p);
+            uint32_t ldr  = *(uint32_t *)(rw_image + va + p + 4);
+            uint32_t blr  = *(uint32_t *)(rw_image + va + p + 8);
+            uint32_t rd, rn, rt, brn;
+            int64_t imm;
+            uint64_t pc, page, slot;
+            int64_t delta;
+            uint32_t bl;
+            if ((adrp & 0x9f000000) != 0x90000000) continue;
+            if ((ldr & 0xffc00000) != 0xf9400000) continue;
+            if ((blr & 0xfffffc1f) != 0xd63f0000) continue;
+            rd = adrp & 31;
+            rn = (ldr >> 5) & 31;
+            rt = ldr & 31;
+            brn = (blr >> 5) & 31;
+            if (rn != rd || brn != rt) continue;
+            seen++;
+            pc = (uint64_t)(rx_image + va + p);
+            imm = ((int64_t)((adrp >> 5) & 0x7ffff) << 2) | ((adrp >> 29) & 3);
+            if (imm & (1 << 20)) imm -= (1 << 21);
+            page = (pc & ~0xfffULL) + ((uint64_t)imm << 12);
+            slot = page + ((uint64_t)((ldr >> 10) & 0xfff) << 3);
+            if (slot != rx_slot || !target) continue;
+            delta = (int64_t)target - (int64_t)(pc + 8);
+            if ((delta & 3) || delta < -(1LL << 27) || delta >= (1LL << 27))
+            {
+                dprintf( 2, "[retarget] %p out of range delta=%lld target=%p\n",
+                         (void *)(pc + 8), (long long)delta, (void *)target );
+                continue;
+            }
+            bl = 0x94000000u | (uint32_t)((delta >> 2) & 0x3ffffff);
+            *(uint32_t *)(rw_image + va + p + 8) = bl;
+            sys_icache_invalidate( rx_image + va + p + 8, 4 );
+            patched++;
+            if (patched <= 4)
+            {
+                uint32_t got = 0;
+                mach_vm_size_t ngot = 0;
+                kern_return_t kr = mach_vm_read_overwrite( mach_task_self(),
+                        (mach_vm_address_t)(rx_image + va + p + 8), 4,
+                        (mach_vm_address_t)&got, &ngot );
+                dprintf( 2, "[retarget] %p blr -> %08x rw=%08x rx=%08x kr=%d target=%p\n",
+                         (void *)(pc + 8), bl, *(uint32_t *)(rw_image + va + p + 8),
+                         got, kr, (void *)target );
+            }
+        }
+    }
+done:
+    {
+        uint64_t rx_q = 0;
+        mach_vm_size_t ngot = 0;
+        kern_return_t kr = mach_vm_read_overwrite( mach_task_self(),
+                (mach_vm_address_t)rx_slot, 8, (mach_vm_address_t)&rx_q, &ngot );
+        dprintf( 2, "[retarget] slot pe=%p rx=%p rw=%p target=%p sequences=%d patched=%d "
+                 "rx-slot=%p kr=%d\n",
+                 pe_slot, (void *)rx_slot, rw_image + off, (void *)target,
+                 seen, patched, (void *)rx_q, kr );
+    }
+}
+
+/* CHPE __os_arm64x_dispatch_call_no_redirect RVA. The metadata pointer is an
+ * absolute address: the pool copy after DIR64, or the PE view the image was
+ * copied from. Returns 0 when this image has no such slot. */
+static int ios_image_noredir_rva( char *rw, char *rx, const void *pe, size_t size, uint32_t *rva )
+{
+    int pe_off;
+    uint32_t lc_rva, lc_sz;
+    uint64_t meta;
+    char *mp;
+
+    if (!rw || size < 0x200 || rw[0] != 'M' || rw[1] != 'Z') return 0;
+    pe_off = *(int *)(rw + 0x3c);
+    if (pe_off < 0x40 || (size_t)pe_off + 0xe0 > size) return 0;
+    lc_rva = *(uint32_t *)(rw + pe_off + 0xd8);
+    lc_sz  = *(uint32_t *)(rw + pe_off + 0xdc);
+    if (!lc_rva || lc_sz < 0xd0 || (size_t)lc_rva + 0xd0 > size) return 0;
+    meta = *(uint64_t *)(rw + lc_rva + 0xc8);
+    if (!meta) return 0;
+    if (rx && meta >= (uint64_t)(uintptr_t)rx && meta + 0x18 <= (uint64_t)(uintptr_t)rx + size)
+        mp = rw + (meta - (uint64_t)(uintptr_t)rx);
+    else if (pe && meta >= (uint64_t)(uintptr_t)pe && meta + 0x18 <= (uint64_t)(uintptr_t)pe + size)
+        mp = rw + (meta - (uint64_t)(uintptr_t)pe);
+    else if (meta >= (uint64_t)(uintptr_t)rw && meta + 0x18 <= (uint64_t)(uintptr_t)rw + size)
+        mp = (char *)(uintptr_t)meta;
+    else
+        return 0;
+    *rva = *(uint32_t *)(mp + 0x14);
+    if (!*rva || (size_t)*rva + 8 > size) return 0;
+    return 1;
+}
+
+/* Replace this image's `adrp; ldr; blr` of its own no_redirect slot with `bl`
+ * to `target`, through the writable alias. The caller invalidates the
+ * executable copy once, before any guest fetch — the same window the x18
+ * patcher uses. A later per-instruction invalidate does not change what the
+ * CPU has already fetched. */
+static int ios_jit_patch_blrs( char *rw, char *rx, size_t size, uint64_t rx_slot, uint64_t target )
+{
+    int pe_off, s, patched = 0;
+    unsigned short num_sec, opt_size;
+    unsigned char *sh;
+
+    if (!rw || !rx || !target || size < 0x40) return 0;
+    pe_off = *(int *)(rw + 0x3c);
+    if (pe_off < 0 || (size_t)pe_off + 0x18 > size) return 0;
+    num_sec = *(unsigned short *)(rw + pe_off + 6);
+    opt_size = *(unsigned short *)(rw + pe_off + 0x14);
+    sh = (unsigned char *)rw + pe_off + 0x18 + opt_size;
+    if (num_sec > 96 || (size_t)(sh - (unsigned char *)rw) + (size_t)num_sec * 40 > size) return 0;
+    for (s = 0; s < num_sec; s++, sh += 40)
+    {
+        uint32_t va = *(uint32_t *)(sh + 12);
+        uint32_t vsz = *(uint32_t *)(sh + 8);
+        uint32_t chars = *(uint32_t *)(sh + 36);
+        uint32_t p;
+        if (!(chars & 0x20000000)) continue;
+        if ((size_t)va >= size || vsz > size - va) continue;
+        for (p = 0; p + 12 <= vsz && patched < 512; p += 4)
+        {
+            uint32_t adrp = *(uint32_t *)(rw + va + p);
+            uint32_t ldr  = *(uint32_t *)(rw + va + p + 4);
+            uint32_t blr  = *(uint32_t *)(rw + va + p + 8);
+            uint32_t rd, rn, rt, brn;
+            int64_t imm, delta;
+            uint64_t pc, page, slot;
+            if ((adrp & 0x9f000000) != 0x90000000) continue;
+            if ((ldr & 0xffc00000) != 0xf9400000) continue;
+            if ((blr & 0xfffffc1f) != 0xd63f0000) continue;
+            rd = adrp & 31;
+            rn = (ldr >> 5) & 31;
+            rt = ldr & 31;
+            brn = (blr >> 5) & 31;
+            if (rn != rd || brn != rt) continue;
+            pc = (uint64_t)(uintptr_t)(rx + va + p);
+            imm = ((int64_t)((adrp >> 5) & 0x7ffff) << 2) | ((adrp >> 29) & 3);
+            if (imm & (1 << 20)) imm -= (1 << 21);
+            page = (pc & ~0xfffULL) + ((uint64_t)imm << 12);
+            slot = page + ((uint64_t)((ldr >> 10) & 0xfff) << 3);
+            if (slot != rx_slot) continue;
+            delta = (int64_t)target - (int64_t)(pc + 8);
+            if ((delta & 3) || delta < -(1LL << 27) || delta >= (1LL << 27))
+            {
+                dprintf( 2, "[retarget-copy] %p out of range delta=%lld target=%p\n",
+                         (void *)(pc + 8), (long long)delta, (void *)target );
+                continue;
+            }
+            *(uint32_t *)(rw + va + p + 8) = 0x94000000u | (uint32_t)((delta >> 2) & 0x3ffffff);
+            patched++;
+        }
+    }
+    return patched;
+}
+
+/* ExitToX64 is an export of xtajit64, which is copied before ucrtbase. The
+ * hybrid slot that points at it is still zero at copy time: the pointer is
+ * written only after xtajit64 finishes loading. */
+static uint64_t ios_exit_to_x64_rx;
+/* arm64x_check_call, the body __os_arm64x_dispatch_icall is filled with.
+ * Recorded from ntdll's pool copy. ntdll is copied before ucrtbase. */
+static uint64_t ios_check_call_rx;
+
+static uint32_t ios_pe_export_rva( char *img, size_t size, const char *want )
+{
+    int pe_off, i;
+    uint32_t exp_rva, exp_sz, nnames, funcs, names, ords;
+
+    if (!img || !want || size < 0x200 || img[0] != 'M' || img[1] != 'Z') return 0;
+    pe_off = *(int *)(img + 0x3c);
+    if (pe_off < 0x40 || (size_t)pe_off + 0x90 > size) return 0;
+    exp_rva = *(uint32_t *)(img + pe_off + 0x88);
+    exp_sz = *(uint32_t *)(img + pe_off + 0x8c);
+    if (!exp_rva || exp_sz < 40 || (size_t)exp_rva + 40 > size) return 0;
+    nnames = *(uint32_t *)(img + exp_rva + 24);
+    funcs = *(uint32_t *)(img + exp_rva + 28);
+    names = *(uint32_t *)(img + exp_rva + 32);
+    ords = *(uint32_t *)(img + exp_rva + 36);
+    if (!nnames || nnames > 8192) return 0;
+    if ((size_t)names + (size_t)nnames * 4 > size || (size_t)ords + (size_t)nnames * 2 > size)
+        return 0;
+    for (i = 0; i < (int)nnames; i++)
+    {
+        uint32_t nr = *(uint32_t *)(img + names + (size_t)i * 4);
+        uint16_t ord;
+        uint32_t fr;
+        if (!nr || (size_t)nr + 16 > size) continue;
+        if (strcmp( img + nr, want )) continue;
+        ord = *(uint16_t *)(img + ords + (size_t)i * 2);
+        if ((size_t)funcs + ((size_t)ord + 1) * 4 > size) return 0;
+        fr = *(uint32_t *)(img + funcs + (size_t)ord * 4);
+        if (!fr || (size_t)fr >= size) return 0;
+        return fr;
+    }
+    return 0;
+}
+
+/* A `blr` through a read-only slot whose pointer already names a function in
+ * this image. ucrtbase+0x17680 is one: the file has the pointer, the guest
+ * load still returns 0, and the previous experiment died there as soon as the
+ * exit thunk itself was no longer the instruction that ran. The slot does not
+ * change, so the direct call is the same call. */
+static int ios_jit_patch_const_blrs( char *rw, char *rx, const void *pe, size_t size )
+{
+    int pe_off, s, patched = 0, skipped = 0;
+    unsigned short num_sec, opt_size;
+    unsigned char *sh;
+    uint64_t imagebase;
+
+    if (!rw || !rx || size < 0x40 || rw[0] != 'M' || rw[1] != 'Z') return 0;
+    pe_off = *(int *)(rw + 0x3c);
+    if (pe_off < 0x40 || (size_t)pe_off + 0x38 > size) return 0;
+    imagebase = *(uint64_t *)(rw + pe_off + 0x30);
+    num_sec = *(unsigned short *)(rw + pe_off + 6);
+    opt_size = *(unsigned short *)(rw + pe_off + 0x14);
+    sh = (unsigned char *)rw + pe_off + 0x18 + opt_size;
+    if (num_sec > 96 || (size_t)(sh - (unsigned char *)rw) + (size_t)num_sec * 40 > size) return 0;
+    for (s = 0; s < num_sec; s++, sh += 40)
+    {
+        uint32_t va = *(uint32_t *)(sh + 12);
+        uint32_t vsz = *(uint32_t *)(sh + 8);
+        uint32_t chars = *(uint32_t *)(sh + 36);
+        uint32_t p;
+        if (!(chars & 0x20000000)) continue;
+        if ((size_t)va >= size || vsz > size - va) continue;
+        for (p = 0; p + 12 <= vsz && patched < 8192; p += 4)
+        {
+            uint32_t adrp = *(uint32_t *)(rw + va + p);
+            uint32_t ldr  = *(uint32_t *)(rw + va + p + 4);
+            uint32_t blr  = *(uint32_t *)(rw + va + p + 8);
+            uint32_t rd, rn, rt, brn, slot_rva, t;
+            int64_t imm, delta;
+            uint64_t pc, page, slot, q, target;
+            int writable = 1;
+            if ((adrp & 0x9f000000) != 0x90000000) continue;
+            if ((ldr & 0xffc00000) != 0xf9400000) continue;
+            if ((blr & 0xfffffc1f) != 0xd63f0000) continue;
+            rd = adrp & 31;
+            rn = (ldr >> 5) & 31;
+            rt = ldr & 31;
+            brn = (blr >> 5) & 31;
+            if (rn != rd || brn != rt) continue;
+            pc = (uint64_t)(uintptr_t)(rx + va + p);
+            imm = ((int64_t)((adrp >> 5) & 0x7ffff) << 2) | ((adrp >> 29) & 3);
+            if (imm & (1 << 20)) imm -= (1 << 21);
+            page = (pc & ~0xfffULL) + ((uint64_t)imm << 12);
+            slot = page + ((uint64_t)((ldr >> 10) & 0xfff) << 3);
+            if (slot < (uint64_t)(uintptr_t)rx || slot + 8 > (uint64_t)(uintptr_t)rx + size)
+                continue;
+            slot_rva = (uint32_t)(slot - (uint64_t)(uintptr_t)rx);
+            for (t = 0; t < num_sec; t++)
+            {
+                unsigned char *hs = (unsigned char *)rw + pe_off + 0x18 + opt_size + t * 40;
+                uint32_t hva = *(uint32_t *)(hs + 12);
+                uint32_t hvsz = *(uint32_t *)(hs + 8);
+                uint32_t hch = *(uint32_t *)(hs + 36);
+                if (slot_rva >= hva && slot_rva < hva + hvsz)
+                {
+                    writable = (hch & 0x80000000) != 0;
+                    break;
+                }
+            }
+            if (writable) continue;
+            q = *(uint64_t *)(rw + slot_rva);
+            if (q >= (uint64_t)(uintptr_t)rx && q < (uint64_t)(uintptr_t)rx + size)
+                target = q;
+            else if (pe && q >= (uint64_t)(uintptr_t)pe && q < (uint64_t)(uintptr_t)pe + size)
+                target = (uint64_t)(uintptr_t)rx + (q - (uint64_t)(uintptr_t)pe);
+            else if (imagebase && q >= imagebase && q < imagebase + size)
+                target = (uint64_t)(uintptr_t)rx + (q - imagebase);
+            else
+                continue;
+            delta = (int64_t)target - (int64_t)(pc + 8);
+            if ((delta & 3) || delta < -(1LL << 27) || delta >= (1LL << 27))
+            {
+                skipped++;
+                continue;
+            }
+            *(uint32_t *)(rw + va + p + 8) = 0x94000000u | (uint32_t)((delta >> 2) & 0x3ffffff);
+            patched++;
+        }
+    }
+    if (patched || skipped)
+        dprintf( 2, "[retarget-copy] %s constant calls patched %d skipped %d\n",
+                 ios_pe_module_name( pe, size ) ? ios_pe_module_name( pe, size ) : "?",
+                 patched, skipped );
+    return patched;
+}
+
+/* arm64x_check_call starts with `lsr x16, x11, #39; cbnz x16, ...`. The cbnz
+ * displacement differs between ntdll builds. The next instruction is
+ * `ldr x16, [x18, #0x60]`, but the x18 patcher runs first and replaces it
+ * with a branch, so the scan cannot require that word. The two-instruction
+ * prefix occurs once, in ntdll. */
+static void ios_find_check_call( char *rw, char *rx, size_t size )
+{
+    int pe_off, s;
+    unsigned short num_sec, opt_size;
+    unsigned char *sh;
+
+    if (ios_check_call_rx || !rw || !rx || size < 0x40) return;
+    pe_off = *(int *)(rw + 0x3c);
+    if (pe_off < 0 || (size_t)pe_off + 0x18 > size) return;
+    num_sec = *(unsigned short *)(rw + pe_off + 6);
+    opt_size = *(unsigned short *)(rw + pe_off + 0x14);
+    sh = (unsigned char *)rw + pe_off + 0x18 + opt_size;
+    if (num_sec > 96 || (size_t)(sh - (unsigned char *)rw) + (size_t)num_sec * 40 > size) return;
+    for (s = 0; s < num_sec; s++, sh += 40)
+    {
+        uint32_t va = *(uint32_t *)(sh + 12);
+        uint32_t vsz = *(uint32_t *)(sh + 8);
+        uint32_t chars = *(uint32_t *)(sh + 36);
+        uint32_t p;
+        if (!(chars & 0x20000000)) continue;
+        if ((size_t)va >= size || vsz > size - va || vsz < 12) continue;
+        for (p = 0; p + 12 <= vsz; p += 4)
+        {
+            uint32_t w0 = *(uint32_t *)(rw + va + p);
+            uint32_t w1 = *(uint32_t *)(rw + va + p + 4);
+            if (w0 != 0xd367fd70 || (w1 & 0xff00001f) != 0xb5000010)
+                continue;
+            ios_check_call_rx = (uint64_t)(uintptr_t)(rx + va + p);
+            dprintf( 2, "[retarget-copy] %s arm64x_check_call %p\n",
+                     ios_pe_module_name( rw, size ) ? ios_pe_module_name( rw, size ) : "?",
+                     (void *)ios_check_call_rx );
+            return;
+        }
+    }
+}
+
+/* Read one ULONG from IMAGE_ARM64EC_METADATA. field_off 0x20 is
+ * __os_arm64x_dispatch_icall, 0x24 is __os_arm64x_dispatch_icall_cfg.
+ * Both are filled with arm64x_check_call after the image has been copied. */
+static int ios_image_meta_u32( char *rw, char *rx, const void *pe, size_t size,
+                               uint32_t field_off, uint32_t *rva )
+{
+    int pe_off;
+    uint32_t lc_rva, lc_sz, need;
+    uint64_t meta;
+    char *mp;
+
+    if (!rw || !rva || size < 0x200 || rw[0] != 'M' || rw[1] != 'Z') return 0;
+    pe_off = *(int *)(rw + 0x3c);
+    if (pe_off < 0x40 || (size_t)pe_off + 0xe0 > size) return 0;
+    lc_rva = *(uint32_t *)(rw + pe_off + 0xd8);
+    lc_sz  = *(uint32_t *)(rw + pe_off + 0xdc);
+    if (!lc_rva || lc_sz < 0xd0 || (size_t)lc_rva + 0xd0 > size) return 0;
+    meta = *(uint64_t *)(rw + lc_rva + 0xc8);
+    need = field_off + 4;
+    if (!meta || field_off > 0x40) return 0;
+    if (rx && meta >= (uint64_t)(uintptr_t)rx && meta + need <= (uint64_t)(uintptr_t)rx + size)
+        mp = rw + (meta - (uint64_t)(uintptr_t)rx);
+    else if (pe && meta >= (uint64_t)(uintptr_t)pe && meta + need <= (uint64_t)(uintptr_t)pe + size)
+        mp = rw + (meta - (uint64_t)(uintptr_t)pe);
+    else if (meta >= (uint64_t)(uintptr_t)rw && meta + need <= (uint64_t)(uintptr_t)rw + size)
+        mp = (char *)(uintptr_t)meta;
+    else
+        return 0;
+    *rva = *(uint32_t *)(mp + field_off);
+    if (!*rva || (size_t)*rva + 8 > size) return 0;
+    return 1;
+}
+
+/* The per-call thunks branch to one stub that does
+ * adrp/ldr/blr through __os_arm64x_dispatch_icall. That slot is zero at copy
+ * time. Replacing the blr with bl to arm64x_check_call skips the load. */
+static void ios_jit_patch_icall( char *rw, char *rx, const void *pe, size_t size )
+{
+    uint32_t icall = 0, cfg = 0;
+    const char *name = ios_pe_module_name( pe, size );
+    int n = 0;
+
+    if (!ios_image_meta_u32( rw, rx, pe, size, 0x20, &icall )) return;
+    if (!ios_check_call_rx)
+    {
+        dprintf( 2, "[retarget-copy] %s icall rva %#x, arm64x_check_call not copied yet\n",
+                 name ? name : "?", icall );
+        return;
+    }
+    n = ios_jit_patch_blrs( rw, rx, size, (uint64_t)(uintptr_t)(rx + icall), ios_check_call_rx );
+    if (ios_image_meta_u32( rw, rx, pe, size, 0x24, &cfg ) && cfg != icall)
+        n += ios_jit_patch_blrs( rw, rx, size, (uint64_t)(uintptr_t)(rx + cfg), ios_check_call_rx );
+    dprintf( 2, "[retarget-copy] %s icall patched %d target %p\n",
+             name ? name : "?", n, (void *)ios_check_call_rx );
+}
+
+/* Called from the image copy, after the bytes are in the pool and before the
+ * guest can fetch them. */
+void ios_jit_retarget_at_copy( char *rw, char *rx, size_t size, const void *pe )
+{
+    uint32_t slot_rva = 0, exit_rva;
+    const char *name;
+    int n;
+
+    ios_find_check_call( rw, rx, size );
+    exit_rva = ios_pe_export_rva( rw, size, "ExitToX64" );
+    if (exit_rva)
+    {
+        ios_exit_to_x64_rx = (uint64_t)(uintptr_t)(rx + exit_rva);
+        dprintf( 2, "[retarget-copy] %s ExitToX64 %p\n",
+                 ios_pe_module_name( pe, size ) ? ios_pe_module_name( pe, size ) : "?",
+                 (void *)ios_exit_to_x64_rx );
+    }
+    if (ios_image_noredir_rva( rw, rx, pe, size, &slot_rva ))
+    {
+        name = ios_pe_module_name( pe, size );
+        if (!ios_exit_to_x64_rx)
+            dprintf( 2, "[retarget-copy] %s slot rva %#x, ExitToX64 not copied yet\n",
+                     name ? name : "?", slot_rva );
+        else
+        {
+            n = ios_jit_patch_blrs( rw, rx, size, (uint64_t)(uintptr_t)(rx + slot_rva),
+                                    ios_exit_to_x64_rx );
+            dprintf( 2, "[retarget-copy] %s slot %p target %p patched %d\n",
+                     name ? name : "?", rx + slot_rva, (void *)ios_exit_to_x64_rx, n );
+        }
+    }
+    ios_jit_patch_icall( rw, rx, pe, size );
+    ios_jit_patch_const_blrs( rw, rx, pe, size );
 }
 
 /* ntdll data sync range: env.MADEIRA_NTDLL_DATA_SYNC_RANGE = 1 (OPT-IN; contributed by mckenna654).
@@ -7431,8 +7967,68 @@ size_t ios_jit_x18_tramp_need( const char *text, size_t text_size, int stores )
     return need + 0x1000;
 }
 
+/* x64 bytes inside a hybrid image are not ARM. An `ff 25` jmp whose
+ * displacement happens to set bits [20:16] to 18 decodes as an ADD that
+ * reads x18, and the patcher then overwrites the jmp with a branch.
+ * GetCommandLineA's thunk is one of those. The CHPE code map names the
+ * ranges that are x64; they must not be rewritten. */
+struct ios_x64_span { uint32_t rva, end; };
+
+static int ios_x64_spans( char *rw, char *rx, const void *pe, size_t size,
+                          struct ios_x64_span *out, int cap )
+{
+    int pe_off, n = 0;
+    uint32_t lc_rva, lc_sz, count, i;
+    uint64_t meta, imagebase;
+    char *mp, *map;
+
+    if (!rw || !out || cap < 1 || size < 0x200 || rw[0] != 'M' || rw[1] != 'Z') return 0;
+    pe_off = *(int *)(rw + 0x3c);
+    if (pe_off < 0x40 || (size_t)pe_off + 0xe0 > size) return 0;
+    imagebase = *(uint64_t *)(rw + pe_off + 0x30);
+    lc_rva = *(uint32_t *)(rw + pe_off + 0xd8);
+    lc_sz  = *(uint32_t *)(rw + pe_off + 0xdc);
+    if (!lc_rva || lc_sz < 0xd0 || (size_t)lc_rva + 0xd0 > size) return 0;
+    meta = *(uint64_t *)(rw + lc_rva + 0xc8);
+    if (!meta) return 0;
+    if (rx && meta >= (uint64_t)(uintptr_t)rx && meta + 0x10 <= (uint64_t)(uintptr_t)rx + size)
+        mp = rw + (meta - (uint64_t)(uintptr_t)rx);
+    else if (pe && meta >= (uint64_t)(uintptr_t)pe && meta + 0x10 <= (uint64_t)(uintptr_t)pe + size)
+        mp = rw + (meta - (uint64_t)(uintptr_t)pe);
+    else if (meta >= (uint64_t)(uintptr_t)rw && meta + 0x10 <= (uint64_t)(uintptr_t)rw + size)
+        mp = (char *)(uintptr_t)meta;
+    else if (imagebase && meta >= imagebase && meta + 0x10 <= imagebase + size)
+        mp = rw + (uint32_t)(meta - imagebase);
+    else
+        return 0;
+    count = *(uint32_t *)(mp + 8);
+    if (!*(uint32_t *)(mp + 4) || !count || count > 65536) return 0;
+    if ((size_t)*(uint32_t *)(mp + 4) + (size_t)count * 8 > size) return 0;
+    map = rw + *(uint32_t *)(mp + 4);
+    for (i = 0; i < count && n < cap; i++)
+    {
+        uint32_t start = *(uint32_t *)(map + i * 8);
+        uint32_t len = *(uint32_t *)(map + i * 8 + 4);
+        if ((start & 3) != 2 || !len) continue;          /* 2 = x64 */
+        out[n].rva = start & ~3u;
+        out[n].end = out[n].rva + len;
+        n++;
+    }
+    return n;
+}
+
+static int ios_rva_in_spans( const struct ios_x64_span *s, int n, uint32_t rva )
+{
+    int i;
+    for (i = 0; i < n; i++)
+        if (rva >= s[i].rva && rva < s[i].end) return 1;
+    return 0;
+}
+
 int ios_jit_patch_x18(char *text_rw, char *text_rx, size_t text_size,
-                       char *tramp_rw, char *tramp_rx, size_t tramp_size, int stores)
+                       char *tramp_rw, char *tramp_rx, size_t tramp_size, int stores,
+                       char *image, char *image_rx, const void *image_pe, size_t image_size,
+                       size_t text_rva)
 {
     size_t tramp_off = 0;
     int count = 0;
@@ -7440,6 +8036,9 @@ int ios_jit_patch_x18(char *text_rw, char *text_rx, size_t text_size,
     int lit_skipped = 0;
     int ldr_scratch = 0;   /* ml7xx: patched via the destination register */
     int x18_scratch = 0;   /* ml7xx: patched via x18 itself */
+    int x64_skipped = 0;
+    struct ios_x64_span x64_spans[256];
+    int x64_n = ios_x64_spans( image, image_rx, image_pe, image_size, x64_spans, 256 );
     unsigned char *data_map = NULL;
     extern int ios_teb_tls_slot_offset;
 
@@ -7588,6 +8187,11 @@ int ios_jit_patch_x18(char *text_rw, char *text_rx, size_t text_size,
     {
         uint32_t insn = *(uint32_t *)(text_rw + i);
         int role;
+        if (x64_n && ios_rva_in_spans( x64_spans, x64_n, (uint32_t)(text_rva + i) ))
+        {
+            x64_skipped++;
+            continue;
+        }
         if (data_map && (data_map[(i / 4) >> 3] & (1 << ((i / 4) & 7))))
         {
             if (ios_insn_x18_role(insn, stores) != X18_ROLE_NONE) lit_skipped++;
@@ -7788,6 +8392,8 @@ int ios_jit_patch_x18(char *text_rw, char *text_rx, size_t text_size,
                 "tramp=%p+%#lx used=%lu\n",
                 text_rx, (unsigned long)text_size, text_rw, count, skipped,
                 tramp_rx, (unsigned long)tramp_size, (unsigned long)tramp_off);
+    if (x64_skipped)
+        dprintf(2, "[x18-patch] left %d instruction(s) in x64 code ranges alone\n", x64_skipped);
     /* dprintf, not ERR: err-virtual is muted, and after the SP-align fix the
      * split is the thing to check on-device -- no trampoline may touch SP. */
     if (count > 0)
@@ -20525,7 +21131,10 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                             char *text_rx = (char *)jit_rx_base + offset + text_off;
 
                             int patched = ios_jit_patch_x18(text_rw, text_rx, text_sz,
-                                                            tramp_rw, tramp_rx, tramp_alloc, x18_stores);
+                                                            tramp_rw, tramp_rx, tramp_alloc, x18_stores,
+                                                            (char *)jit_rw_base + offset,
+                                                            (char *)jit_rx_base + offset,
+                                                            image_base, image_size, text_off);
 
                             if (patched > 0)
                             {
@@ -20541,6 +21150,13 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                     }
                 }
                 x18_patch_done: ;
+                /* The exit branch has to be in the pool copy before the first
+                 * fetch. A store after this invalidate does not change the
+                 * instruction the CPU runs. */
+                ios_jit_retarget_at_copy( (char *)jit_rw_base + offset,
+                                          (char *)jit_rx_base + offset,
+                                          image_size, image_base );
+                sys_icache_invalidate( (char *)jit_rx_base + offset, image_size );
             }
 
             /* ml957: honour a requested PROT_WRITE on the backing.
@@ -20907,7 +21523,8 @@ int ios_jit_copy_module_for_child(void *module_addr, void *child_peb)
             rw_dest + m->text_offset, rx_dest + m->text_offset, m->text_size,
             (char *)ios_jit_rw_base_global + tramp_off,
             (char *)ios_jit_rx_base_global + tramp_off, child_tramp_prealloc,
-            ios_x18_patch_stores(m->pe_base, m->size));
+            ios_x18_patch_stores(m->pe_base, m->size),
+            rw_dest, rx_dest, m->pe_base, m->size, m->text_offset);
         sys_icache_invalidate((char *)ios_jit_rx_base_global + tramp_off, child_tramp_prealloc);
         dprintf(2, "[child-ntdll] x18-patched %d instructions (tramps at image-relative +0x%lx)\n",
                 patched, (unsigned long)(alloc_size - child_tramp_prealloc));
@@ -36611,6 +37228,7 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
                     uintptr_t pool_offset = (uintptr_t)ios_jit_mappings[idx].jit_base
                                           - (uintptr_t)ios_jit_rx_base_global;
                     char *jit_rw_dest = (char *)ios_jit_rw_base_global + pool_offset + off;
+                    char *jit_rx_dest = (char *)ios_jit_mappings[idx].jit_base + off;
                     /* MADEIRA_NTDLL_DATA_SYNC_RANGE: off, never reached. */
                     if (ios_ntdll_data_sync_range_enabled())
                     {
@@ -36725,6 +37343,7 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
                     {
                         /* No overlap with .text — safe to copy whole region */
                         memcpy(jit_rw_dest, base, size);
+                        ios_jit_mirror_rx( jit_rx_dest, base, size );
                         ERR("iOS JIT IAT sync: full copy %p+0x%lx → JIT (no text overlap)\n",
                             base, (unsigned long)size);
                     }
@@ -36827,9 +37446,15 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
                         }
 
                         if (overlap_start > 0)
+                        {
                             memcpy(jit_rw_dest, (char *)base, overlap_start);
+                            ios_jit_mirror_rx( jit_rx_dest, (char *)base, overlap_start );
+                        }
                         if (overlap_end < size)
+                        {
                             memcpy(jit_rw_dest + overlap_end, (char *)base + overlap_end, size - overlap_end);
+                            ios_jit_mirror_rx( jit_rx_dest + overlap_end, (char *)base + overlap_end, size - overlap_end );
+                        }
 
                         ERR("iOS JIT IAT sync: partial copy %p+0x%lx → JIT (skipping text [0x%lx-0x%lx])\n",
                             base, (unsigned long)size,

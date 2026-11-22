@@ -7914,6 +7914,25 @@ dispatch_guest_fault:
                             (unsigned long long)state.__x[4], (unsigned long long)state.__x[8],
                             (unsigned long long)state.__x[9], (unsigned long long)state.__x[10],
                             (unsigned long long)state.__x[11], (unsigned long long)state.__fp);
+                        /* x9 is the address check_call gave up on. The bytes
+                         * decide whether that was a hotpatch jmp the recogniser
+                         * should have followed. */
+                        {
+                            unsigned char xb[16];
+                            mach_vm_size_t got_x9 = 0;
+                            uint64_t x9a = state.__x[9];
+                            if (x9a > 16 && mach_vm_read_overwrite( mach_task_self(),
+                                    (mach_vm_address_t)(x9a - 8), sizeof(xb),
+                                    (mach_vm_address_t)xb, &got_x9 ) == KERN_SUCCESS
+                                && got_x9 == sizeof(xb))
+                                dprintf( STDERR_FILENO,
+                                    "[thunk-slot] x9-8: %02x%02x%02x%02x%02x%02x%02x%02x "
+                                    "%02x%02x%02x%02x%02x%02x%02x%02x\n",
+                                    xb[0], xb[1], xb[2], xb[3], xb[4], xb[5], xb[6], xb[7],
+                                    xb[8], xb[9], xb[10], xb[11], xb[12], xb[13], xb[14], xb[15] );
+                            else
+                                dprintf( STDERR_FILENO, "[thunk-slot] x9-8 unreadable\n" );
+                        }
                         ios_dump_ec_dispatch_slots( lr_va ? lr_va : lr_exec,
                                                     state.__x[9] );
                         /* Exec-relative adrp target: adrp sits at lr-0xc;

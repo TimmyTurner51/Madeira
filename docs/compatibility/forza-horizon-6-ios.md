@@ -2202,6 +2202,31 @@ target was in an executable section. The packaged dylib carries the log lines
 for `ExitToX64`, `arm64x_check_call`, `icall patched` and `constant calls
 patched`, so a run that prints none of them is not running this package.
 
+### 4au. The copy-time branch does run, and the x18 patcher was eating the x64 jmp
+
+`ml265` was pushed and loaded (`[unix-half] ... ml265-exitexport`). ucrtbase
+logged slot patched 19, icall patched 11, constant calls patched 181. The
+faulting instruction, read back from the link register, is `97eb034b`, which is
+`bl` to the logged `ExitToX64`. The copy-time window is what the CPU fetches.
+
+The call is `GetCommandLineA` (kernel32 export at `0x35a70`) during
+`load_arm64ec_module`'s dependency attach, before `arm64ec_process_init`. The
+fast-forward bypass does not match a hotpatch jmp, so `ExitToX64` tries to
+enter the emulator. `EmulatorData[2]` is still 0, and `br` to it dies at
+`pc=0`. `ThreadInit` has not run: the log never reaches "about to call
+arm64ec_process_init".
+
+The bytes at the jmp are not `ff 25`. They are `48 8d a4 24 00 00 00 00` then
+`b` (`14 02 32 bb`) into the x18 trampoline area. `ff 25 d2 ab` is the word
+`0xabd225ff`. Its bits [20:16] are 18, so the x18 patcher classifies that x64
+jmp as an ARM add that reads x18 and replaces it. `GetCommandLineA` sits in
+the code map's x64 range `0x34000` for `0xdcc0`. `ml267` leaves those ranges
+alone (kernel32 logged 3726 instructions left). `arm64ec_process_init` then
+returns 0, and both `pProcessInit` and `pThreadInit` return 0. The dock loads
+Steam modules past that point and later dies at `pc=0xb3724a68` with the guest
+RIP at kernel32+`0x319cc` (`c0000005`, tid `00ac` in the dock). `forzahorizon6.exe`
+does not start.
+
 ---
 
 ## 5. Premise corrections
@@ -2238,21 +2263,13 @@ and the fault is at `image+0x537099c`.
 
 ## 6. Next experiments, cheapest first
 
-0. **Finish the exit branch before anything else (§4at).** The dock dies on a
-   795-prologue `kernel32` at `ucrtbase+0x90f1c` and the game never starts, so
-   none of the decrypt measurements below can run. The package is already
-   built: `dist/ml265-exitexport-native.wcp`. It is not on the phone. Push that
-   file (do not rebuild the app). `[retarget-copy]` should show `ExitToX64`,
-   `ucrtbase` `patched` above 0, `icall patched` above 0, and `constant calls
-   patched` near 181. The icall target is `arm64x_check_call`, matched by
-   `lsr x16, x11, #39` / `cbnz x16` after the x18 patcher has already replaced
-   the following load. If the dock still dies at `0x90f1c`, that write window
-   is also not what the CPU fetches. If the branch runs, `x9` on the last crash
-   was `kernel32+0x35a78` (`ff 25`, not the fast-forward sequence), so
-   `ExitToX64` falls into the emulator; the ciphertext at `0x537099c` is the
-   measurement only after the dock survives. Until that ships, Play crashes the
-   dock. Putting the bundle's bare `kernel32.dll` back on the `kernel32-one.dll`
-   component makes Play safe and gives up the test.
+0. **The exit branch is done (§4au). The dock now dies later.** `ml267-x64span`
+   is what the phone is running. Process init returns, and the dock then faults
+   at `pc=0xb3724a68` with the guest RIP at kernel32+`0x319cc` (`c0000005`).
+   That is the next measurement. `forzahorizon6.exe` still does not start, and
+   Play still crashes the dock. The ciphertext at `0x537099c` is still not
+   reachable. Putting the bundle's bare `kernel32.dll` back on the
+   `kernel32-one.dll` component makes Play safe and gives up the prologue test.
 
 1. **Catch the guest stack at the moment `.text` is unlocked (§4ah).**
    The decrypt question has narrowed to one moment: `prot-img` #45 takes `.text`
