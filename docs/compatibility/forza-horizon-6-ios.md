@@ -2268,15 +2268,20 @@ and the fault is at `image+0x537099c`.
 
 ## 6. Next experiments, cheapest first
 
-0. **Do not emulate a pool address of ARM code (§4au).** `ml267-x64span` is on
-   the phone. Process init returns. The dock then dies because the guest RIP is
-   the pool address of kernel32+`0x319cc`, which is ARM code in an EC range,
-   and the host jumps to unmapped `0xb3724a68`. `ExitToX64` has to branch to
-   that address natively, and a pool address of real x64 code has to be turned
-   back into a PE address before it is used as a guest RIP. `forzahorizon6.exe`
-   still does not start. Play still crashes the dock. Putting the bundle's
-   bare `kernel32.dll` back on the `kernel32-one.dll` component makes Play
-   safe and gives up the prologue test.
+0. **The dock loads `C:\windows\system32\xtajit64.dll`, and it is still the
+   bundle's emulator unless a package links over that exact path.** A package
+   whose dest is `${sysx64}/xtajit64.dll` leaves the running module unchanged
+   (build id stayed `Nov 21`). Linking the same file at `${system32}` is what
+   the dock actually opens: the image grew from `0x418000` to `0x419000` and
+   the build id became `Nov 22 2026 15:42:09`. `ExitToX64` in that module
+   checks the EC bitmap bit of a pool address and the alias table before
+   emulating. Neither one diverted kernel32+`0x319cc`: there is no
+   `[exit-pool]` line, and the dock still dies `0xc0000005` at the same guest
+   RIP (`unix_calls=4517`). `forzahorizon6.exe` does not start. Play still
+   crashes the dock. The phone's enabled emulator package is `ml268-exitpool`,
+   dest `${system32}/xtajit64.dll`. Putting the bundle's bare `kernel32.dll`
+   back on the `kernel32-one.dll` component makes Play safe and gives up the
+   prologue test.
 
 1. **Catch the guest stack at the moment `.text` is unlocked (§4ah).**
    The decrypt question has narrowed to one moment: `prot-img` #45 takes `.text`
