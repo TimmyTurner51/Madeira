@@ -4,14 +4,14 @@ Date: Wed, 4 Nov 2026 21:15:33 -0600
 Subject: [PATCH] winebuild: emit x86_64-style hotpatch prologues for ARM64EC import thunks
 
 ---
- tools/winebuild/spec32.c | 171 +++++++++++++++++++++++++++++++++++++++
- 1 file changed, 171 insertions(+)
+ tools/winebuild/spec32.c | 212 ++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 212 insertions(+)
 
 diff --git a/tools/winebuild/spec32.c b/tools/winebuild/spec32.c
-index 062e65c..5c34b40 100644
+index 9d99850f..30060d77 100644
 --- a/tools/winebuild/spec32.c
 +++ b/tools/winebuild/spec32.c
-@@ -1430,6 +1430,159 @@ void output_def_file( DLLSPEC *spec, struct exports *exports, int import_only )
+@@ -1462,6 +1462,182 @@ void output_def_file( DLLSPEC *spec, struct exports *exports, int import_only )
  }
  
  
@@ -52,11 +52,17 @@ index 062e65c..5c34b40 100644
 +    unsigned int i, j, pos, nb_funcs, funcs_rva, count = 0;
 +    unsigned long long image_base, chpe_va;
 +    unsigned char *sec, *lc, *dvrt, *chpe, *map, *exp, *funcs;
++    unsigned short machine;
++    int pure_ec;
 +
 +    if (size < 0x40) return 0;
 +    nt = get_le32( data + 0x3c );
 +    if (nt > size - 0x108 || memcmp( data + nt, "PE\0\0", 4 )) return 0;
-+    if (get_le16( data + nt + 4 ) != IMAGE_FILE_MACHINE_ARM64) return 0;
++    /* ARM64X hybrids carry the ARM64 machine; aarch64-windows builtins are pure
++     * ARM64EC and carry the x64 machine with the EC metadata instead.  Both ship
++     * x64 import thunks that anti-tamper inspects, so accept both. */
++    machine = get_le16( data + nt + 4 );
++    if (machine != IMAGE_FILE_MACHINE_ARM64 && machine != IMAGE_FILE_MACHINE_AMD64) return 0;
 +    nb_sec = get_le16( data + nt + 6 );
 +    opt = nt + 24;
 +    if (get_le16( data + opt ) != IMAGE_NT_OPTIONAL_HDR64_MAGIC) return 0;
@@ -72,7 +78,22 @@ index 062e65c..5c34b40 100644
 +    lc_size = get_le32( lc );
 +    if (lc_size < 232 || !(lc = pe_rva_ptr( data, size, sec, nb_sec, lc_rva, lc_size ))) return 0;
 +
++    /* A pure ARM64EC image has one export directory holding both the EC entry
++     * points and the x64 thunks that back them, so there is no ARM64X dynamic
++     * relocation to resolve and no CHPE code map to consult. */
++    pure_ec = (machine == IMAGE_FILE_MACHINE_AMD64);
++    if (pure_ec)
++    {
++        exp_rva = get_le32( data + dirs + 8 * 0 /* IMAGE_DIRECTORY_ENTRY_EXPORT */ );
++        exp_size = get_le32( data + dirs + 8 * 0 + 4 );
++        if (!exp_rva) return 0;
++        map = NULL;
++        map_count = 0;
++    }
++
 +    /* CHPE code map, to only touch x64 code */
++    if (!pure_ec)
++    {
 +    chpe_va = get_le32( lc + 200 ) | ((unsigned long long)get_le32( lc + 204 ) << 32);
 +    if (!chpe_va) return 0;
 +    chpe_rva = chpe_va - image_base;
@@ -125,6 +146,7 @@ index 062e65c..5c34b40 100644
 +        }
 +        pos = end;
 +    }
++    }
 +    if (!exp_rva || !(exp = pe_rva_ptr( data, size, sec, nb_sec, exp_rva, 40 ))) return 0;
 +
 +    iat_rva = get_le32( data + dirs + 8 * IMAGE_DIRECTORY_ENTRY_IAT );
@@ -140,7 +162,8 @@ index 062e65c..5c34b40 100644
 +        int rel, x64 = 0;
 +
 +        if (!func || (func & 15) || (func >= exp_rva && func < exp_rva + exp_size)) continue;
-+        for (j = 0; j < map_count; j++)
++        if (pure_ec) x64 = 1;  /* every pure-ARM64EC export slot holds x64 thunk code */
++        for (j = 0; !pure_ec && j < map_count; j++)
 +        {
 +            unsigned int start = get_le32( map + 8 * j ), len = get_le32( map + 8 * j + 4 );
 +            if ((start & 3) == 2 && func >= (start & ~3) && func + 16 <= (start & ~3) + len) x64 = 1;
@@ -171,7 +194,7 @@ index 062e65c..5c34b40 100644
  /*******************************************************************
   *         make_builtin_files
   */
-@@ -1471,6 +1624,24 @@ void make_builtin_files( struct strarray files )
+@@ -1503,6 +1679,24 @@ void make_builtin_files( struct strarray files )
                      write( fd, &dll_charact, sizeof(dll_charact) );
                  }
              }
@@ -196,6 +219,3 @@ index 062e65c..5c34b40 100644
          }
          else fatal_error( "%s: Unrecognized file format\n", file );
          close( fd );
--- 
-2.53.0
-
