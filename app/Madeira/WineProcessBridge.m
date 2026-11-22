@@ -854,6 +854,10 @@ static void madeira_overlay_vcruntime32(NSFileManager *fm, NSString *prefix)
  *   ${sysx64}    drive_c/windows/sysx64
  *   ${sysaa64}   drive_c/windows/sysaa64
  *   ${aarch64}   system32 in an aarch64 session, sysaa64 in an ARM64EC one
+ *   ${sysarm64ec} the farm an ARM64EC process resolves in this session: sysx64 in an
+ *                aarch64 session (whose system32 holds aarch64 binaries), system32 in an
+ *                ARM64EC one. This is what an arm64ec-windows package must use; assuming
+ *                system32 overwrites the launcher's own arch and breaks the launch.
  *
  * An enabled package's "environment" dictionary is exported too. That is how a
  * FEX package can carry its own FEX_* switches; it applies to every launch
@@ -947,10 +951,18 @@ static void madeira_apply_wcp_components(NSFileManager *fm, NSString *prefix, BO
 
             NSString *resolved = [dest stringByReplacingOccurrencesOfString:@"${aarch64}"
                                     withString:(use_arm64ec ? @"${sysaa64}" : @"${system32}")];
+            // The ARM64EC farm moves with the session: an ARM64EC session links its own
+            // binaries into system32, so the EC set stays there; an aarch64 session keeps
+            // system32 for itself and gives ARM64EC children sysx64 (see the sysx64/sysaa64
+            // farm pass above). A package's arm64ec-windows files must follow that.
+            resolved = [resolved stringByReplacingOccurrencesOfString:@"${sysarm64ec}"
+                                    withString:(use_arm64ec ? @"${system32}" : @"${sysx64}")];
             // A native (Mach-O) component is not linked into the prefix: its libraries stay in
             // the component folder and are dlopen'ed at launch (UnixHalf). Skipping it here is
             // what keeps it out of the link count instead of reporting it as a failure.
-            if ([resolved hasPrefix:@"files/"]) continue;
+            // Same for a builtin package's `pe/` staging tree, which the loader reads directly
+            // from WINEDLLPATH because it builds ntdll's own path.
+            if ([resolved hasPrefix:@"files/"] || [resolved hasPrefix:@"pe/"]) continue;
             NSString *folder = nil;
             for (NSString *token in tokens) {
                 NSString *marker = [NSString stringWithFormat:@"${%@}", token];

@@ -358,6 +358,13 @@ enum WCPInstaller {
                     add(file, "${syswow64}/" + base)
                 } else if parts.contains("aarch64-windows") || parts.contains("arm64-windows") {
                     add(file, "${aarch64}/" + base)
+                } else if parts.contains("arm64ec-windows") {
+                    // An ARM64EC DLL must land in the farm an ARM64EC process actually
+                    // resolves, and that is NOT always system32: an aarch64 session links
+                    // its own arch into system32 and puts the EC set in sysx64, so a package
+                    // that assumed system32 overwrote the launcher's aarch64 kernel32 with an
+                    // EC one and every launch died in the loader with c000007b (no spawn).
+                    add(file, "${sysarm64ec}/" + base)
                 } else {
                     add(file, "${system32}/" + base)
                 }

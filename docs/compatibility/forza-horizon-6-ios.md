@@ -1811,33 +1811,84 @@ No manual patch, no cache refresh: `build.sh` now produces prologue-bearing buil
 `image+0x537099c`. So the DroidDeck import-thunk-prologue root cause is now **falsified on this
 fault on-device**, not merely by static analysis. It remains a genuine Windows-fidelity fix.
 
-### 4am. A `Wine-Builtin` `.wcp` cannot currently carry `kernel32.dll`
+### 4am. CORRECTED — `kernel32.dll` CAN ship in a `.wcp`; the farm was wrong
 
-Trying to ship the fixed `kernel32.dll` as a builtin component broke the launch completely:
+An earlier note here said a `.wcp` could not carry `kernel32.dll` and blamed the
+`WINEDLLPATH` override. That diagnosis was **wrong** and is retracted. The real cause was
+the package landing the file in the **wrong architecture farm**, and the real channel —
+which needs no app change at all — works.
+
+Every symptom blamed on the DLL or on `WINEDLLPATH` reproduces with the **byte-identical**
+`kernel32.dll` copied out of the app bundle (`sha256 5866094b…` on both sides), which rules
+out the bytes and rules in placement.
+
+What this session actually shows (session routing line, logged by the bridge):
 
 ```
-[file-fail] #1..#6 NtCreateFile status=0xc0000034 ... kernel32.dll   (system, windows, system32\wbem, ...)
-err:module:load_dll [dll-missing] #1 L"kernel32.dll" status=c000007b
-wine: could not load kernel32.dll, status c000007b
+[WineProc] PE routing: machine=0xaa64 bundle=aarch64-windows i386-set=1 force-ec=0
+[WineProc] Symlinked 147 DLLs from aarch64-windows -> sys32
+[WineProc] Farm sysx64:  422 links -> arm64ec-windows
+[WineProc] Farm sysaa64: 147 links -> aarch64-windows
 ```
 
-`dockhost.exe` dies before the game is ever spawned (`child-census ... status=-1073741701`,
-`phase] spawn` count 0). **The mechanism, not the DLL, is at fault:** the control case — the
-byte-identical `kernel32.dll` copied straight out of the app bundle into the same component —
-fails identically (`sha256 5866094b…` on both sides). Disabling the component restores the
-launch immediately.
+The launcher process is **aarch64**, so *its* binaries own `system32` and the ARM64EC set
+lives in `sysx64`. A `Wine`-kind package whose source path contains `arm64ec-windows` was
+mapped to `${system32}`, overwriting the aarch64 `kernel32.dll` the launcher needs:
 
-Cause: `madeira_builtin_override_path()` is exported to the *guest* as a `WINEDLLPATH` entry,
-so Wine scans the component's `pe/` tree as a **native PE search path** rather than through the
-loader's arch-aware builtin probe. It also silently changes which file answers a plain
-`kernel32.dll` lookup. The arch-aware route (`open_builtin_pe_file` with a real override
-directory, the one `ntdll` already uses) is the correct one, and it lives in `loader_ios.c`,
-which is compiled into the **statically linked** unix half — so it cannot be changed without an
-app rebuild. That is the same `dxmt`/`ntdll_unix` limitation already tracked as
-`comp-half-fix`/`dxmt-override`, now with a second victim.
+```
+err:module:load_dll [dll-missing] L"kernel32.dll" status=c000007b
+[child-census] ml2029 session end status=-1073741701   (no `phase] spawn` at all)
+```
 
-Consequence for the iteration loop: **`kernel32` (and any other non-`ntdll` PE builtin) is still
-app-rebuild-only.** `ntdll` and FEX keep their `.wcp` channels.
+That is a machine mismatch inside the loader, and it is why the launcher died before it
+could ever spawn the game. Pointing the same payload at `${sysx64}` fixes it outright
+(`[wcp] 1 links`, no `could not load kernel32`, game spawns and faults at the usual
+`…99C`).
+
+**Two changes landed for this:**
+
+- `tools/wcp/make-pe-wcp.sh` — packages PE builtins as kind `Wine` (prefix link) rather
+  than kind `Wine-Builtin` (`pe/` + `WINEDLLPATH`). This is the DroidDeck-equivalent
+  channel: the component is symlinked over the bundle's copy in the prefix for the session,
+  and disabling it re-links the bundle on the next launch. Nothing in the app bundle changes,
+  nothing is re-signed, nothing is reinstalled.
+- A new `${sysarm64ec}` token (`WCPComponents.swift` + `WineProcessBridge.m`): `sysx64` in an
+  aarch64 session, `system32` in an ARM64EC one. `.wine` layout now maps `arm64ec-windows`
+  sources through it, so the mistake cannot be made again. **Needs an app rebuild to take
+  effect**; until then the farm has to be set in `state.json` by hand (which is how the
+  runs above were made).
+
+The `[wcp] N links, M failed` line also stopped counting `.builtin` `pe/` deps as failures —
+they are staged for the loader, not linked, so `failed` now means a genuinely broken entry.
+
+### 4an. A patched `kernel32.dll`, once actually loaded, stops the game from launching
+
+With the farm fixed, a patched `kernel32.dll` (795 hotpatch prologues, 0 bare `ff 25`)
+really is the DLL the session loads — and the launch changes shape:
+
+| payload in `${sysx64}` | links | game spawns | fault |
+|---|---|---|---|
+| none (baseline) | – | yes | `…99C` |
+| bundle's own `kernel32.dll` | 1 | yes | `…99C` |
+| build-tree `kernel32.dll` (hotpatch) | 1 | **no** | – |
+| build-tree `kernel32.dll` + matching `kernelbase.dll` | 2 | **no** | – |
+
+`dockhost.exe` starts, `[madeira-dock] starting the host` is logged, and then the session
+ends with `status=0 games=0` instead of authorising the launch. The console shows no
+`could not load kernel32` and no `#UD`.
+
+This is **not** a packaging artifact: the build-tree DLL is byte-identical in code to the
+earlier hand-patched one (whole-file diff is 6 bytes — the COFF `TimeDateStamp` and one
+export-table field), so there is nothing "new" about this DLL. What is new is that this is
+the **first time a patched `kernel32.dll` has actually been loaded by a session**. Every
+earlier "measured, fault unchanged with the hotpatch kernel32" result was measured without
+the DLL being loaded at all, and must be treated as unmeasured.
+
+Consequence: patch 0001's prologues are safe where they have been validated (`ntdll`, and
+the game's own imports) but **cannot simply be extended to `kernel32.dll`** — the x64
+consumers that share that farm (the dock and Steam's webhelper) stop working. Next step is
+bisection, not more packaging: ship a kernel32 patched in *half* its exports, or delay the
+patch to only the exports the protector inspects, and see which set is unsafe to touch.
 
 ---
 
