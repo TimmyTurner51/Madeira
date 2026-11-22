@@ -27,6 +27,9 @@ running under LiveContainer.
 | Protected code decrypts | **never** | §4 |
 | In-game window | never | — |
 
+The dock regression in §4au is cleared (§4av). `forzahorizon6.exe` is created
+again, and it dies at this same fault.
+
 The last `[xp]` sample before the fault:
 
 ```
@@ -2232,6 +2235,41 @@ the pool pointer as an x64 RIP and the host left the block for an unmapped
 address. `forzahorizon6.exe` does not start. "Failed to mprotect last page of
 code buffer" is logged earlier and execution continues past it.
 
+### 4av. The crash at kernel32+`0x319cc` is the return check, and the game now reaches the ciphertext fault
+
+Widening `ExitToX64`'s pool window does not touch this crash. A window of
+`0x10`–`0x13` missed a pool whose base had moved to `0x148000000` (guest RIP
+`0x14a3459cc`, `unix_calls=4589`, still no `[exit-pool]` line). Widening it to
+`0x10`–`0x17` (`poolgate2 compiled Nov 22 2026 16:08:27`) loaded and changed
+nothing: the same guest RIP, `unix_calls=4517`. The window inspects `x9`, and
+`x9` at the `bl` is the call target. The address that becomes the guest RIP is
+the link register, which `ios_ffs_no_bypass` pushes as the x86 return address.
+Do not widen that window again.
+
+The EC bitmap for the pool page is set. The dispatcher loop takes
+`ExitFunctionEC` with `x9` = the pool epilogue. `ExitFunctionEC` loads the
+word at `[x9-4]` and compares it with `blr x16` (`0xd63f0200`). The copy-time
+patch replaced that `blr` with a direct `bl`, so the word is the BL encoding.
+The miss path adds that word, masked to a 4-byte offset, to the return
+address and branches there. kernel32's BL at pool `0x14a3459c8` is
+`0x97e7acbb`; adding it to `0x14a3459cc` lands on `0xe21c0684`, which is the
+fault pc, with `x16` still holding `0xd63f0200` and `x9` still the epilogue.
+
+A BL (top six bits `0x25`) is the same return edge as `blr x16`, so
+`ExitFunctionEC` now branches to the epilogue. The image that did this prints
+`blrret compiled Nov 22 2026 16:15:39`. The dock survives.
+`NtCreateUserProcess` creates
+`C:\Program Files (x86)\Steam\steamapps\common\ForzaHorizon6\forzahorizon6.exe`
+at t+5.4 s (image `0x132f00000`, pool `0x153a44000`). The process then dies
+`0xc000001d` at `0x13827099c`, which is image+`0x537099c`. The bytes there are
+still `ea e9 6b e6 14`, and the arena needle does not find that stub in the
+16 MB arena. That is the halt in §4. It is not a new one. `unix_calls=9958`.
+
+The return-edge check is in the FEX working tree (`Module.S`,
+`ExitFunctionEC`) and in the `ml268-exitpool` component file on the phone. It
+is not a submodule commit: `Module.cpp` in the same tree also carries the
+unlanded debug-register exports.
+
 ---
 
 ## 5. Premise corrections
@@ -2268,20 +2306,19 @@ and the fault is at `image+0x537099c`.
 
 ## 6. Next experiments, cheapest first
 
-0. **The dock loads `C:\windows\system32\xtajit64.dll`, and it is still the
-   bundle's emulator unless a package links over that exact path.** A package
-   whose dest is `${sysx64}/xtajit64.dll` leaves the running module unchanged
-   (build id stayed `Nov 21`). Linking the same file at `${system32}` is what
-   the dock actually opens: the image grew from `0x418000` to `0x419000` and
-   the build id became `Nov 22 2026 15:42:09`. `ExitToX64` in that module
-   checks the EC bitmap bit of a pool address and the alias table before
-   emulating. Neither one diverted kernel32+`0x319cc`: there is no
-   `[exit-pool]` line, and the dock still dies `0xc0000005` at the same guest
-   RIP (`unix_calls=4517`). `forzahorizon6.exe` does not start. Play still
-   crashes the dock. The phone's enabled emulator package is `ml268-exitpool`,
-   dest `${system32}/xtajit64.dll`. Putting the bundle's bare `kernel32.dll`
-   back on the `kernel32-one.dll` component makes Play safe and gives up the
-   prologue test.
+0. **The dock crash at kernel32+`0x319cc` is fixed, and the game dies at the
+   known ciphertext site.** Do not point the FEX package at `${sysx64}`: the
+   dock opens `C:\windows\system32\xtajit64.dll` (§4av). Do not widen
+   `ExitToX64`'s pool window: `x9` is the call target, and the guest RIP is
+   the pushed link register. The bitmap already sent that return to
+   `ExitFunctionEC`; the fault pc `0xe21c0684` was the BL encoding added to
+   the return address. The phone is running `blrret compiled Nov 22 2026
+   16:15:39` from `ml268-exitpool` at `${system32}/xtajit64.dll`.
+   `forzahorizon6.exe` is created and dies `0xc000001d` at image+`0x537099c`
+   with bytes `ea e9 6b e6 14`. That halt is §4. The closed decryptor
+   experiments stay closed. The kernel32 component is still the 795-prologue
+   build; putting the bundle's bare `kernel32.dll` back on
+   `kernel32-one.dll` gives up that test.
 
 1. **Catch the guest stack at the moment `.text` is unlocked (§4ah).**
    The decrypt question has narrowed to one moment: `prot-img` #45 takes `.text`
