@@ -640,6 +640,33 @@ OK: counts match the independent enumerator
 the same number, so no translation is needed there — the mistake was only possible in
 the offline model, which is exactly why the model needed the check.)
 
+### 4v0. HAZARD: pushing a config file can hide the whole Steam library
+
+`SteamOwnedLibrary.enabled == MadeiraDock.enabled && MADEIRA_STEAM_LIBRARY`, and
+`MadeiraDock.enabled == MADEIRA_DOCK (default 1) && bundled` (Library.swift:2961,
+MadeiraDock.swift:58, SteamOwnedLibrary.swift:296). So a config that sets
+`env.MADEIRA_DOCK = 0` does not merely skip the dock: it removes the Steam
+section, its games, and the Workshop row from the library. Measured
+2026-11-22 01:08: `[library-sections] native-steam=0 sections=0`; restoring
+`env.MADEIRA_DOCK = 1` gives `native-steam=1 sections=1` and the games back.
+
+There is exactly one config the app reads —
+`Documents/Data/Application/EDAFB512-.../Documents/madeira.cfg` — and no backup is
+taken automatically. Never write it blind:
+
+1. `afc-pull.py` it first. A 0-byte result is a FAILED read (AFC returns nothing
+   for some files), not an empty config; re-read the effective values from the
+   last line starting `[INFO] madeira.cfg:` in the log instead.
+2. Edit only the key you mean to change; keep `env.MADEIRA_DOCK` out of the file
+   unless you deliberately want the dock off.
+3. Push, then confirm `[library-sections] native-steam=1` in the next log.
+
+Also worth knowing: `[WineProc] Target exe: explorer.exe` with
+`machine=0xaa64` exits `0xc000007b` in ~1 s on this build, so a library "Play"
+that routes through the shell fails before any game starts. That is a separate,
+pre-existing defect, not a consequence of a config edit; launching a game
+directly needs `env.MADEIRA_EXE` naming the game.
+
 ### 4v. Iteration win: a dylib change is one push, effective next launch
 
 The two-launch cost seen in §4s was an artefact of deploying through the `Import`
@@ -1189,6 +1216,87 @@ table unconditionally — but per §4n neither ran, because the exit is in the a
 Per the objective's boundary: this is a memory-layout / loader-fidelity question
 and is in scope. Nothing here indicates an anti-tamper verdict about emulation,
 and no detection-evasion work is warranted or done.
+
+### 4ab. MEASURED — the faulting function is *still ciphertext in the image*, and the protector's own handler declines it
+
+Run 22:42, components `ml2111-nestedexc` (unix half), `FH6-iOS-1.5-fex`, `FH6-iOS-1.5-ntdll-builtin`.
+The decisive lines, in order:
+
+```
+00e8:err:seh:prepare_exception_arm64ec [rtcs] pre: code=c000001d addr=0000000175F7099C …
+00e8:err:seh:madeira_stub_census [stub-census] #1 image=0000000170C00000 |
+      129 sampled protected entries: 129 still 0xEA (ciphertext), 0 not |
+      fault rva 0x537099c: ea e9 6b e6 14 48 89 7c
+00e8:err:seh:call_vectored_handlers [stub-census] illegal instruction at 0000000175F7099C:
+      1 vectored handler(s) in the process chain before dispatch
+00e8:err:seh:call_vectored_handlers … vectored handler 0000000175FCD858 returned 0
+00e8:err:seh:ios_seh_xlate_note [seh-xlate] handler=0000000176AAA3B8 GUEST left in PE space
+      (icall -> FEX)  module=L"forzahorizon6.exe"+0x5eaa3b8
+00e8:err:seh:call_seh_handlers [unwind-root] ml633 ACCEPTING terminal root frame 7043d50000
+      (== stack hi) ControlPc=71f3843d30  — this is the unhandled-exception filter frame
+wine: Unhandled illegal instruction at address 0000000175F7099C (thread 00e8) …
+00e8:err:process:NtTerminateProcess … exit_code=0xc000001d
+```
+
+Three things this settles:
+
+1. **The faulting RVA is ciphertext in the image itself** (`fault rva 0x537099c: ea e9 6b e6 14 48 89 7c`,
+   base `0x170C00000`), and 129 of 129 sampled protected entries are still `0xEA`. There is no
+   decrypted copy anywhere to execute yet. This is not a stale-copy or sync problem at this point;
+   the protector has not decrypted.
+2. **The protector's own vectored handler runs and declines** ("returned 0" = continue search).
+   So the VEH is not failing to be called — it is choosing not to handle this address. The process
+   then unwinds to the image's own unhandled-exception filter and exits `0xC000001D`. Any work on
+   exception plumbing (nested-exception delivery, unwind cost, self-setcontext) changes *how*
+   this ends, not *whether* the code gets decrypted.
+3. **Cross-thread `NtGetContextThread` is refused with `STATUS_ACCESS_DENIED`**, three times, just
+   before the fault:
+
+```
+[ec-getctx] ml715 #1 handle=00000000000001FC status=c0000022 native_pc=0 is_ec=-1
+            -> returned rip=0 rsp=0 flags=0
+```
+
+   On Windows that call succeeds **if the handle carries `THREAD_GET_CONTEXT`**, and `c0000022`
+   is the server's access check (`get_thread_from_handle( handle, THREAD_GET_CONTEXT )`,
+   `wine/server/thread.c`), not a machine/state refusal. So this is only a divergence if the
+   protector opened the handle for context access.
+
+   **MEASURED, and it is NOT a divergence.** `NtOpenThread` was wrapped to log the requested
+   mask beside the handle it produces (`[ec-openthread]`), and `[ec-getctx]` now prints the
+   requested `ContextFlags`. Run 22:54, probe `dist/FH6-iOS-1.6-ntdll-builtin.wcp`:
+
+```
+[ec-openthread] #1 status=00000000 access=00000040 -> handle=...0100 tid=008c
+... 64 logged opens, ALL access=00000040 ...
+[ec-getctx] #1 handle=...01FC status=c0000022 requested=00000000 ...
+```
+
+   Every open asks for `0x40` = `THREAD_QUERY_INFORMATION` only; not one asks for `THREAD_GET_CONTEXT`
+   (`0x4`). A `GetThreadContext` on such a handle is refused on Windows too, with the same
+   status, so Wine is behaving correctly here and there is nothing to fix. The requested
+   `ContextFlags` is also **`0`** — no caller in this run asks for any register class at all,
+   let alone `CONTEXT_AMD64_DEBUG_REGISTERS`.
+
+   Two consequences, both useful:
+   - the x64 debug-register port (§4ab, `dbgregs`) is **correct but dormant** in this title:
+     nothing exercises it, so it can neither be the cause nor the cure of the decrypt failure;
+   - "the protector probes debug registers and we answer wrong" is **falsified** as a
+     hypothesis. That closes the `getctx-access` line of investigation.
+
+Also re-measured in the same session: **`FEX_SMCCHECKS=full` still breaks the launch after 0002**
+(`launch-client-error=46` with the key, `=0` without it, same DLL), so the 0002 writable-range
+gating did not make the reference's required configuration affordable. `0004` remains the candidate.
+
+Two fixes landed and are deployed:
+
+- **Imported PE builtins are resolved by the loader** (`loader_ios.c`, `builtin_override_pe_file`).
+  The app-side `WINEDLLPATH` change never applied to ntdll: `load_ntdll()` and
+  `ios_load_child_ec_ntdll()` build the path from `ntdll_dir`/`dll_dir` directly. Log proof:
+  `[builtin-override] using .../Components/FH6-iOS-1.5-ntdll-builtin-builtin/pe/arm64ec-windows/ntdll.dll`.
+- **A nested exception on the signal stack is delivered there instead of `abort_thread(1)`**
+  (`virtual_ios.c`, `virtual_setup_exception`), matching the reference's "no longer kills the
+  process". Untriggered in this run (`nested exception` count 0), so it is deployed but unproven.
 
 ---
 
