@@ -687,6 +687,52 @@ static unsigned int send_request( const struct __server_request_info *req )
         abort_thread(0);
     }
     if (errno == EFAULT) return STATUS_ACCESS_VIOLATION;
+#ifdef WINE_IOS
+    /* ml1382 probe: UNCONDITIONAL on any failed server write.
+     *
+     * ml1381 logged only errno == EBADF here and never fired, while the log
+     * still printed "wine client error:0: write: Bad file descriptor" -- and
+     * "error:0" means GetCurrentThreadId() returned 0, i.e. a thread with no
+     * TEB. Rather than guess which assumption was wrong, record every failure
+     * at this point: the errno, the fd, whether the fd still exists, the
+     * section flags and the PEB.
+     *
+     * If this stays silent on a run that prints the client error, then this
+     * function is not the copy executing that write (a second half linked
+     * statically into the app) and the instrumentation has to be rebuilt into
+     * the app rather than pushed as a component.
+     *
+     * MADEIRA_SRV_CLOSED_IS_EPIPE=1 additionally takes the killed-thread path
+     * for EBADF instead of the protocol-error path; default keeps today's
+     * behaviour exactly. */
+    {
+        static int closed_is_epipe = -1;
+        static int logged;
+        int w_errno = errno;
+        int fd_state = fcntl( request_fd, F_GETFD );
+        int fcntl_errno = errno;
+        uintptr_t sec = ios_section_state();
+
+        if (closed_is_epipe < 0)
+        {
+            const char *e = getenv( "MADEIRA_SRV_CLOSED_IS_EPIPE" );
+            closed_is_epipe = (e && e[0] == '1');
+        }
+        if (__sync_fetch_and_add( &logged, 1 ) < 8 )
+            dprintf( 2, "[srv-wfail] #%d tid=%04x errno=%d request_fd=%d fcntl(F_GETFD)=%d "
+                     "fcntl_errno=%d sections=%u abortflag=%u peb=%p treat_ebadf_as_epipe=%d rev=ml1382\n",
+                     logged, (unsigned)GetCurrentThreadId(), w_errno, request_fd, fd_state, fcntl_errno,
+                     (unsigned)(sec & IOS_SECTION_DEPTH), (sec & IOS_SECTION_ABORT) ? 1u : 0u,
+                     (void *)NtCurrentTeb()->Peb, closed_is_epipe );
+        errno = w_errno;
+        if (w_errno == EBADF && closed_is_epipe)
+        {
+            if (ios_defer_section_abort()) return STATUS_THREAD_IS_TERMINATING;
+            abort_thread( 0 );
+        }
+        errno = w_errno;
+    }
+#endif
     server_protocol_perror( "write" );
 }
 

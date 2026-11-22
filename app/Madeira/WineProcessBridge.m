@@ -338,6 +338,15 @@ extern void __wine_main(int argc, char *argv[]);
 // File-based logging (from server_ios.c)
 extern void wine_log_set_file(const char *path);
 
+/* The unix half can also arrive as a .wcp component (UnixHalf.swift, which owns the
+ * discovery, the dlopen and the signing rules). When one is installed these three return 1
+ * and the calls above must not be used: the loaded half owns its own dispatch table and its
+ * own state, so mixing it with the linked archive would run two halves in one process.
+ * A return of 0 means no component is installed and the linked symbols apply. */
+extern int madeira_unix_half_start(int argc, char *argv[]);
+extern int madeira_unix_half_set_log_file(const char *path);
+extern int madeira_unix_half_set_main_i386(int value);
+
 /* madeira-bcd: env.MADEIRA_SRV_FGETPATH of the launch in progress, read by the in-app
  * wineserver (build/wineserver/fd_ios.c), which is running before a game's env lines
  * are set. Set after they are applied, cleared when the session ends. */
@@ -1960,7 +1969,10 @@ static void *wine_process_thread(void *arg) {
         {
             NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
             NSString *logPath = [docs stringByAppendingPathComponent:@"madeira-log.txt"];
-            wine_log_set_file(logPath.UTF8String);
+            // The half that will run owns the log: when a component is installed, the
+            // archive's logger is a different object and would write nothing this session reads.
+            if (!madeira_unix_half_set_log_file(logPath.UTF8String))
+                wine_log_set_file(logPath.UTF8String);
             /* ml519: start the freeze detector as soon as logging works, so
              * every launch (Thumper as well as Steam) yields a measurement. */
             { extern void winios_freeze_watch_start(void); winios_freeze_watch_start(); }
@@ -2840,12 +2852,17 @@ static void *wine_process_thread(void *arg) {
 
         /* WoW64: publish the main image's machine so the unix side reserves
          * this process's guest window before its first TEB, and hand FEX's
-         * WOW64 module the host features it cannot query itself. */
-        ios_main_image_i386 = is_i386_target ? 1 : 0;
+         * WOW64 module the host features it cannot query itself. Written through
+         * the entry below because the flag lives in the half: setting the linked
+         * archive's copy while a component's half is running would write a
+         * variable nothing reads. */
+        if (!madeira_unix_half_set_main_i386(is_i386_target ? 1 : 0))
+            ios_main_image_i386 = is_i386_target ? 1 : 0;
         madeira_publish_host_probe();   /* both FEX modules read it (A12/A13: FlagM, FlagM2) */
 
         if (setjmp(wine_ios_exit_jmpbuf) == 0) {
-            __wine_main(argc, argv);
+            if (!madeira_unix_half_start(argc, argv))
+                __wine_main(argc, argv);
             dprintf(STDERR_FILENO, "[WineProc] __wine_main returned normally\n");
         } else {
             dprintf(STDERR_FILENO, "[WineProc] Wine exited with code %d (caught by longjmp)\n", wine_ios_exit_code);

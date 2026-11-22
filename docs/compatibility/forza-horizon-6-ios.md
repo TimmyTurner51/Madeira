@@ -592,6 +592,43 @@ The 5 remaining unhandled exceptions are unrelated addresses
 (`0x111f59bfc` `addr=0x8` twice, `0x198e1ff94` `addr=0x0` twice — the known wild
 pointer from 4b — and `0x1106c59ac` `type=6`).
 
+### 4m. The failing write is NOT in the component half — it needs an app rebuild
+
+Two probes were pushed as `native` components and measured on device:
+
+| probe | what it logs | result |
+|---|---|---|
+| `unixhalf-ml1381-ebadf` | `[srv-ebadf]`, only when `errno == EBADF` at the failed server write | **silent** (run 17:55) |
+| `unixhalf-ml1382-wfail` | `[srv-wfail]`, **unconditionally** on any failed server write | **silent** (run 18:02) |
+
+Both runs were verified to be executing the component half, not a stale one:
+
+```
+[unix-half] component half INSTALLED from .../Components/unixhalf-ml1382-wfail-native-native/files/libntdll_unix.dylib
+ml989: running image .../unixhalf-ml1382-wfail-native-native/files/libntdll_unix.dylib base=0x10b898000 LC_UUID=B067...
+```
+
+and both runs still printed `wine client error:0: write: Bad file descriptor` and still
+ended the session with `Wine exited with code 1`. The string `[srv-wfail]` is present in
+the pushed dylib (`strings` check) and `ml1382` replaced `ml1381` as the only enabled
+native component.
+
+**Conclusion.** The write that fails is executed by a *second* copy of the half — the
+`libntdll_unix.a` that `build/ntdll-unix/build.sh` copies into `app/Madeira/` and that
+the app links statically. A source change in `build/ntdll-unix/server_ios.c` therefore
+does not reach this path by `.wcp` push. **This corrects the earlier note that unix-half
+instrumentation ships by package push without an IPA**: that is true for whatever is
+reached through the function table the component installs, and false for this path.
+
+Also note `GetCurrentThreadId()` printed **0** in the message, i.e. the failing write
+comes from a thread with no TEB — consistent with app-side code rather than a guest
+thread.
+
+The probes are kept in the source (behind `#ifdef WINE_IOS`, no behaviour change by
+default) so the next app rebuild answers the fd question immediately, and
+`MADEIRA_SRV_CLOSED_IS_EPIPE=1` is available to test the "closed pipe is the
+killed-thread case" hypothesis in that same rebuild.
+
 ### 4e. Scope note
 
 Per the objective's boundary: this is a memory-layout / loader-fidelity question
