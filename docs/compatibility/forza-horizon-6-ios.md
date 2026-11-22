@@ -1913,6 +1913,21 @@ carries the warning. `kernel32` is the only builtin the patch touches — `ntdll
 `kernelbase` have no `ff 25` import thunks — so patch `0001` is, today, exactly the change that
 breaks the dock and nothing else.
 
+**Run-to-run variance, measured — do not read it as signal.** Two runs of the *same*
+unmodified baseline (no links, bundle `kernel32`) produced different post-spawn outcomes:
+
+| baseline run | game spawns | after spawn |
+|---|---|---|
+| control earlier in this session | yes | `#UD` at `…99C` |
+| final verification, minutes later | yes | no `#UD`; `.text` unlocked once; still running at 60 s, `P=0.00` |
+
+So "the game spawns but never faults" is **baseline noise, not a kernel32 or prologue
+signature**, and any earlier conclusion that read it as one needs revisiting. The robust
+signal is only the binary one — *does the game process spawn at all*: 5/5 blocked with
+prologues in `sysx64`, 4/4 spawned without them. Everything downstream of the spawn must be
+replicated before it is believed.
+
+
 
 ### 4ao. FIXED — a prologue written past `VirtualSize` is silently corrupted by `llvm-strip`
 
