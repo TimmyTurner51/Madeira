@@ -1766,6 +1766,81 @@ left nothing enabled; that is why the check lives after the import.
 
 ---
 
+### 4al. Why the app kept shipping bare `ff 25` thunks: patch 0001 never fired on ARM64EC
+
+§4ak proved the app bundle carried 796 bare `ff 25` import thunks while the build tree was
+believed to be fixed. The actual cause was not a stale cache. **Patch 0001's post-link fixup
+never ran on any `arm64ec-windows` builtin**, so every build produced the bare thunks and the
+"fixed" build tree the earlier session measured must have been hand-patched.
+
+The fixup is `fixup_arm64x_import_thunks()` in `tools/winebuild/spec32.c`. It returned at its
+second gate:
+
+```c
+if (get_le16( data + nt + 4 ) != IMAGE_FILE_MACHINE_ARM64) return 0;
+```
+That is the right test for an **ARM64X hybrid** (`aarch64-windows`), whose x64 export view is
+reached through ARM64X dynamic relocations. Every `arm64ec-windows` builtin is a **pure ARM64EC**
+image instead: machine `0x8664`, one ordinary export directory, no CHPE code map to consult and
+no ARM64X relocations. Measured on `dlls/kernel32/arm64ec-windows/kernel32.dll`:
+
+```
+machine=0x8664 nsec=14 nb_dirs=16 loadcfg_rva=0x526f8   exp_rva=0x56a40  nfuncs=1358
+func[2] rva=0x350c0  ff 25 3a af 01 00 00 00 00 00 00 00   <- bare, exactly as shipped
+```
+
+Confirmed by instrumenting the fixup and relinking: it was entered, and returned before the
+thunk loop because of that gate.
+
+**Fix (committed `c168c39`):** accept both machines. For a pure ARM64EC image use the regular
+export directory and treat every 16-byte-aligned export slot as x64 thunk code. The existing
+per-thunk validation still applies (slot must be `ff 25`, the padding must be uniform, the
+relative target must land inside the IAT and be 8-byte aligned), so nothing but import thunks
+is rewritten. Measured immediately after a clean rebuild:
+
+```
+before: kernel32.dll  hotpatch=0   bare-ff25=796 other=562
+after:  kernel32.dll  hotpatch=796 bare-ff25=0   other=562
+```
+
+No manual patch, no cache refresh: `build.sh` now produces prologue-bearing builtins.
+
+**The fault is unchanged with the fixed DLL loaded.** Pushed the patched, stripped `kernel32.dll`
+(795 hotpatch, 0 bare) onto the device and ran a full session: the game spawns, and dies at
+**`Invalid instruction in entry block: 17547099C`** — same low 12 bits as the documented
+`image+0x537099c`. So the DroidDeck import-thunk-prologue root cause is now **falsified on this
+fault on-device**, not merely by static analysis. It remains a genuine Windows-fidelity fix.
+
+### 4am. A `Wine-Builtin` `.wcp` cannot currently carry `kernel32.dll`
+
+Trying to ship the fixed `kernel32.dll` as a builtin component broke the launch completely:
+
+```
+[file-fail] #1..#6 NtCreateFile status=0xc0000034 ... kernel32.dll   (system, windows, system32\wbem, ...)
+err:module:load_dll [dll-missing] #1 L"kernel32.dll" status=c000007b
+wine: could not load kernel32.dll, status c000007b
+```
+
+`dockhost.exe` dies before the game is ever spawned (`child-census ... status=-1073741701`,
+`phase] spawn` count 0). **The mechanism, not the DLL, is at fault:** the control case — the
+byte-identical `kernel32.dll` copied straight out of the app bundle into the same component —
+fails identically (`sha256 5866094b…` on both sides). Disabling the component restores the
+launch immediately.
+
+Cause: `madeira_builtin_override_path()` is exported to the *guest* as a `WINEDLLPATH` entry,
+so Wine scans the component's `pe/` tree as a **native PE search path** rather than through the
+loader's arch-aware builtin probe. It also silently changes which file answers a plain
+`kernel32.dll` lookup. The arch-aware route (`open_builtin_pe_file` with a real override
+directory, the one `ntdll` already uses) is the correct one, and it lives in `loader_ios.c`,
+which is compiled into the **statically linked** unix half — so it cannot be changed without an
+app rebuild. That is the same `dxmt`/`ntdll_unix` limitation already tracked as
+`comp-half-fix`/`dxmt-override`, now with a second victim.
+
+Consequence for the iteration loop: **`kernel32` (and any other non-`ntdll` PE builtin) is still
+app-rebuild-only.** `ntdll` and FEX keep their `.wcp` channels.
+
+---
+
 ## 5. Premise corrections
 
 
