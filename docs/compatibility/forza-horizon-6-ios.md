@@ -1854,9 +1854,11 @@ could ever spawn the game. Pointing the same payload at `${sysx64}` fixes it out
   nothing is re-signed, nothing is reinstalled.
 - A new `${sysarm64ec}` token (`WCPComponents.swift` + `WineProcessBridge.m`): `sysx64` in an
   aarch64 session, `system32` in an ARM64EC one. `.wine` layout now maps `arm64ec-windows`
-  sources through it, so the mistake cannot be made again. **Needs an app rebuild to take
-  effect**; until then the farm has to be set in `state.json` by hand (which is how the
-  runs above were made).
+  sources through it, so the mistake cannot be made again. A FEX package had the same
+  assumption: `libarm64ecfex.dll` was linked to `${system32}/xtajit64.dll`, and
+  `libwow64fex.dll` to `${system32}/xtajit.dll`. Those now use `${sysarm64ec}` and
+  `${aarch64}`. **Needs an app rebuild to take effect**; until then the farm has to be
+  set in `state.json` by hand (which is how the runs above were made).
 
 The `[wcp] N links, M failed` line also stopped counting `.builtin` `pe/` deps as failures —
 they are staged for the loader, not linked, so `failed` now means a genuinely broken entry.

@@ -336,14 +336,18 @@ enum WCPInstaller {
                 let base = (file as NSString).lastPathComponent.lowercased()
                 switch base {
                 case "libarm64ecfex.dll", "xtajit64.dll":
-                    add(file, "${system32}/xtajit64.dll")
+                    // Same farm as an arm64ec-windows Wine package. system32 in an
+                    // aarch64 session is the launcher's own arch.
+                    add(file, "${sysarm64ec}/xtajit64.dll")
                 case "libwow64fex.dll", "xtajit.dll":
-                    add(file, "${system32}/xtajit.dll")
+                    // Native ARM64 PE. ${aarch64} is system32 in an aarch64 session
+                    // and sysaa64 in an ARM64EC one.
+                    add(file, "${aarch64}/xtajit.dll")
                 default:
                     continue
                 }
             }
-            guard seen.contains("${system32}/xtajit64.dll") else {
+            guard seen.contains("${sysarm64ec}/xtajit64.dll") else {
                 throw WCPError.message("This FEX package has no ARM64EC module (libarm64ecfex.dll).")
             }
         case .wine:

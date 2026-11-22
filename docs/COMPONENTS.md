@@ -37,7 +37,7 @@ next launch. A session already running keeps the files it started with.
 
 | `profile.json` type | Treated as | Files linked |
 |---|---|---|
-| contains `FEXCore` | FEX | `libarm64ecfex.dll` → `system32/xtajit64.dll`, `libwow64fex.dll` → `system32/xtajit.dll` |
+| contains `FEXCore` | FEX | `libarm64ecfex.dll` → `${sysarm64ec}/xtajit64.dll`, `libwow64fex.dll` → `${aarch64}/xtajit.dll` |
 | contains `Builtin` | Wine builtins (PE override) | staged in the component, ahead of the bundle on `WINEDLLPATH` — see below |
 | contains `Wine` or `Proton` | Wine | `.dll`, `.drv` and `.cpl` files, by their architecture folder |
 | anything else with a `libarm64ecfex.dll` | FEX | as above |
