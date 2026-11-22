@@ -47,10 +47,10 @@ Wine files are mapped by the architecture folder in their path:
 
 | Path contains | Destination |
 |---|---|
-| `arm64ec-windows`, `x86_64-windows` | `drive_c/windows/system32` |
-| `aarch64-windows` | `system32` in an ARM64EC-native session, `sysaa64` in an ARM64EC one |
-| `i386-windows` | `drive_c/windows/syswow64` |
-| no architecture folder | `system32` |
+| `arm64ec-windows` | `${sysarm64ec}`: `sysx64` in an aarch64 session, `system32` in an ARM64EC one |
+| `aarch64-windows`, `arm64-windows` | `${aarch64}`: `system32` in an aarch64 session, `sysaa64` in an ARM64EC one |
+| `i386-windows` | `${syswow64}` |
+| `x86_64-windows`, or no architecture folder | `${system32}` |
 
 The package's own `files[].target` paths (DroidDeck writes `${proton}/...` and
 `${system32}/...`) are not required; the importer resolves each file by its name
