@@ -7102,8 +7102,20 @@ int ios_patch_execreq_leave_current( const void *pe_addr )
  * fault-path diagnostics: reads the mapping table and the image's own headers.
  * Writes the description into buf and the image's PE base into *img_base;
  * returns 0 when no pool-copied image covers va. */
-int ios_image_section_describe( unsigned long long va, char *buf, size_t len, unsigned long long *img_base )
+
+/* ml2132: MADEIRA_QUERY_VM=1? Read once; getenv is fine in the unix half. */
+int ios_query_vm_enabled( void )
 {
+    static int on = -1;
+    if (on < 0)
+    {
+        const char *e = getenv( "MADEIRA_QUERY_VM" );
+        on = (e && e[0] == '1' && !e[1]);
+    }
+    return on;
+}
+
+int ios_image_section_describe( unsigned long long va, char *buf, size_t len, unsigned long long *img_base ){
     int i, pass;
 
     for (pass = 0; pass < 2; pass++)
@@ -37938,9 +37950,89 @@ NTSTATUS WINAPI NtQueryVirtualMemory( HANDLE process, LPCVOID addr,
     TRACE("(%p, %p, info_class=%d, %p, %ld, %p)\n",
           process, addr, info_class, buffer, len, res_len);
 
+#ifdef WINE_IOS
+    /* ml2133: prove this function is reached at all, and by which build.
+     * ml2132 printed nothing, and "nothing" has already meant two different
+     * things twice in this investigation (§4ag). §4ac/§4ah also proved the app's
+     * statically linked unix half runs alongside the component one, so a silent
+     * probe may simply be the half that is not being asked. Print unconditionally
+     * for the first 8 calls of any class, naming the build. */
+    {
+        static int qc;
+        if (qc < 8)
+            dprintf( 2, "[vm-entry] ml2133 #%d class=%d gated=%d addr=%p len=%#lx\n",
+                     ++qc, (int)info_class, ios_query_vm_enabled(), addr, (unsigned long)len );
+    }
+#endif
+
     switch(info_class)
     {
         case MemoryBasicInformation:
+#ifdef WINE_IOS
+            /* ml2132: what does the guest learn about its own memory?
+             *
+             * The DroidDeck reference profiled the working game and found the
+             * protector calls NtQueryVirtualMemory *three times per decrypted
+             * function* (its "decrypt trio"). So on a healthy run the decryptor
+             * is gated on memory-query answers, and it runs constantly. Here the
+             * protector unlocks .text to RW and then writes nothing (§4ah), which
+             * is exactly the shape of "queried, did not like the answer, bailed".
+             * We have never once looked at this path, so log it before theorising:
+             * every MemoryBasicInformation query from this process, bounded, with
+             * the address named against the main image and the full answer.
+             *
+             * MADEIRA_QUERY_VM=1 enables. Inert otherwise (one static read). */
+            {
+                extern int ios_query_vm_enabled( void );
+                if (ios_query_vm_enabled())
+                {
+                    static int qn;
+                    static ULONG_PTR img;
+                    static ULONG_PTR img_end;
+                    PEB *peb = NtCurrentTeb() ? NtCurrentTeb()->Peb : NULL;
+                    NTSTATUS qs = STATUS_UNSUCCESSFUL;
+                    const MEMORY_BASIC_INFORMATION *mbi = buffer;
+                    int ok = (len >= sizeof(*mbi));
+
+                    if (!img && peb) img = (ULONG_PTR)peb->ImageBaseAddress;
+                    if (!img_end && img)
+                    {
+                        const IMAGE_DOS_HEADER *dos = (const IMAGE_DOS_HEADER *)img;
+                        img_end = img + (dos->e_magic == IMAGE_DOS_SIGNATURE ?
+                            ((const IMAGE_NT_HEADERS *)(img + dos->e_lfanew))->OptionalHeader.SizeOfImage
+                            : 0);
+                    }
+
+                    if (ok) qs = get_basic_memory_info( process, addr, buffer, len, res_len );
+                    /* Unconditional for the first 300, with the process's own
+                     * image on #1 so a reader can tell which process this is and
+                     * whether an address is inside it. The previous filtered
+                     * version printed nothing at all and could not say why. */
+                    if (qn++ < 300)
+                    {
+                        int inside = img && (ULONG_PTR)addr >= img && (ULONG_PTR)addr < img_end;
+                        if (qn == 1)
+                            dprintf( 2, "[query-vm] pid-img base=%p end=%p size=%#lx\n",
+                                     (void *)img, (void *)img_end,
+                                     (unsigned long)(img_end > img ? img_end - img : 0) );
+                        if (ok && !qs)
+                            dprintf( 2, "[query-vm] #%d addr=%p %s -> base=%p alloc=%p size=%#lx "
+                                     "state=%#x prot=%#x type=%#x protect=%#lx\n",
+                                     qn, addr, inside ? "IN-IMAGE" : "elsewhere",
+                                     mbi->BaseAddress, mbi->AllocationBase,
+                                     (unsigned long)mbi->RegionSize, (unsigned)mbi->State,
+                                     (unsigned)mbi->Protect, (unsigned)mbi->Type,
+                                     (unsigned long)mbi->AllocationProtect );
+                        else
+                            dprintf( 2, "[query-vm] #%d addr=%p %s -> FAILED status=%#x len=%#lx\n",
+                                     qn, addr, inside ? "IN-IMAGE" : "elsewhere",
+                                     (unsigned)qs, (unsigned long)len );
+                    }
+                    if (ok) return qs;
+                    return STATUS_INFO_LENGTH_MISMATCH;
+                }
+            }
+#endif
             return get_basic_memory_info( process, addr, buffer, len, res_len );
 
         case MemoryWorkingSetExInformation:

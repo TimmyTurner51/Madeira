@@ -61,3 +61,7 @@ asyncio.run(main())
 PY
 
 echo "== done. Next: tools/local/dev-run-fh6.sh (it installs, restarts once more, then launches)"
+
+# Enabling exactly one UnixHalf happens in tools/local/dev-run-fh6.sh, after the
+# import: doing it here runs before the new component exists in state.json, which
+# left nothing enabled (ml2136) instead of one thing.

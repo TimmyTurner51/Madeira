@@ -1684,9 +1684,90 @@ Two things follow, and neither is comfortable:
   was added to separate those two, and the follow-up run aborted before reporting. **No
   result yet.**
 
+### 4ak. The reference's root cause is REAL and the app ships the broken copy
+
+Asked directly "does the DroidDeck code hide FEX from file/module queries?", so here is
+what the reference actually contains, checked rather than remembered, plus what the check
+turned up.
+
+**The hide-FEX question, answered from the reference's own transcript** (the handoff store,
+`fh6-transcript.jsonl`):
+
+- It *was* implemented. The reference agent built it: FEX off the PEB loader lists, plus
+  "file lookups for the FEX DLL say not found, and memory queries for its mapping don't
+  reveal its file name".
+- It was **measured not to help**: *"hiding FEX from the module list and from file-name
+  lookups didn't change that"* (the punishments kept firing).
+- It **caused a boot regression**: removing FEX from the address-to-module lookups broke
+  exception dispatch, because that map is how an address is resolved to a module during
+  unwinding. The reference pulled it back to "the module lists that a module walk reads",
+  leaving FEX visible to address and name lookups, and fixed the boot.
+- The reference's own note: it went in *before* the real cause was found and may be
+  unnecessary. So `hidefex` stays where it was: last, and only if something new points at it.
+- None of the reference's four FEX patches or two Wine patches hide FEX. The single
+  `NtQueryVirtualMemory` in the 0004 patch is a `NtTerminateProcess` stack dump, not a mask.
+
+**What the reference says the real cause was, and the check that followed.** Its README is
+explicit: *"Forza's anti-tamper checks the first bytes of exported Windows functions. Native
+Windows, and Wine on x86_64, start those import thunks with a standard 8-byte hotpatch
+prologue. Wine on ARM64EC used to emit a bare `jmp` instead, so the game decided its imports
+were hooked."* DroidDeck-Proton 11-12.3 ships kernel32 with 797 fixed thunks.
+
+We ported that (`build/wine-patches/0001`) and it is in the **build tree**: the freshly built
+`wine/build-arm64ec/dlls/kernel32/arm64ec-windows/kernel32.dll` measures **796 hotpatch
+thunks, 0 bare `ff 25`**.
+
+But the **shipped** copy does not have it. Bytes, from the same checker:
+
+| artifact | hotpatch prologues | bare `ff 25` |
+|---|---|---|
+| `wine/build-arm64ec/.../kernel32.dll` (built) | **796** | 0 |
+| `.runtime-cache/windows/files/arm64ec-windows/kernel32.dll` (staged) | **0** | **796** |
+| `app/Madeira/arm64ec-windows/kernel32.dll` (bundle) | **0** | **796** |
+| `app/DerivedData/.../Madeira.app/arm64ec-windows/kernel32.dll` (installed) | **0** | **796** |
+| `Components/FH6-iOS-1.7-kernel32/pe/.../kernel32.dll` (override, **never enabled**) | **795** | 0 |
+
+`tools/build/runtime-components.py:stage()` copies from `.runtime-cache/<name>/files/` into
+`app/Madeira/`, so the stale cache is what the phone runs: every import thunk the game binds
+to kernel32 is a bare `jmp`, which is precisely the condition the reference says makes the
+protector refuse to run. The cache mtime is 21:32, the patched build 23:37 — the cache was
+snapshotted before the patch landed and never refreshed.
+
+Other staged modules are bare too: `user32.dll` 206, `advapi32.dll` 200, `kernelbase.dll` 2.
+The reference only names kernel32, so kernel32 is the one to test first.
+
+This also dissolves the "0 bare ff 25 thunks among the game's 592 imports" note in the
+objective: that measured the *game's own* IAT, not the thunks our builtins point at.
+
+**Two clean negatives measured this turn, so nobody re-runs them:**
+
+- **`NtQueryVirtualMemory` is not on the boot path.** The reference profiled the working game
+  and found the protector queries memory *three times per decrypted function* (its "decrypt
+  trio"), which made "the decryptor queried, disliked the answer and bailed" the leading
+  hypothesis. Measured here with `[query-vm]` (unconditional, self-describing, ml2135): a run
+  that reached the `.text` unlock (`prot-img` past #45) contains **exactly one** `[query-vm]`
+  process header, for a 112 KB image — i.e. the `dock`/`explorer` process consumes all 300
+  samples. The **game process makes zero** `MemoryBasicInformation` queries before the fault.
+  The decrypt trio is steady-state gameplay, not a pre-decrypt gate.
+- **Debug registers remain dormant.** `[ec-openthread]` still shows every open asking
+  `access=0x00000040` (never `THREAD_GET_CONTEXT`, `0x8`) and every failing
+  `NtGetContextThread` passing `requested=00000000`. The reference's hardware-breakpoint
+  route is not exercised on this path.
+
+**A harness defect that made several of these ambiguous.** At one point **six** `UnixHalf`
+components were enabled at once (`ml2132`, `ml2133`, `ml2134`, `ml2130`, `ml2120`, plus the
+PE builtin): each half installs the same `libntdll_unix.dylib` symbols, each prints its own
+probe lines, and `--no-install` meant some freshly built packages were never imported at all
+while the counters still came from the app's static half. Two runs of the same probe then
+disagreed. Fixed in the harness, not in a note: `dev-run-fh6.sh` now reduces the enabled
+`UnixHalf` set to one after the import step, and says which it kept. `MADEIRA_KEEP_OTHER_HALVES=1`
+opts out. The old `build-half.sh` attempt ran before the component existed in `state.json` and
+left nothing enabled; that is why the check lives after the import.
+
 ---
 
 ## 5. Premise corrections
+
 
 The objective carries "established facts" that no longer match measurement. They
 are listed here so the next session does not pursue the objective from a

@@ -80,6 +80,36 @@ if [ "$INSTALL" = 1 ] && [ "${waiting:-0}" != "0" ]; then
     pull_log /tmp/fh6-install.txt && LC_ALL=C grep -a '\[wcp\] imported\|unix-half\] ' /tmp/fh6-install.txt | tail -2 | cut -c1-140
 fi
 
+# Keep exactly ONE UnixHalf enabled. Do it here, after the import, because that is
+# the first moment the new component exists in state.json -- enabling it from the
+# build script ran too early and left nothing enabled (ml2136). Two or more alive at
+# once is what made ml2132/2133/2134 disagree: each half prints its own lines, so a
+# probe "printing nothing" may just be the half nobody is calling (§4ah, §4ak).
+if [ -z "${MADEIRA_KEEP_OTHER_HALVES:-}" ]; then
+    HALFDIR="Documents/Data/Application/EDAFB512-48D7-4839-98DA-E66816D6174E/Documents"
+    if DEVICE_FILE_ROUTE=pmd3 ./tools/local/device-file.sh get "$HALFDIR/Components/state.json" /tmp/_halfstate.json >/dev/null 2>&1; then
+        python3 - <<'PY'
+import json
+d = json.load(open("/tmp/_halfstate.json"))
+halves = [c for c in d["components"] if c.get("type") == "UnixHalf"]
+on = [c for c in halves if c.get("enabled")]
+if len(on) <= 1:
+    print(f"== UnixHalf: {len(on)} enabled" + (f" ({on[0]['name']})" if on else ""))
+else:
+    # Keep the newest by name (mlNNNN sorts lexically) and turn the rest off.
+    keep = sorted(on, key=lambda c: c.get("name", ""))[-1]
+    for c in on:
+        if c is not keep:
+            c["enabled"] = False
+    json.dump(d, open("/tmp/_halfstate.json", "w"))
+    print(f"== UnixHalf: {len(on)} were enabled; keeping {keep['name']}, disabling "
+          + ", ".join(c['name'] for c in on if c is not keep))
+PY
+        DEVICE_FILE_ROUTE=pmd3 ./tools/local/device-file.sh put /tmp/_halfstate.json "$HALFDIR/Components/state.json" >/dev/null 2>&1 \
+            && echo "   restarted Madeira needed? no -- this applies to the next launch"
+    fi
+fi
+
 echo "== locating Forza Horizon 6 in the library"
 # DO NOT SCROLL FIRST. Measured: on a fresh Madeira start FH6 is the FIRST game in
 # the list and the list is already at the top, so the row is on the very first
