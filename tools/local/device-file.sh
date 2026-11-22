@@ -95,6 +95,27 @@ pmd3_get() {
     bounded "$LIMIT" "$PMD3" apps pull --udid "$DEVID" "$LC_BUNDLE" "$1" "$2" >/dev/null 2>&1
 }
 
+# `apps pull` asks AFC to open the path, and AFC in this container refuses a file
+# with more than one hard link: FILE_OPEN answers status 1 ("unknown"), not the
+# status 8 a missing path gives, so the failure reads like a transport fault.
+# Madeira's own live log is hard-linked by design (LogStore.startSessionLog keeps
+# `Documents/logs/<program>-<stamp>.txt` pointing at the same inode), which makes
+# `madeira-log.txt` nlink=2 for the whole session -- measured 2026-11-21:
+#
+#   madeira-log.txt / madeira-log.prev.txt   nlink 2 -> status 1
+#   madeira-last-game-log.txt, rotated logs  nlink 1 -> read fine
+#
+# afc-pull.py stats first and, when nlink > 1, unlinks the redundant `logs/` name
+# (same inode, app prunes that directory itself) so the file becomes openable.
+# Nothing is lost: the inode stays reachable by the name we read.
+afc_pull() {
+    local py
+    py="$(dirname "$0")/afc-pull.py"
+    [ -f "$py" ] || return 1
+    IOSDEV_UDID="$DEVID" LC_BUNDLE="$LC_BUNDLE" \
+        bounded "$LIMIT" python3 "$py" "$1" "$2" "$LC_BUNDLE" >/dev/null 2>&1
+}
+
 pmd3_put() {
     bounded "$LIMIT" "$PMD3" apps push --udid "$DEVID" "$LC_BUNDLE" "$1" "$2" >/dev/null 2>&1
 }
@@ -110,7 +131,8 @@ get)
     }
     try_pmd3() {
         [ "$ROUTE" = devicectl ] && return 1
-        pmd3_get "$remote" "$local_" && [ -s "$local_" ]
+        if pmd3_get "$remote" "$local_" && [ -s "$local_" ]; then return 0; fi
+        afc_pull "$remote" "$local_" && [ -s "$local_" ]
     }
     # Diagnostics go to stderr: this is called from a loop that captures stdout
     # as the log body, and a route banner inside the log is a corrupted log.

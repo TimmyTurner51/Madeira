@@ -592,6 +592,68 @@ The 5 remaining unhandled exceptions are unrelated addresses
 (`0x111f59bfc` `addr=0x8` twice, `0x198e1ff94` `addr=0x0` twice — the known wild
 pointer from 4b — and `0x1106c59ac` `type=6`).
 
+### 4s. Reproduced, and the fault is RVA-invariant
+
+The 19:07 run (ml2029 still loaded — see below) died the same way, with the image
+at a different base:
+
+```
+[jit-pool] image 0x1333c0000+0xb3c0000 (forzahorizon6.exe)
+E E8 Invalid instruction in entry block: 13873099C
+wine: Unhandled illegal instruction at address 000000013873099C (thread 00e8)
+```
+
+`0x13873099C − 0x1333c0000 = 0x537099c`, exactly as at base `0x132b50000`. Third
+independent placement, same RVA, so the fault tracks the image and not any pool
+address (which is what retracted the alias theory earlier, §4 alias-retraction).
+
+**The census did not run: this session loaded the wrong half.** The log's first
+line is the loader's verdict, and it predates the import:
+
+```
+[19:07:37.021] [unix-half] component half INSTALLED from .../unixhalf-ml2029-census...
+[19:07:39.672] [wcp] 1 package(s) waiting in Import; installing
+[19:07:39.822] [wcp] imported ml2030-stubcensus-native-native type=UnixHalf files=2 links=2
+```
+
+`UnixHalf.install()` runs at app launch and picks the newest enabled native
+package; the package that `installInboxAtLaunch()` unpacked two seconds later is
+correctly the newest one for *next* launch. So a package pushed into `Import`
+needs **two** launches: one to install it, the next to use it. Worth knowing
+before reading silence as a negative result — this is the same failure mode as
+"the probe never ran" being mistaken for "the probe saw nothing".
+
+### 4t. Tooling: AFC refuses a hard-linked log, which is every live log
+
+Pulling `madeira-log.txt` mid-session failed with
+
+```
+AfcException: [Errno 1] Opcode: FILE_OPEN failed with status: 1
+```
+
+Status 1 ("unknown"), not status 8 ("not found") — the file existed and stated
+fine at 5,006,752 bytes. Cause, measured:
+
+| file | nlink | read |
+|---|---|---|
+| `madeira-log.txt` | 2 | status 1 |
+| `madeira-log.prev.txt` | 2 | status 1 |
+| `madeira-last-game-log.txt` | 1 | ok |
+| rotated `logs/<program>-<stamp>.txt` | 1 | ok |
+
+`LogStore.startSessionLog` hard-links the live log to
+`logs/<program>-<stamp>.txt` so a run can be found by name without renaming
+anything — which makes the live log nlink 2 for the whole session, and AFC in
+this container will not open it. `svc.link` (MAKE_LINK) is refused too (status
+15), so the link cannot be recreated from the Mac side.
+
+`tools/local/afc-pull.py` handles it: stat, and when `nlink > 1` find the
+redundant name under `logs/` by identical size+mtime and unlink **that** one, so
+the name the app writes to survives and the inode becomes readable. Verified on
+a real hard-linked log (`madeira-log.prev.txt`, 7,422,139 bytes, link dropped,
+read succeeded). `tools/local/device-file.sh` now falls back to it when
+`apps pull` fails, which is what makes mid-session log reads possible at all.
+
 ### 4r. The next probe: count the whole protected set, not one address
 
 §4q leaves one question, and it is not answerable from the faulting address:
