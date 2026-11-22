@@ -2159,11 +2159,16 @@ Same crash.
 
 The next write resolves `ExitToX64` from the export table while xtajit64 itself
 is being copied (it is copied before ucrtbase; the tree's `xtajit64.dll` exports
-it at RVA `0x118c44`) and patches the later images in that same window, ahead of
-the full-image invalidate the copy already does. That code is in
-`ios_jit_retarget_at_copy` and has not been on the phone. The phone is still on
-`ml264-copybl`, the 795-prologue `kernel32`, and the retarget ntdll, so Play
-crashes the dock.
+it at RVA `0x118c44`, and the bytes there are `ldr x16, [x9]`, the real body)
+and patches the later images in that same window, ahead of the full-image
+invalidate the copy already does. The same pass also rewrites `blr` through a
+read-only slot that already holds an in-image pointer. ucrtbase has 181 of
+those, and one of them is `ucrtbase+0x17680` (`adrp; ldr x8, [x8, #0x1d0]; blr
+x8`, slot RVA `0xd81d0` in `.rdata`, file pointer `0x18008fec4`). The earlier
+branch rewrite died at that instruction as soon as `0x90f1c` was no longer the
+one that ran. Packaged locally as `dist/ml265-exitexport-native.wcp`. It has
+not been on the phone. The phone is still on `ml264-copybl`, the 795-prologue
+`kernel32`, and the retarget ntdll, so Play crashes the dock.
 
 ---
 
