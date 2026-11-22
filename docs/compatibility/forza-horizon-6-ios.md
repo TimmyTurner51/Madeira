@@ -1915,7 +1915,6 @@ breaks the dock and nothing else.
 
 **Run-to-run variance, measured — do not read it as signal.** Two runs of the *same*
 unmodified baseline (no links, bundle `kernel32`) produced different post-spawn outcomes:
-
 | baseline run | game spawns | after spawn |
 |---|---|---|
 | control earlier in this session | yes | `#UD` at `…99C` |
@@ -1926,6 +1925,50 @@ signature**, and any earlier conclusion that read it as one needs revisiting. Th
 signal is only the binary one — *does the game process spawn at all*: 5/5 blocked with
 prologues in `sysx64`, 4/4 spawned without them. Everything downstream of the spawn must be
 replicated before it is believed.
+
+### 4ap. MEASURED — it is the *number* of prologued exports, and the dock **crashes**
+
+Bisection was expected to find a bad export. It found a **count threshold** instead. Every
+set below is a `kernel32.dll` identical to the bundle's except for the named exports' 16-byte
+slots, pushed straight over the live component file (`tools/local/k32-bisect.sh`, one launch
+per step because no re-import is needed):
+
+| exports prologued | sets tried | verdict |
+|---|---|---|
+| 1 | `CreateThreadpoolIo` | spawns |
+| 8 | two halves of the 17-set | spawns (both) |
+| 9, 12 | disjoint slices of the untouched rest | spawns |
+| 16 | a slice of the 17-set, a **disjoint** 16, and a **third** disjoint 16 | **blocked (3/3)** |
+| 17, 134 | | blocked |
+
+The 16-export blocking sets share almost no names: `{CloseHandle…CreateThreadpoolIo}`,
+`{CreateTimerQueue…FlushFileBuffers}`, and `{12 from one end + WideCharToMultiByte,
+WriteFile, WerRegister*}`. So the trigger is not *which* export carries a prologue but *how
+many do* — the threshold is between 12 and 16, which points at a fixed-size bookkeeping
+structure somewhere in our own stack rather than at anything about the functions.
+
+**The dock does not refuse the launch — it crashes.** All three blocked runs contain an
+unhandled `c0000005` in `dockhost.exe` tid 0038, and the spawning run contains none. The
+fault is `pc=0x0`, `nparams=2`, `p0=8` (execute), i.e. a call through a NULL function
+pointer, in a ucrtbase dispatch stub:
+
+```
+call_site@(lr-16): a9029be5 f9444d10 f90013e4 d63f0200   ; ... ldr x16,[x8,#imm] ; blr x16
+callee:            d10143ff a9047bfd 910103fd d0000288
+x8=0x11d25f000  x16=0x0  x9=0x11d2e40c0
+[thunk-slot] exec-relative slot @0x11d25e480 = 0x0     ; target was never written
+```
+
+`x8+imm` resolves to `0x11d25e480`, inside ucrtbase's pool copy, and it holds `0`.
+`[subfloor] DECLINING: pc=0 unreadable` then turns that into an unhandled `c0000005`, and
+`NtTerminateProcess exit_code=0xc0000005` ends the dock before it authorises anything. So
+this is **our** dispatch metadata being incomplete, not a tamper verdict — squarely inside
+the "platform-fidelity bug, pursue aggressively" side of the boundary.
+
+Next: find what fills the ucrtbase exec-relative slot at `+0x480` from the thunk's `adrp`
+target and why it is skipped for some exports, and look for a 13–16-entry table in that path
+(a fixed-size array is the shape the threshold implies).
+
 
 
 
