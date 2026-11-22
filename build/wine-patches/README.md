@@ -12,3 +12,14 @@ out. The Wine submodule pin does not change.
 
 The patch changes build output only: `winebuild` rewrites the thunk bytes as it
 installs each ARM64EC builtin. Rebuild the PE modules after changing it.
+
+> **WARNING — do not ship this patch's output in the app bundle yet (§4an).** The
+> only builtin it changes is `kernel32.dll` (`ntdll` and `kernelbase` have no
+> `ff 25` import thunks to rewrite). A `kernel32.dll` carrying those prologues
+> reproducibly stops `dockhost.exe` from authorising a launch: no game process is
+> spawned, with no loader error and no `#UD`. Patching all 792 exports and patching
+> only the 134 the game imports fail identically, while the bundle's bare-thunk
+> `kernel32` launches normally. `app/Madeira/arm64ec-windows/kernel32.dll` is
+> therefore kept reverted to its bare form, and a `runtime-components.py build
+> windows` run will overwrite it with the dock-breaking version — re-check
+> `tools/local/pe-thunks.py` on it after any component rebuild.

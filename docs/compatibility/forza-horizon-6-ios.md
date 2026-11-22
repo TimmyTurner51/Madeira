@@ -1902,6 +1902,18 @@ patched `kernel32.dll` has actually been loaded by a session** (§4am explains w
 earlier one was ignored). Every previous "fault unchanged with the hotpatch kernel32" result
 was measured without the DLL loaded and is unmeasured, not falsified.
 
+**This is a shipping blocker, not just an experiment.** `runtime-components.py build windows`
+runs with patch `0001` applied, so it writes 792 prologues into
+`app/Madeira/arm64ec-windows/kernel32.dll` — the exact file that becomes `sysx64/kernel32.dll`
+at prefix setup. A rebuilt component therefore produces an app whose Steam dock cannot launch
+any game. Caught by rebuilding the component (verify then passed) and measuring the artifact
+instead of trusting the build: 795 prologues reported by `pe-thunks.py` where the shipped file
+had 0. The artifact has been reverted to its bare form, and `build/wine-patches/README.md`
+carries the warning. `kernel32` is the only builtin the patch touches — `ntdll` and
+`kernelbase` have no `ff 25` import thunks — so patch `0001` is, today, exactly the change that
+breaks the dock and nothing else.
+
+
 ### 4ao. FIXED — a prologue written past `VirtualSize` is silently corrupted by `llvm-strip`
 
 This is the bug behind every "the DLL is nearly byte-identical but behaves completely
