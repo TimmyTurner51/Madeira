@@ -8,7 +8,7 @@ out. The Wine submodule pin does not change.
 
 | Patch | What it fixes |
 |---|---|
-| `0001-arm64ec-import-thunk-hotpatch-prologues.patch` | Gives x64 import thunks in ARM64EC builtins the same hotpatch prologue as native Windows (`48 8d a4 24 00 00 00 00 ff 25`), which anti-tamper checks inspect (Forza Horizon 6) |
+| `0001-arm64ec-import-thunk-hotpatch-prologues.patch` | Gives x64 import thunks in ARM64EC builtins the same hotpatch prologue as native Windows (`48 8d a4 24 00 00 00 00 ff 25`), which anti-tamper checks inspect (Forza Horizon 6). Also refuses to write a prologue that would run past a section's `VirtualSize`: the last thunk in `kernel32` sits flush against the end of `.text`, and the truncated prologue `llvm-strip` would leave behind decodes as `lea rsp,[rsp+0xcccc0000]` (§4ao) |
 
 The patch changes build output only: `winebuild` rewrites the thunk bytes as it
 installs each ARM64EC builtin. Rebuild the PE modules after changing it.

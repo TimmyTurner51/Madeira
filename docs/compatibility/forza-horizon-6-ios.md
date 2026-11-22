@@ -1870,38 +1870,91 @@ really is the DLL the session loads — and the launch changes shape:
 |---|---|---|---|
 | none (baseline) | – | yes | `#UD` at `…99C` |
 | bundle's own `kernel32.dll` | 1 | yes | `#UD` at `…99C` |
-| build-tree `kernel32.dll` (795 hotpatch prologues) | 1 | **no** | launch never authorised |
-| build-tree `kernel32.dll` + matching `kernelbase.dll` (hotpatch) | 2 | **no** | launch never authorised |
-| build-tree `kernel32.dll` with its prologues **removed again** (+ matching `kernelbase.dll`) | 2 | yes | **no `#UD` at all**; still running at 60 s, `P=0.00`, no window |
+| build `kernel32`, **792** prologues (corruption fixed) | 1 | **no** | dock never authorises |
+| build `kernel32`, **134** prologues — only the exports the game actually imports | 1 | **no** | dock never authorises |
+| build `kernel32`, 0 prologues but *with* the truncated slot left in | 1 | yes | no `#UD`; idle at 60 s, `P=0.00` |
 
-The fourth row is the control that makes the third meaningful: `tools/local/pe-unthunk.py`
-restores a builtin's bare thunks, and doing that to the build-tree DLL leaves a file that
-differs from the bundle's own `kernel32.dll` by **11 bytes** (timestamps and one export-table
-field) — i.e. the prologue rewrite is the only functional variable between "launch never
-happens" and "launch happens".
+**The last row is retracted as evidence.** That "bare" file still carried the truncated
+prologue (§4ao) at the very last thunk: 5 of its 11 differing bytes were the residue. Its
+idle-with-no-fault result was a stack-corrupting export, not a property of unthunked code.
+A clean zero-prologue file has not been run yet.
 
-The fifth row is a genuine surprise and is **not** a boot: the game process stays alive with
-no `.text` protect-to-exec (`prot-img … 639b000` count 0), no fault, and no window, at
-`P=0.00`. It is idle, not running. So this DLL set changes *timing* early enough that the
-protector never reaches the code that faults, which makes it useless as a probe of the
-decrypt gate but does show the process is extremely sensitive to the exact builtin set.
+The two middle rows are the useful measurement. Reducing the patch set from 792 exports to
+exactly the 134 the game imports (`tools/local/pe-thunks-apply.py`, names parsed out of the
+reference EXE's own import table: `KERNEL32.dll`, 173 names, 39 of which are real function
+bodies rather than `ff 25` thunks) does **not** restore the launch. So the dock is not reacting
+to some incidental export; it stops authorising as soon as its own dependency set carries
+prologues. The same `kernel32` containing 134 prologues still lets `services.exe` and
+`rpcss.exe` start, so this is specific to the Steam launch flow rather than to the file.
 
-`dockhost.exe` starts, `[madeira-dock] starting the host` is logged, and then the session
-ends with `status=0 games=0` instead of authorising the launch. The console shows no
-`could not load kernel32` and no `#UD`.
+`[wcp] 1 links` and `[main-exe] find_dll_file mixed-arch fallback: kernel32.dll ->
+\??\C:\windows\sysx64\kernel32.dll` confirm it is the overridden DLL that loads, and the
+baseline control was re-run immediately before these (§4am) so device drift is excluded.
 
-This is **not** a packaging artifact: the build-tree DLL is byte-identical in code to the
-earlier hand-patched one (whole-file diff is 6 bytes — the COFF `TimeDateStamp` and one
-export-table field), so there is nothing "new" about this DLL. What is new is that this is
-the **first time a patched `kernel32.dll` has actually been loaded by a session**. Every
-earlier "measured, fault unchanged with the hotpatch kernel32" result was measured without
-the DLL being loaded at all, and must be treated as unmeasured.
+What this changes: the reference's fix cannot be validated here by patching **all** exports.
+The next experiment is a bisection over *which* exports may carry a prologue, not a broader
+port — and the honest prior is that the set is small or empty, because a prologue is
+semantically a no-op (`lea rsp,[rsp+0]` then the same `jmp [rip+rel]`, verified for all 792:
+inside the IAT, 8-byte aligned, and no other export RVA inside any rewritten 16-byte slot).
 
-Consequence: patch 0001's prologues are safe where they have been validated (`ntdll`, and
-the game's own imports) but **cannot simply be extended to `kernel32.dll`** — the x64
-consumers that share that farm (the dock and Steam's webhelper) stop working. Next step is
-bisection, not more packaging: ship a kernel32 patched in *half* its exports, or delay the
-patch to only the exports the protector inspects, and see which set is unsafe to touch.
+One measurement is genuinely new regardless of the bisection: this is the **first time a
+patched `kernel32.dll` has actually been loaded by a session** (§4am explains why every
+earlier one was ignored). Every previous "fault unchanged with the hotpatch kernel32" result
+was measured without the DLL loaded and is unmeasured, not falsified.
+
+### 4ao. FIXED — a prologue written past `VirtualSize` is silently corrupted by `llvm-strip`
+
+This is the bug behind every "the DLL is nearly byte-identical but behaves completely
+differently" surprise above, and it would have shipped in the next app build.
+
+`fixup_arm64x_import_thunks` writes a 16-byte hotpatch slot (`lea rsp,[rsp+0]` + `jmp [rip+rel]`
++ 2 padding bytes) at an export's RVA. It validated the write with `pe_rva_ptr()`, which bounds
+against the section's **`SizeOfRawData`** — the file-padded size. The **last** import thunk in
+`kernel32.dll` sits flush against the end of `.text`, so its slot is 6 real bytes
+(`ff 25 rel32`) followed by file padding:
+
+```
+bundle    037a30  ff 25 da 9e 01 00 cc cc ...
+build     037a30  48 8d a4 24 00 00 00 00 ff 25 d2 9e 01 00 00 00
+```
+
+`.text` has `VirtualSize 0x27a36`, so the section ends at RVA `0x37a36`. The prologue is
+written into padding that is not part of the mapped section. Harmless — until something
+rewrites the image by section size, which is exactly what every `.wcp` DLL goes through:
+
+```
+$ xcrun llvm-strip --strip-debug kernel32.dll
+037a30  48 8d a4 24 00 00 cc cc cc cc cc cc cc cc cc cc
+```
+
+The prologue is cut to its first 6 bytes; those plus the `cc` padding decode as
+`lea rsp,[rsp+0xcccc0000]`, an export that destroys the stack the moment anything calls it —
+in a DLL that otherwise measures "792 hotpatch prologues, 0 bare `ff 25`" and looks perfect.
+Section file-pointers are identical before and after stripping, so this is a real content
+change, not an offset shift (verified via each file's own section table).
+
+Measured, deterministic run to run:
+
+| file | prologues before strip | after strip |
+|---|---|---|
+| before the fix | 793 | 792 + one truncated slot |
+| after the fix | 792 | 792, last thunk correctly left bare |
+
+**Fix** (`build/wine-patches/0001`): `pe_rva_in_virtual_size()` plus a guard requiring the
+whole 16-byte slot to be inside `VirtualSize`, not just the file data. The last thunk keeps its
+bare `ff 25` — which native Windows also has when a slot abuts the section end.
+
+Consequences worth keeping:
+
+- **Never trust "the bytes are identical" as a control** unless the comparison is at RVA level
+  using each file's own section table *and* both files went through the same post-processing.
+  The 11-byte diff above was 6 timestamp bytes plus this 5-byte residue, and that residue is
+  what made the "zero-prologue" control idle instead of faulting.
+- Only a prologue can trigger it, so the app's shipped `kernel32` was never affected (bare
+  thunks). The next rebuild would have been.
+- Tooling: `pe-thunks.py` counts, `pe-thunks-apply.py` writes a named subset with the same
+  `VirtualSize` rule, `pe-unthunk.py` reverses. `tools/wcp/make-pe-wcp.sh` packages PE
+  builtins as prefix links (kind `Wine`) instead of `pe/` staging.
 
 ---
 

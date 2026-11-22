@@ -4,14 +4,14 @@ Date: Wed, 4 Nov 2026 21:15:33 -0600
 Subject: [PATCH] winebuild: emit x86_64-style hotpatch prologues for ARM64EC import thunks
 
 ---
- tools/winebuild/spec32.c | 212 ++++++++++++++++++++++++++++++++++++++++++++++
- 1 file changed, 212 insertions(+)
+ tools/winebuild/spec32.c | 216 +++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 216 insertions(+)
 
 diff --git a/tools/winebuild/spec32.c b/tools/winebuild/spec32.c
-index 9d99850f..30060d77 100644
+index 9d99850f..42b7f6e7 100644
 --- a/tools/winebuild/spec32.c
 +++ b/tools/winebuild/spec32.c
-@@ -1462,6 +1462,182 @@ void output_def_file( DLLSPEC *spec, struct exports *exports, int import_only )
+@@ -1462,6 +1462,204 @@ void output_def_file( DLLSPEC *spec, struct exports *exports, int import_only )
  }
  
  
@@ -34,6 +34,27 @@ index 9d99850f..30060d77 100644
 +        return data + raw_ptr + (rva - va);
 +    }
 +    return NULL;
++}
++
++/* Like pe_rva_ptr, but bounded by the section's VirtualSize rather than its
++ * SizeOfRawData. The tail of a section is padded out to the file alignment, so
++ * a slot that runs past VirtualSize is still writable in the file yet does not
++ * belong to the mapped section. The last import thunk in a .dll sits exactly
++ * there, and a 16-byte hotpatch prologue written into that padding is silently
++ * cut back to int3 by llvm-strip (every .wcp DLL is stripped), which leaves a
++ * half-written prologue -- `lea rsp,[rsp+imm32]` with the displacement taken
++ * from the padding -- and that export corrupts the stack when it is called. */
++static int pe_rva_in_virtual_size( const unsigned char *sec, unsigned int nb_sec,
++                                   unsigned int rva, unsigned int len )
++{
++    unsigned int i;
++
++    for (i = 0; i < nb_sec; i++, sec += 40)
++    {
++        unsigned int va = get_le32( sec + 12 ), vsize = get_le32( sec + 8 );
++        if (rva >= va && rva - va < vsize && vsize - (rva - va) >= len) return 1;
++    }
++    return 0;
 +}
 +
 +/*******************************************************************
@@ -169,6 +190,7 @@ index 9d99850f..30060d77 100644
 +            if ((start & 3) == 2 && func >= (start & ~3) && func + 16 <= (start & ~3) + len) x64 = 1;
 +        }
 +        if (!x64 || !(code = pe_rva_ptr( data, size, sec, nb_sec, func, 16 ))) continue;
++        if (!pe_rva_in_virtual_size( sec, nb_sec, func, 16 )) continue;
 +        if (code[0] != 0xff || code[1] != 0x25) continue;
 +        pad = code[6];
 +        if (pad && pad != 0xcc) continue;
@@ -194,7 +216,7 @@ index 9d99850f..30060d77 100644
  /*******************************************************************
   *         make_builtin_files
   */
-@@ -1503,6 +1679,24 @@ void make_builtin_files( struct strarray files )
+@@ -1503,6 +1701,24 @@ void make_builtin_files( struct strarray files )
                      write( fd, &dll_charact, sizeof(dll_charact) );
                  }
              }
