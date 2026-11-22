@@ -640,15 +640,45 @@ OK: counts match the independent enumerator
 the same number, so no translation is needed there — the mistake was only possible in
 the offline model, which is exactly why the model needed the check.)
 
-### 4v0. HAZARD: pushing a config file can hide the whole Steam library
+### 4v0. HAZARD: two global config keys can break the shell or hide the Steam library
 
-`SteamOwnedLibrary.enabled == MadeiraDock.enabled && MADEIRA_STEAM_LIBRARY`, and
-`MadeiraDock.enabled == MADEIRA_DOCK (default 1) && bundled` (Library.swift:2961,
-MadeiraDock.swift:58, SteamOwnedLibrary.swift:296). So a config that sets
-`env.MADEIRA_DOCK = 0` does not merely skip the dock: it removes the Steam
-section, its games, and the Workshop row from the library. Measured
-2026-11-22 01:08: `[library-sections] native-steam=0 sections=0`; restoring
-`env.MADEIRA_DOCK = 1` gives `native-steam=1 sections=1` and the games back.
+Both of these were introduced on 2026-11-22 by editing `madeira.cfg` to run a
+probe binary, and both are measured before/after. The pristine contents — the
+exact set 104 of 104 recorded runs used — are:
+
+```
+env.-MADEIRA_SWAP_COVERAGE = wide
+env.MADEIRA_JIT_SHORTCUT = 1
+env.MADEIRA_ONE_SESSION_PER_RUN = 0
+env.MADEIRA_SWAP_COVERAGE = wide
+pool = 512
+swap-mb = 2048
+```
+
+**a. `env.MADEIRA_DOCK = 0` removes the Steam library.** 
+`SteamOwnedLibrary.enabled == MadeiraDock.enabled && MADEIRA_STEAM_LIBRARY`,
+and `MadeiraDock.enabled == MADEIRA_DOCK (default 1) && bundled`
+(SteamOwnedLibrary.swift:296, MadeiraDock.swift:58). Setting it to 0 did not
+merely skip the dock: it removed the Steam section, its games and the Workshop
+row. Measured: `[library-sections] native-steam=0 sections=0` with the key, and
+`native-steam=1 sections=1` — games back on screen — without it. Leave this key
+OUT; the default is already the value you want.
+
+**b. `env.MADEIRA_USE_ARM64EC = 1` kills the shell with `0xc000007b`.**
+`explorer.exe` is Machine `0xaa64`. Correct routing is
+`PE routing: machine=0xaa64 bundle=aarch64-windows force-ec=0`. With the key set,
+the same exe is force-routed as `bundle=arm64ec-windows ... force-ec=1`, and
+`explorer.exe` exits `0xc000007b` after ~1 s — before any child spawns, so every
+library "Play" appears to do nothing. EC is a per-game decision the app makes
+itself (the game's own `game-cfg` line carries it); a global key breaks every
+AA64 image in the session. Measured both ways in the same hour: with the key,
+`exit-report status=0xc000007b` and no spawns; without it,
+`[phase] spawn: dockhost.exe / services.exe / conhost.exe / rpcss.exe` and the
+session lives.
+
+An earlier version of this note called that shell failure "pre-existing". It was
+not: the archives show 97 runs with `Target exe: explorer.exe` and not one exiting
+`0xc000007b`, and the last good one differs from the broken one only in this key.
 
 There is exactly one config the app reads —
 `Documents/Data/Application/EDAFB512-.../Documents/madeira.cfg` — and no backup is
@@ -657,15 +687,11 @@ taken automatically. Never write it blind:
 1. `afc-pull.py` it first. A 0-byte result is a FAILED read (AFC returns nothing
    for some files), not an empty config; re-read the effective values from the
    last line starting `[INFO] madeira.cfg:` in the log instead.
-2. Edit only the key you mean to change; keep `env.MADEIRA_DOCK` out of the file
-   unless you deliberately want the dock off.
-3. Push, then confirm `[library-sections] native-steam=1` in the next log.
-
-Also worth knowing: `[WineProc] Target exe: explorer.exe` with
-`machine=0xaa64` exits `0xc000007b` in ~1 s on this build, so a library "Play"
-that routes through the shell fails before any game starts. That is a separate,
-pre-existing defect, not a consequence of a config edit; launching a game
-directly needs `env.MADEIRA_EXE` naming the game.
+2. Reconstruct from the 104/104 baseline above and add only keys you mean to
+   test, one at a time, so a regression has a single suspect.
+3. After a push, confirm in the next log both `[library-sections]
+   native-steam=1` and `PE routing: ... force-ec=0` before concluding anything
+   about a game.
 
 ### 4v. Iteration win: a dylib change is one push, effective next launch
 
