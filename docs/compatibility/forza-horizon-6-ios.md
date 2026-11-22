@@ -1607,6 +1607,33 @@ prove which one answered.
 
 ---
 
+### 4ai. Objective item 4 — the divergences this work introduced, each with its evidence
+
+Audited against the clean-room baseline `0beaf14` ("stock Madeira + WCP import +
+picker"), filtering logging out of the diff so only behaviour remains. Ten source files
+changed, 1,420 insertions. This is the list that matters when something *other* than FH6
+breaks, as `dockhost.exe` already did once.
+
+| # | divergence | path | default | status |
+|---|---|---|---|---|
+| 1 | census sampler: detached thread, reads other images' memory, started for every session | `virtual_ios.c` | **was on** | **FIXED** — now `MADEIRA_STUB_CENSUS=1`; prints one line when off. Caveat: the app's static half still runs its older always-on build (§4ah) |
+| 2 | `[map-name]`: a wineserver round trip + `fcntl` per builtin image, on the loader path, only to log | `virtual_ios.c` | **was on** | **FIXED** — now `MADEIRA_MAP_NAME=1` |
+| 3 | nested exception delivered on the signal stack instead of `abort_thread(1)` | `virtual_ios.c` | **on** | **DOCUMENTED, active** — changes exception delivery for every process, not just FH6. Was `abort_thread(1)` at baseline. Needs an A/B on a non-FH6 title before it is trusted |
+| 4 | `[pool-caller]`: six `dladdr` calls per image map | `virtual_ios.c` | on | documented; logging only, no behaviour. Cheap enough to leave |
+| 5 | `[store-noalias]` wording: requires the region to cover the address, and names the FAR-echo case | `signal_arm64_ios.c` | on | documented; logging only, and it fixed a probe that had sent a session after a non-existent memory fault |
+| 6 | failed server write treated as EPIPE | `server_ios.c` | **off** | env-gated (`MADEIRA_SRV_CLOSED_IS_EPIPE`); baseline behaviour preserved without it |
+| 7 | guest `PROT_EXEC` honoured on anonymous RWX | `virtual_ios.c` | **off** | env-gated (`MADEIRA_GUEST_RWX_EXEC`); the RX-strip is baseline behaviour, so not a divergence by default |
+| 8 | unix half loaded from a `.wcp` instead of the linked archive | `UnixHalf.swift`, `WineProcessBridge.m` | on | **DOCUMENTED, active** — start/log/`i386` flag/child table are routed to whichever half runs; the remaining direct references are `comp-half-fix`, and §4ah proves both halves run at once |
+| 9 | JIT pool claimed at app start, so a game-specific `pool=` may be ignored under LiveContainer | `ContentView.swift`, `StikJITHelper.swift` | on | **DOCUMENTED, active** — a real semantic change; the log says which pool was used |
+| 10 | `[[maybe_unused]]` `files/` components skipped in the link count | `WineProcessBridge.m` | on | documented; prevents a native component being reported as a failed link |
+
+Nothing else in the half or the app changes behaviour by default: the other probes are
+`dprintf`/`ERR` only. The two that were genuinely risky (#1, #2) are now opt-in on the
+component side; #3, #8 and #9 remain active and are the ones to watch if a non-FH6 title
+regresses.
+
+---
+
 ## 5. Premise corrections
 
 The objective carries "established facts" that no longer match measurement. They
