@@ -2223,9 +2223,14 @@ jmp as an ARM add that reads x18 and replaces it. `GetCommandLineA` sits in
 the code map's x64 range `0x34000` for `0xdcc0`. `ml267` leaves those ranges
 alone (kernel32 logged 3726 instructions left). `arm64ec_process_init` then
 returns 0, and both `pProcessInit` and `pThreadInit` return 0. The dock loads
-Steam modules past that point and later dies at `pc=0xb3724a68` with the guest
-RIP at kernel32+`0x319cc` (`c0000005`, tid `00ac` in the dock). `forzahorizon6.exe`
-does not start.
+Steam modules past that point and later dies at host `pc=0xb3724a68`
+(`c0000005`, tid `00ac` in the dock). The guest RIP is the pool address of
+kernel32+`0x319cc`, the instruction after a patched `bl ExitToX64` (the `blr`
+was at `0x319c8`, no_redirect slot `0x70390`, one of the nine). The code map
+marks `0x10000`–`0x338e4` as ARM64EC, so that page is ARM. The emulator used
+the pool pointer as an x64 RIP and the host left the block for an unmapped
+address. `forzahorizon6.exe` does not start. "Failed to mprotect last page of
+code buffer" is logged earlier and execution continues past it.
 
 ---
 
@@ -2263,13 +2268,15 @@ and the fault is at `image+0x537099c`.
 
 ## 6. Next experiments, cheapest first
 
-0. **The exit branch is done (§4au). The dock now dies later.** `ml267-x64span`
-   is what the phone is running. Process init returns, and the dock then faults
-   at `pc=0xb3724a68` with the guest RIP at kernel32+`0x319cc` (`c0000005`).
-   That is the next measurement. `forzahorizon6.exe` still does not start, and
-   Play still crashes the dock. The ciphertext at `0x537099c` is still not
-   reachable. Putting the bundle's bare `kernel32.dll` back on the
-   `kernel32-one.dll` component makes Play safe and gives up the prologue test.
+0. **Do not emulate a pool address of ARM code (§4au).** `ml267-x64span` is on
+   the phone. Process init returns. The dock then dies because the guest RIP is
+   the pool address of kernel32+`0x319cc`, which is ARM code in an EC range,
+   and the host jumps to unmapped `0xb3724a68`. `ExitToX64` has to branch to
+   that address natively, and a pool address of real x64 code has to be turned
+   back into a PE address before it is used as a guest RIP. `forzahorizon6.exe`
+   still does not start. Play still crashes the dock. Putting the bundle's
+   bare `kernel32.dll` back on the `kernel32-one.dll` component makes Play
+   safe and gives up the prologue test.
 
 1. **Catch the guest stack at the moment `.text` is unlocked (§4ah).**
    The decrypt question has narrowed to one moment: `prot-img` #45 takes `.text`
