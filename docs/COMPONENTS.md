@@ -83,6 +83,24 @@ enabled builtin package contributes, so a replacement release needs no manual re
 previous one. A DLL outside `arm64ec-windows`, `aarch64-windows` or `i386-windows` is refused:
 landing a module in an architecture it was not built for is worse than not installing it.
 
+## What a package cannot replace
+
+A package can replace a PE file in the prefix, a builtin on `WINEDLLPATH`, or the
+unix half (a native `.dylib` loaded by `UnixHalf.swift`). It cannot replace an
+archive the app has already linked. `tools/build/package-ipa.sh` requires these
+as build inputs:
+
+| Archive | What it is |
+|---|---|
+| `app/Madeira/libdxmt_combined.a` | DXMT, linked into the app |
+| `app/Madeira/libntdll_unix.a` | fallback unix half, used when no native package is enabled |
+| `app/Madeira/libwineserver.a`, `libwin32u_unix.a`, `libmadeira_rppairing.a` | linked into the app |
+| `FEX/build-ios/.../libFEXCore.a` and the other FEX archives | linked into the FEX module at build time |
+
+`madeira_d3d12.dll` and `d3d12.dll` are PE files under `arm64ec-windows`, so a
+Wine package can link over them. Replacing DXMT or the FEX core archives still
+requires an app rebuild.
+
 ## Environment variables
 
 A profile may carry an optional `environment` (or `env`) object:
