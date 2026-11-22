@@ -2183,6 +2183,16 @@ returns into `br x11`. Packaged locally as `dist/ml265-exitexport-native.wcp`.
 It has not been on the phone. The phone is still on `ml264-copybl`, the
 795-prologue `kernel32`, and the retarget ntdll, so Play crashes the dock.
 
+On that crash `x9` is already set. `ucrtbase` pool base `0x11cb44000`, `x9` =
+`0x11ccada78`, which is `kernel32+0x35a78` in the pool copy at `0x11cc78000`.
+The kernel32 on the phone has `ff 25 d2 ab 01 00` there, the `jmp [rip+rel32]`
+of a hotpatch thunk whose prologue sits at `0x35a70`. `ExitToX64` compares
+`[x9]` with the fast-forward sequence `48 8b c4 48 89 58 20 55 5d` and only
+then takes the native bypass. These bytes do not match, so a direct branch
+that actually runs falls through into the emulator. A fault inside `ldr x16,
+[x9]` would mean that address was not the mapped thunk. `arm64x_check_call` in
+the same log is at `0x11c2aefe0`, about 7MB from ucrtbase, inside `bl` range.
+
 ---
 
 ## 5. Premise corrections
