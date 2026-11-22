@@ -2195,6 +2195,13 @@ that actually runs falls through into the emulator. A fault inside `ldr x16,
 [x9]` would mean that address was not the mapped thunk. `arm64x_check_call` in
 the same log is at `0x11c2aefe0`, about 7MB from ucrtbase, inside `bl` range.
 
+The constant-call pass does not check that its target is executable. A file
+simulation of the same match, on the arm64ec DLLs the app ships, patched
+ucrtbase 181, kernel32 79, kernelbase 744, win32u 1 and ntdll 0, and every
+target was in an executable section. The packaged dylib carries the log lines
+for `ExitToX64`, `arm64x_check_call`, `icall patched` and `constant calls
+patched`, so a run that prints none of them is not running this package.
+
 ---
 
 ## 5. Premise corrections
