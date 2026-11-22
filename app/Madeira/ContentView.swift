@@ -4293,8 +4293,17 @@ final class ControlsWindow: UIWindow {
                 (library.performance && library.performanceRect.contains(point)) {
                 return super.hitTest(point, with: event)
             }
-            guard m.hitsInteractive(point, in: bounds, topBar: false) else { return nil }
-            return super.hitTest(point, with: event)
+            if m.hitsInteractive(point, in: bounds, topBar: false) {
+                return super.hitTest(point, with: event)
+            }
+            // The menu button fades, and the starting screen does not draw it.
+            // A drag in from either edge opens the session menu. The band is
+            // only the margin, so a touch on the game still falls through.
+            let edge: CGFloat = 18
+            if point.x <= edge || point.x >= bounds.width - edge {
+                return super.hitTest(point, with: event)
+            }
+            return nil
         }
         // Portrait draws nothing here, so it must consume nothing.
         guard bounds.width > bounds.height else { return nil }

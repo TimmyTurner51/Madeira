@@ -5628,6 +5628,7 @@ struct LibraryHUD: View {
                     // (and measured) all the same.
                     launchView(entry, geometry: geo).opacity(curtain.hidesStartingScreen ? 0 : 1)
                 }
+                if !model.menu { sessionEdgeSwipe(geo) }
                 if !model.startingScreen && model.performance { LibraryFloatingItem(isMenu: false, viewport: geo.size, insets: geo.safeAreaInsets) }
                 if model.liveLogs && !model.startingScreen { LibraryLiveLogs().frame(maxWidth: 550, maxHeight: 140).padding(.top, Self.topInset(geo) + 60).padding(.horizontal, 12).allowsHitTesting(false) }
                 if !model.sessionMessage.isEmpty && !model.startingScreen { Text(model.sessionMessage).font(.caption).padding(10).background(.regularMaterial, in: Capsule()).frame(maxWidth: .infinity).padding(.top, Self.topInset(geo) + 12).allowsHitTesting(false) }
@@ -5679,6 +5680,32 @@ struct LibraryHUD: View {
             if command == "menu" { if model.menu { model.menu = false } else { model.showMenu() } }
             else if command == "back", model.menu { model.menu = false }
         }
+    }
+    /// Either screen edge opens the session menu. The centre does not take the
+    /// touch: ControlsWindow only delivers these bands, and the spacer passes
+    /// through while the starting screen is covering the whole window.
+    @ViewBuilder private func sessionEdgeSwipe(_ geo: GeometryProxy) -> some View {
+        let band: CGFloat = 18
+        HStack(spacing: 0) {
+            Color.clear.frame(width: band).frame(maxHeight: .infinity)
+                .contentShape(Rectangle())
+                .gesture(sessionEdgeDrag)
+            Spacer().allowsHitTesting(false)
+            Color.clear.frame(width: band).frame(maxHeight: .infinity)
+                .contentShape(Rectangle())
+                .gesture(sessionEdgeDrag)
+        }
+        .frame(width: geo.size.width, height: geo.size.height)
+    }
+    private var sessionEdgeDrag: some Gesture {
+        DragGesture(minimumDistance: 24, coordinateSpace: .local)
+            .onEnded { value in
+                let dx = value.translation.width
+                let dy = value.translation.height
+                guard abs(dx) > 56, abs(dx) > abs(dy) * 1.5 else { return }
+                fputs("[frontend] edge swipe opened the session menu\n", stderr)
+                model.showMenu()
+            }
     }
     /// Landscape: the cover large on the left, the title, status and controls beside it
     /// (launchWideView). MADEIRA_LAUNCH_WIDE=0 keeps the centred column in landscape too.
