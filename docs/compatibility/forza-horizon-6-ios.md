@@ -592,6 +592,52 @@ The 5 remaining unhandled exceptions are unrelated addresses
 (`0x111f59bfc` `addr=0x8` twice, `0x198e1ff94` `addr=0x0` twice — the known wild
 pointer from 4b — and `0x1106c59ac` `type=6`).
 
+### 4p. FIXED: the session now outlives the launcher, and the game is blocked, not dead
+
+The app rebuild (Debug, incremental, ~100 s) carried three changes: the child-table reader
+through the half, the app-side reader preferring it, and the half-side holder. Measured on
+the first run afterwards:
+
+```
+[WineProc] Wine exited with code 0 (caught by longjmp)
+[WineProc] the main process exited but 5 child process(es) it started still run
+            (dockhost.exe services.exe conhost.exe rpcss.exe forzahorizon6.exe)
+            -- a launcher started the game; the session goes on until they exit
+[WineProc] still running: 4 child process(es) (dockhost.exe services.exe conhost.exe rpcss.exe), 60 s
+[WineProc] still running: 2 child process(es) (services.exe rpcss.exe), 240 s
+```
+
+The session stayed up for the whole 240 s window instead of ending at 5–15 s, and the
+screen kept a live session (HUD, "Game menu") the whole time. **`MADEIRA_WAIT_CHILDREN` is
+the fix, and it only works once the child table is read from the image that fills it** —
+which is the app's own copy, so this needed the rebuild, not a package.
+
+Two things this exposes, both new:
+
+* The game does **not** exit. It is blocked in a native wait with no window:
+
+  ```
+  [thread-sample] modmap peb=0x107fec000 modules=85 first=forzahorizon6.exe@0x132b50000
+  [thread-sample] b0 teb=0x703b3b0000 cpu=0% wait pc=0x71f38361c0 NATIVE (no FEX state)
+                  sp-cand=[forzahorizon6.exe+0x63f4510 forzahorizon6.exe+0x639e4c0 ...]
+  ```
+
+  So the "no window" question is no longer "does the session end" (it does not) but "what
+  is the game's first thread waiting on". 0 % CPU, 85 modules mapped, the stack holding
+  return addresses in its own image: a blocker inside the guest, not a crash and not the
+  protection fault of §4.
+
+* `forzahorizon6.exe` is listed at the first census and missing from the 60 s one while its
+  threads are demonstrably alive. Its child slot is being released or marked exited early
+  (`ios_child_slot_release` when a child's boot thread returns, `ios_child_slot_exited` by
+  PEB), so the session currently stays alive only because `services.exe` and `rpcss.exe`
+  outlast the game's slot — not because the game is tracked. That has to be fixed before
+  the wait can be trusted as a game-lifetime signal.
+
+`[child-census] ml2029 … games=0() used=0() session=0x0 caller=0x0` also now appears, from
+the half's copy of the table, in the same seconds the app's copy listed five names: the two
+arrays are confirmed distinct, and the app's is the populated one.
+
 ### 4n. The session-ending exit is not in the copy a `.wcp` can patch
 
 Four consecutive unix-half packages were pushed, verified loaded on device, and produced no
