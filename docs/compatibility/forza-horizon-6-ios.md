@@ -1387,13 +1387,22 @@ The real fix is app-side: those direct references must go through the component'
 dispatch table like the rest of UnixHalf. Until then, **a component half is only usable
 with the two keys above**, and that caveat belongs in every future probe run.
 
-**Separate collateral damage, same shape as the dock bug that was already recorded:**
-`FH6-iOS-1.6-ntdll-builtin` (the PE `ntdll.dll` override carrying the 0002 and
-`[ec-openthread]` probes) breaks the dock *on its own*. With it enabled the log shows
-`[builtin-override] using .../FH6-iOS-1.6-ntdll-builtin-builtin/pe/arm64ec-windows/ntdll.dll`
-and the session dies before the game spawns; disabling it restored
-`host finished (result 0)` and a spawn at `t+6.2s` with every other component still off.
-Treat a global PE `ntdll` override as a test-only setting, never a default.
+**Separate collateral damage — and its correction.** At first, `FH6-iOS-1.6-ntdll-builtin`
+(the PE `ntdll.dll` override carrying the 0002 patches and the `[ec-openthread]` probes)
+appeared to break the dock on its own: with it enabled `[builtin-override] using
+.../FH6-iOS-1.6-ntdll-builtin-builtin/pe/arm64ec-windows/ntdll.dll` appeared and the
+session died before the game spawned. **That was that artifact, not PE overrides in
+general.** A rebuilt override (`FH6-iOS-1.7-veh`) is loaded through the same path
+(`[builtin-override] using .../FH6-iOS-1.7-veh-builtin-builtin/pe/arm64ec-windows/ntdll.dll`)
+and the same run reports `host finished (result 0)` and spawns the game at `t+6.14s`.
+So the 1.6 DLL should be treated as a bad build, not as evidence against the mechanism.
+
+Two practical notes about placing an override by hand: the loader looks for
+`Components/<id>/pe/<machine>/<dll>`, which is what the installer *materialises* from a
+package's layout, so copying only `files/lib/wine/...` silently does nothing; and a
+layout whose `dest` has no `${...}` token is counted as `failed` by the link pass
+(`[wcp] ... 1 failed`) while still working for the override, because the override and
+the system32 symlink farm are two different consumers of the same layout.
 
 ### 4ad. Four hypotheses falsified this turn (do not re-run these)
 
@@ -1437,6 +1446,78 @@ attempt did exactly that (dylib timestamp 00:53, source edited 01:28, probe stri
 from the artifact). Always use `tools/local/build-half.sh <version> <desc>`; it refuses a
 dylib older than its newest source.
 
+### 4ae. MEASURED LIVE — the vectored handler is called with correct inputs and returns 0
+
+The claim "the protector's VEH declines the #UD" had been carried over from a build that
+no longer exists: the `[veh-add]`/`[veh-chain]` probes are **not in the current tree**, and
+`call_vectored_handlers` only logged `STATUS_ACCESS_VIOLATION`, so `0xC000001D` was invisible.
+Rebuilt with both fixed (`wine/dlls/ntdll/exception.c`, probes widened to
+`STATUS_ILLEGAL_INSTRUCTION` and the registration logged), shipped as
+`FH6-iOS-1.7-veh-builtin.wcp`, and reproduced on the phone:
+
+```
+00e4:err:seh:add_vectored_handler [veh-add] func=000000013736D858 first=1
+00e4:err:seh:call_vectored_handlers [veh] calling handler 000000013736D858 code=c000001d
+      addr=000000013731099C nparams=0 info0=0 info1=0 ctx=00000070417DF4… Rsp=00000070417DFE08
+      Rip=000000013731099C
+00e4:err:seh:call_vectored_handlers [veh] handler 000000013736D858 RETURNED 0 code=c000001d
+      addr=000000013731099C Rsp=… Rip=000000013731099C
+```
+
+Read this carefully, because it closes a whole family of hypotheses:
+
+- exactly **one** handler is registered, `first=1` (exception chain, not the continue chain);
+- it is called for the real `#UD`, with `ExceptionAddress` **and** `ContextRecord->Rip`
+  both equal to the faulting protected RVA (`base + 0x537099c`, base `0x131FA0000` here);
+- `NumberOfParameters=0`, matching Windows' `#UD` (so no parameter mismatch to fix);
+- it returns **0 = EXCEPTION_CONTINUE_SEARCH** with `Rip` and `Rsp` untouched.
+
+So the handler is not being starved, mis-addressed, or handed a wrong context: it is asked
+to handle exactly this fault and declines. Combined with `§4ab` (the bytes are still
+ciphertext at the fault) this says the protector does not decrypt lazily through this
+path. Any future work on exception plumbing — nested delivery, unwind cost, context
+fidelity — changes *how* this ends, not whether the code gets decrypted.
+
+### 4af. The 16MB buffer holds ciphertext-like data, measured against real `.text`
+
+`§4ad` showed the buffer is not image bytes. It is also not decrypted code, by a calibrated
+byte statistic on the shipped `Reference/forzahorizon6.exe` (4MB samples):
+
+| sample | 0x00 | 0xCC | 0x48 | 0xEA |
+|---|---|---|---|---|
+| plaintext `.text` (first 4MB) | 5.85% | 8.33% | 8.16% | 0.093% |
+| an "encrypted island" (0x7f0000, 4MB) | 1.80% | 3.36% | 3.44% | 0.299% |
+| the 16MB buffer `[0,4K)` on device | — | — | — | **0.269%** |
+
+The buffer's `0xEA` rate sits with the encrypted islands, not with code, so "the decryptor
+wrote plaintext into the buffer and we failed to copy it back" is not supported either:
+the buffer is input to a decrypt step that never runs.
+
+About **5.8% of `.text` (92 of 1594 64KB blocks, 0x00 < 0.4%) looks encrypted**. That also
+means the `[stub-census]` set — functions whose *first byte* is `0xEA` — is not the whole
+protected range: `rva 0x1b226ca` and `rva 0x3cbeb92` sit inside functions starting
+`b0 75 3b` / `5a f4 40` and are themselves high-entropy. Do not treat "all 4538 entry bytes
+unchanged" as "no byte of `.text` changed".
+
+### 4ag. The one `.text` divergence the guest actually made, and why it is not the decrypt
+
+`[text-sync] ml2039 #9 … base=0x1607a1000 region=0x639ace3: .text differ=10 of 104443107
+bytes at protect-to-exec (guest view has edits the pool copy does NOT get) | first offs:
+0x1b126ca 0x1b126cb 0x3cadb92 0x3cadb93 …`
+
+So the guest wrote **10 bytes** into FH6's `.text` (two 5-byte patches, at image RVAs
+`0x1b226ca` and `0x3cbeb92`) and the pool copy — the one FEX executes — never received
+them, because `NtProtectVirtualMemory`'s sync deliberately skips `.text`. This is the only
+such event in the run (9 total `[text-sync]` lines, and it is the only one for this image).
+
+It is a real fidelity bug with a designed fix (a pristine per-image baseline plus a
+diff-apply of guest-changed bytes into the pool, *not* a wholesale copy that would clobber
+our thunks). But it is **not** the decrypt: 10 bytes, once, long before the arena is
+filled, and the census shows the target entry untouched at the fault. Rank it as a
+correctness fix, not as the boot fix, and note that a whole-`.text` baseline copy for this
+title would cost another 104MB of address space, so if it is built it should snapshot only
+the writable window at protect-to-RW.
+
 ---
 
 ## 5. Premise corrections
@@ -1446,11 +1527,11 @@ are listed here so the next session does not pursue the objective from a
 falsified starting point.
 
 1. **"The binary cannot register a vectored exception handler by any name;
-   `[veh-chain] EMPTY` is the only possible state."** Measured otherwise in an
-   earlier session: `[veh-add] func=1453CD858` is registered and `[veh-chain]`
-   delivers to it. *This* build's log has no `veh-*` lines at all — the probe is
-   not present, so this log can neither confirm nor refute it. Treat the claim
-   as unproven rather than established.
+   `[veh-chain] EMPTY` is the only possible state."** Now measured directly on
+   the current build (§4ae): exactly one handler is registered and it *is* called
+   for the `#UD` with the correct address and `Rip`, then returns 0. The claim is
+   falsified — and so is its converse ("a skipped or mis-addressed handler is the
+   problem"), because the handler receives everything it needs and declines.
 2. **"The `FEX_*` environment preset changes nothing."** See §3 — it does, and
    one key in it was blocking the launch outright.
 3. **"Dies within ~1 s."** Now ~6 s of real execution (`t+7.633s` spawn,
