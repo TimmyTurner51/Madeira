@@ -1493,6 +1493,21 @@ The buffer's `0xEA` rate sits with the encrypted islands, not with code, so "the
 wrote plaintext into the buffer and we failed to copy it back" is not supported either:
 the buffer is input to a decrypt step that never runs.
 
+**And it is not a copy of `.text`, measured three ways** (`[arena-sig]`, ml2124, 32-byte
+signatures, 16MB pass each):
+
+```
+[arena-needle] stub@0x537099c = ea e9 6b e6 14 … NOT FOUND
+[arena-sig] rva=0x7f0010  NOT FOUND in the arena     (inside an encrypted island)
+[arena-sig] rva=0x537099c NOT FOUND in the arena     (the faulting stub)
+[arena-sig] rva=0x1b22670 NOT FOUND in the arena     (encrypted body, non-0xEA start)
+```
+
+So the workspace is not "`.text` moved elsewhere to be decrypted", and not "`.text` copied
+to be written back". It holds the protector's own payload. The decrypt-in-place never
+begins, and the payload in the workspace is not the reason — nothing in the workspace
+corresponds to the code that faults.
+
 About **5.8% of `.text` (92 of 1594 64KB blocks, 0x00 < 0.4%) looks encrypted**. That also
 means the `[stub-census]` set — functions whose *first byte* is `0xEA` — is not the whole
 protected range: `rva 0x1b226ca` and `rva 0x3cbeb92` sit inside functions starting

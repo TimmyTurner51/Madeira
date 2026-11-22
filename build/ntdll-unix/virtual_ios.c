@@ -19979,6 +19979,36 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                     ios_pe_module_name( image_base, image_size ), (char *)jit_rx_base + offset,
                     (unsigned long)image_used, (unsigned long)image_budget,
                     (unsigned long)tramp_prealloc, image_in_low ? " [pool-low] region C" : "");
+            /* ml2119: dump the bytes the IMAGE ITSELF has at a known export RVA, and the
+             * same offset in the pool copy. An override only counts if these are the
+             * file's bytes; the guest's view and the on-disk file must agree. */
+            {
+                const char *mn2 = ios_pe_module_name( image_base, image_size );
+                if (mn2 && strstr( mn2, "kernel32" ) && image_size > 0x40000)
+                {
+                    const unsigned char *a = (const unsigned char *)image_base + 0x37510;
+                    const unsigned char *b = (const unsigned char *)jit_rx_base + offset + 0x37510;
+                    dprintf( 2, "[img-bytes] image %02x%02x%02x%02x%02x%02x%02x%02x%02x%02x "
+                             "pool %02x%02x%02x%02x%02x%02x%02x%02x%02x%02x\n",
+                             a[0],a[1],a[2],a[3],a[4],a[5],a[6],a[7],a[8],a[9],
+                             b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7],b[8],b[9] );
+                }
+            }
+
+            if (1)   /* ml2116: who called us for THIS image */
+            {
+                Dl_info di;
+                uintptr_t fb = 0;
+                if (dladdr( (void *)__builtin_return_address(0), &di )) fb = (uintptr_t)di.dli_fbase;
+                dprintf( 2, "[pool-caller] %s ra=%p+0x%lx,%p+0x%lx,%p+0x%lx,%p+0x%lx,%p+0x%lx,%p+0x%lx\n",
+                         ios_pe_module_name( image_base, image_size ), (void *)fb,
+                         (unsigned long)((uintptr_t)__builtin_return_address(0) - fb),
+                         (void *)fb, (unsigned long)((uintptr_t)__builtin_return_address(1) - fb),
+                         (void *)fb, (unsigned long)((uintptr_t)__builtin_return_address(2) - fb),
+                         (void *)fb, (unsigned long)((uintptr_t)__builtin_return_address(3) - fb),
+                         (void *)fb, (unsigned long)((uintptr_t)__builtin_return_address(4) - fb),
+                         (void *)fb, (unsigned long)((uintptr_t)__builtin_return_address(5) - fb) );
+            }
 
             /* ml2036: arm the stub census sampler from here -- this runs for every image,
              * early, in the component. See ios_stub_census_ensure. */
@@ -27317,6 +27347,27 @@ static unsigned int virtual_map_section( HANDLE handle, PVOID *addr_ptr, ULONG_P
             prev = NtCurrentTeb64()->Tib.ArbitraryUserPointer;
             NtCurrentTeb64()->Tib.ArbitraryUserPointer = PtrToUlong(NtCurrentTeb()->Tib.ArbitraryUserPointer);
         }
+        /* ml2117: name the file this view is coming from, before builtin replacement. */
+        if (image_info)
+        {
+            char nb[260]; int ni = 0;
+            if (nt_name.Buffer)
+                for (; ni < nt_name.Length / 2 && ni < 255; ni++) nb[ni] = (char)nt_name.Buffer[ni];
+            nb[ni] = 0;
+            /* and the unix file actually mapped, which is what decides which bytes
+             * the guest will see -- the NT path is only a name. */
+            {
+                char up[MAXPATHLEN] = "(no fd)";
+                int ufd = -1; unsigned int uacc = 0;
+                extern NTSTATUS wine_server_handle_to_fd( HANDLE, ACCESS_MASK, int *, unsigned int * );
+                if (NT_SUCCESS(wine_server_handle_to_fd( handle, 0, &ufd, &uacc )))
+                {
+                    if (fcntl( ufd, F_GETPATH, up ) == -1) strcpy( up, "(F_GETPATH failed)" );
+                    close( ufd );
+                }
+                dprintf( 2, "[map-name] '%s' machine=0x%x\n    file=%s\n", nb, machine, up );
+            }
+        }
         /* check if we can replace that mapping with the builtin */
         res = load_builtin( image_info, &nt_name, &exp_name, machine, &info,
                             addr_ptr, size_ptr, limit_low, limit_high, offset.QuadPart );
@@ -29948,7 +29999,42 @@ void *virtual_setup_exception( void *stack_ptr, size_t size, EXCEPTION_RECORD *r
     {
         if (is_inside_signal_stack( stack ))
         {
-            ERR( "nested exception on signal stack addr %p stack %p\n", rec->ExceptionAddress, stack );
+            /* MADEIRA (DroidDeck reference: "a nested exception on the signal stack no
+             * longer kills the process").
+             *
+             * Upstream calls abort_thread(1) here: the fault happened while this thread
+             * was already running on its signal stack, so there is no room on the guest
+             * stack to build a dispatch frame and upstream treats that as unrecoverable.
+             * It is not. The signal stack is a fixed per-TEB region with space below the
+             * faulting frame, and the only thing the caller needs is a writable
+             * sizeof(*stack) scratch area to copy EXCEPTION_RECORD + CONTEXT into before
+             * it points SP at it and enters KiUserExceptionDispatcher -- nothing there
+             * reads the guest stack. So deliver the nested exception on the signal stack
+             * when the frame fits inside it.
+             *
+             * Killing the thread instead is what turns a single guest exception into a
+             * dead pseudo-process, and the protection in this title raises exceptions
+             * constantly (single stepping, breakpoints). Keep the abort as the last
+             * resort: a frame that does not fit below the current SP is still
+             * unrecoverable, and faulting on it would loop. */
+            char *frame = stack - size;
+            char *base = (char *)get_signal_stack();
+            if (frame >= base + host_page_size && ios_range_writable( frame, size ))
+            {
+                static unsigned nested_delivered;
+                if (nested_delivered < 8)
+                {
+                    nested_delivered++;
+                    ERR( "nested exception on signal stack addr %p stack %p: delivering frame "
+                         "%p (+0x%lx into the signal stack) instead of killing the thread\n",
+                         rec->ExceptionAddress, stack, frame,
+                         (unsigned long)(frame - base) );
+                }
+                return frame;
+            }
+            ERR( "nested exception on signal stack addr %p stack %p "
+                 "(%lu-byte frame does not fit)\n",
+                 rec->ExceptionAddress, stack, (unsigned long)size );
             abort_thread(1);
         }
         WARN( "exception outside of stack limits addr %p stack %p (%p-%p-%p)\n",
@@ -39653,6 +39739,56 @@ void ios_stub_census( double uptime_s )
                                 if (!found)
                                     dprintf( 2, "[arena-needle]   NOT FOUND: the arena is not a "
                                              "copy of the image around the faulting stub\n" );
+
+                                /* ml2124: a 5-byte needle at one RVA cannot distinguish
+                                 * "the arena is a staging copy of some .text" from "the arena
+                                 * is an independent blob", because only the stub was searched.
+                                 * Search for 32-byte signatures from three different kinds of
+                                 * site, and report the arena offset where each lands:
+                                 *   0x7f0010  inside the first 64KB block whose byte mix says
+                                 *             "encrypted island" (~5.8% of .text is like this)
+                                 *   0x537099c the faulting stub itself
+                                 *   0x1b22670 a function whose body is encrypted although its
+                                 *             first byte is not 0xEA
+                                 * A hit means the arena holds .text bytes and the missing step
+                                 * is the decrypt-in-place; three misses mean the input is not
+                                 * .text at all and the decrypt reads something else. */
+                                {
+                                    static const uint32_t probe_rva[3] = { 0x7f0010, 0x537099c, 0x1b22670 };
+                                    unsigned pi;
+                                    for (pi = 0; pi < 3; pi++)
+                                    {
+                                        unsigned char sig[32];
+                                        size_t s, off2;
+                                        unsigned hit = 0;
+                                        if (!ios_stub_census_read( census.pe + probe_rva[pi], sig, 32 ))
+                                        {
+                                            dprintf( 2, "[arena-sig] rva=%#x unreadable\n", probe_rva[pi] );
+                                            continue;
+                                        }
+                                        for (off2 = 0; off2 + 32 <= asz && !hit; off2 += 0x100000)
+                                        {
+                                            mach_vm_size_t g2 = 0;
+                                            size_t n2 = (asz - off2 < 0x100000) ? asz - off2 : 0x100000;
+                                            if (mach_vm_read_overwrite( mach_task_self(),
+                                                    (mach_vm_address_t)(a0 + off2), n2,
+                                                    (mach_vm_address_t)chunk, &g2 ) != KERN_SUCCESS || !g2)
+                                                continue;
+                                            for (s = 0; s + 32 <= g2; s++)
+                                                if (!memcmp( chunk + s, sig, 32 ))
+                                                {
+                                                    dprintf( 2, "[arena-sig] rva=%#x FOUND at arena+0x%lx "
+                                                             "-> arena is a copy of .text\n",
+                                                             probe_rva[pi], (unsigned long)(off2 + s) );
+                                                    hit = 1;
+                                                    break;
+                                                }
+                                        }
+                                        if (!hit)
+                                            dprintf( 2, "[arena-sig] rva=%#x NOT FOUND in the arena\n",
+                                                     probe_rva[pi] );
+                                    }
+                                }
                             }
                             free( chunk );
                         }
