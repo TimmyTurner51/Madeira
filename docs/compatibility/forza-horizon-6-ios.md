@@ -1866,12 +1866,25 @@ they are staged for the loader, not linked, so `failed` now means a genuinely br
 With the farm fixed, a patched `kernel32.dll` (795 hotpatch prologues, 0 bare `ff 25`)
 really is the DLL the session loads — and the launch changes shape:
 
-| payload in `${sysx64}` | links | game spawns | fault |
+| payload in `${sysx64}` | links | game spawns | outcome |
 |---|---|---|---|
-| none (baseline) | – | yes | `…99C` |
-| bundle's own `kernel32.dll` | 1 | yes | `…99C` |
-| build-tree `kernel32.dll` (hotpatch) | 1 | **no** | – |
-| build-tree `kernel32.dll` + matching `kernelbase.dll` | 2 | **no** | – |
+| none (baseline) | – | yes | `#UD` at `…99C` |
+| bundle's own `kernel32.dll` | 1 | yes | `#UD` at `…99C` |
+| build-tree `kernel32.dll` (795 hotpatch prologues) | 1 | **no** | launch never authorised |
+| build-tree `kernel32.dll` + matching `kernelbase.dll` (hotpatch) | 2 | **no** | launch never authorised |
+| build-tree `kernel32.dll` with its prologues **removed again** (+ matching `kernelbase.dll`) | 2 | yes | **no `#UD` at all**; still running at 60 s, `P=0.00`, no window |
+
+The fourth row is the control that makes the third meaningful: `tools/local/pe-unthunk.py`
+restores a builtin's bare thunks, and doing that to the build-tree DLL leaves a file that
+differs from the bundle's own `kernel32.dll` by **11 bytes** (timestamps and one export-table
+field) — i.e. the prologue rewrite is the only functional variable between "launch never
+happens" and "launch happens".
+
+The fifth row is a genuine surprise and is **not** a boot: the game process stays alive with
+no `.text` protect-to-exec (`prot-img … 639b000` count 0), no fault, and no window, at
+`P=0.00`. It is idle, not running. So this DLL set changes *timing* early enough that the
+protector never reaches the code that faults, which makes it useless as a probe of the
+decrypt gate but does show the process is extremely sensitive to the exact builtin set.
 
 `dockhost.exe` starts, `[madeira-dock] starting the host` is logged, and then the session
 ends with `status=0 games=0` instead of authorising the launch. The console shows no
