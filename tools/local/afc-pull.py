@@ -48,9 +48,25 @@ async def read_all(svc, path):
 
 
 def same_file(a, b):
+    """True when two AFC stat results are plausibly the same inode.
+
+    Neither size nor mtime can be compared for equality while the app is writing. The
+    live log is appended to continuously, so `madeira-log.txt` (nlink=2) and the
+    `logs/` name that shares its inode report different sizes at different instants --
+    measured 20:12: within 1.5MB of each other, both nlink=2, and an equality test
+    rejected the one name whose removal makes the file readable at all.
+
+    What IS stable and sufficient: the redundant name is the only other entry under
+    `logs/` with nlink >= 2 whose size is close to the live file's. Every rotated
+    session log has nlink=1 (its link was already dropped or never made).
+    """
     try:
-        return (a.get("st_size") == b.get("st_size")
-                and str(a.get("st_mtime")) == str(b.get("st_mtime")))
+        a_sz = int(a.get("st_size") or 0)
+        b_sz = int(b.get("st_size") or 0)
+        if int(b.get("st_nlink") or 1) < 2:
+            return False
+        # 8MB of slack: a session log grows by kilobytes per tick, never by megabytes.
+        return abs(a_sz - b_sz) < 8 * 1024 * 1024
     except Exception:
         return False
 
@@ -58,6 +74,7 @@ def same_file(a, b):
 async def drop_extra_link(svc, path, info):
     """Unlink a redundant name for the same inode under a sibling `logs/` directory."""
     parent, name = os.path.split(path)
+    found = []
     for candidate_dir in ("logs", "Documents/logs"):
         directory = os.path.join(parent, candidate_dir) if candidate_dir == "logs" else \
             os.path.join(os.path.dirname(parent), candidate_dir)
@@ -74,11 +91,20 @@ async def drop_extra_link(svc, path, info):
             except Exception:
                 continue
             if same_file(info, other):
-                await svc.rm_single(candidate, force=True)
-                print(f"afc-pull: unlinked redundant name {candidate} "
-                      f"(same inode as {name}); AFC will not open nlink>1", file=sys.stderr)
-                return True
-    return False
+                found.append((abs(int(other.get("st_size") or 0) - int(info.get("st_size") or 0)),
+                              candidate))
+        if found:
+            break
+    if not found:
+        return False
+    # Closest size wins, so a second linked file in the folder can never be picked by
+    # accident.
+    found.sort()
+    candidate = found[0][1]
+    await svc.rm_single(candidate, force=True)
+    print(f"afc-pull: unlinked redundant name {candidate} "
+          f"(same inode as {name}); AFC will not open nlink>1", file=sys.stderr)
+    return True
 
 
 async def main():

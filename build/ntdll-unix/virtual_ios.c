@@ -2221,6 +2221,40 @@ static unsigned ios_jit_scan_nonexec( const char *label, const char *who,
     return bad;
 }
 
+/* ml2036: the stub census runs on a timer owned by this file, and the timer is started
+ * from code that certainly runs in the component.
+ *
+ * A __attribute__((constructor)) does NOT work here. Measured 20:01: the constructor was
+ * in the deployed dylib and the same build's `[text-sync]` printed eight times, so the
+ * library and its code were live, yet zero census lines appeared -- a pthread_create
+ * issued from inside dyld's dlopen of a component, before Wine has started, is not a
+ * reliable place to start a thread on this platform. So arm it lazily instead: the first
+ * function call into this file that we know happens (an image being registered in the
+ * JIT pool) spawns the sampler, which then owns its cadence from there on. */
+static pthread_once_t ios_stub_census_once = PTHREAD_ONCE_INIT;
+static void *ios_stub_census_thread_start( void * );
+static void ios_stub_census_once_init( void )
+{
+    pthread_t t;
+    int rc;
+    if (getenv( "MADEIRA_STUB_CENSUS_OFF" ))
+    {
+        dprintf( 2, "[stub-census] ml2037 disabled by MADEIRA_STUB_CENSUS_OFF\n" );
+        return;
+    }
+    rc = pthread_create( &t, NULL, ios_stub_census_thread_start, NULL );    if (rc)
+    {
+        dprintf( 2, "[stub-census] ml2037 pthread_create FAILED rc=%d -- no samples this run\n", rc );
+        return;
+    }
+    pthread_detach( t );
+    dprintf( 2, "[stub-census] ml2037 sampler started (250ms, component-owned)\n" );
+}
+static void ios_stub_census_ensure( void )
+{
+    pthread_once( &ios_stub_census_once, ios_stub_census_once_init );
+}
+
 static void ios_jit_verify_text_exec( const char *who, const void *rx_dest, size_t image_size )
 {
     static unsigned verified;
@@ -18605,6 +18639,19 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
     else if ((unix_prot & PROT_EXEC) && ios_guest_anon_rwx_is_host_data( base, size ))
     {
         static unsigned long grd_n;
+        /* ml2042: remember the guest's own RWX allocation, so the census can watch it
+         * whether or not it ends up in the alias table. Measured 20:39: the protector
+         * allocated its 16MB arena ([guest-rwx] printed twice) but [arena-progress]
+         * printed nothing, because that probe scans ios_jit_anon_aliases and this
+         * mapping was not aliased -- so the one run that could have shown the arena's
+         * contents showed no arena at all. Hook the allocation itself. */
+        if (size >= 0x400000)
+        {
+            extern volatile uintptr_t ios_census_arena_va;
+            extern volatile size_t ios_census_arena_sz;
+            ios_census_arena_va = (uintptr_t)base;
+            ios_census_arena_sz = size;
+        }
         if (++grd_n <= 24 && !ios_in_mach_exc)
             dprintf( 2, "[guest-rwx] #%lu %p+0x%lx prot=%c%c%c — anonymous guest memory, "
                         "EXEC is FEX bookkeeping; applying %c%c- instead\n",
@@ -19932,6 +19979,10 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                     ios_pe_module_name( image_base, image_size ), (char *)jit_rx_base + offset,
                     (unsigned long)image_used, (unsigned long)image_budget,
                     (unsigned long)tramp_prealloc, image_in_low ? " [pool-low] region C" : "");
+
+            /* ml2036: arm the stub census sampler from here -- this runs for every image,
+             * early, in the component. See ios_stub_census_ensure. */
+            ios_stub_census_ensure();
 
             ios_jit_verify_text_exec( ios_pe_module_name( image_base, image_size ),
                                       (char *)jit_rx_base + offset, image_size );
@@ -36485,6 +36536,11 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
                             static unsigned text_sync_n;
                             size_t lo = overlap_start, hi = overlap_end;
                             size_t i, differ = 0;
+                            /* ml2037: arm the census sampler here too. This call site is
+                             * proven to execute in the component (its own output is in the
+                             * log), so it is the reliable trigger even if the image path
+                             * somehow is not. */
+                            ios_stub_census_ensure();
                             if (hi > lo && text_sync_n < 40)
                             {
                                 const unsigned char *g = (const unsigned char *)base + lo;
@@ -36502,7 +36558,7 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
                                 if (differ)
                                 {
                                     text_sync_n++;
-                                    dprintf( 2, "[text-sync] #%u %p region=0x%lx off=0x%lx: .text differ=%lu of %lu "
+                                    dprintf( 2, "[text-sync] ml2039 #%u %p region=0x%lx off=0x%lx: .text differ=%lu of %lu "
                                              "bytes at protect-to-exec (guest view has edits the pool copy "
                                              "does NOT get) | first offs:", text_sync_n, base,
                                              (unsigned long)size, (unsigned long)off,
@@ -39298,11 +39354,17 @@ static struct {
     uint32_t *rva;
     unsigned int n;
     int      last_img, last_pool;
+    int      waiting;
     int      last_arena;
     unsigned int last_arena_hit;
     unsigned int tick;
     unsigned int lines;
 } census;
+
+/* ml2042: the guest's own large RWX allocation, recorded where it is GRANTED rather than
+ * inferred from the alias table. The census reads it; the guest-write path sets it. */
+volatile uintptr_t ios_census_arena_va;
+volatile size_t    ios_census_arena_sz;
 
 void ios_stub_census( double uptime_s )
 {
@@ -39318,8 +39380,6 @@ void ios_stub_census( double uptime_s )
         unsigned int dir, magic;
         unsigned char *tab, *b;
 
-        census.armed = -1;
-
         /* The game is by far the largest image in the table (188 MB; the next is
          * 9.9 MB), and it is the only one this question is about. Taking the
          * largest avoids guessing which PEB this thread owns. */
@@ -39329,23 +39389,51 @@ void ios_stub_census( double uptime_s )
             size_t sz = ios_jit_mappings[mi].size;
             if (pe && sz >= 0x2000000 && (best < 0 || sz > ios_jit_mappings[best].size)) best = mi;
         }
-        if (best < 0) return;   /* no big image yet: try again next tick */
+
+        /* ml2035: DO NOT DISARM BEFORE THE IMAGE EXISTS.
+         *
+         * This used to set census.armed = -1 here, at the top, and only set it back
+         * to 1 on success. Measured cost of that (run 19:41): the [xp] sampler's
+         * first tick is at t~0.1s, the game's image is registered at t=4.84s, so
+         * every early tick took the `best < 0` path and the census disabled itself
+         * for the whole session -- printing nothing, twice in a row, which reads
+         * exactly like "the protector decrypted everything".
+         *
+         * So "no image yet" is a WAIT, not a failure. Only a parse we attempted and
+         * could not complete disarms, and even that now says so out loud. */
+        if (best < 0)
+        {
+            if (!census.waiting)
+            {
+                census.waiting = 1;
+                dprintf( 2, "[stub-census] waiting for a >=32MB image at t=%.1fs "
+                         "(iojit mappings=%d) -- nothing to count yet, will keep trying\n",
+                         uptime_s, ios_jit_mapping_count );
+            }
+            return;
+        }
+        census.armed = -1;   /* from here on, a failure to parse is final */
 
         census.pe   = (uintptr_t)ios_jit_mappings[best].pe_base;
         census.sz   = ios_jit_mappings[best].size;
         census.pool = (uintptr_t)ios_jit_mappings[best].jit_base;
 
-        if (!ios_stub_census_read( census.pe, dos, sizeof(dos) ) || dos[0] != 'M' || dos[1] != 'Z') return;
+        if (!ios_stub_census_read( census.pe, dos, sizeof(dos) ) || dos[0] != 'M' || dos[1] != 'Z')
+        { dprintf( 2, "[stub-census] GAVE UP: %p is not readable as a DOS header\n", (void *)census.pe ); return; }
         memcpy( &e_lfanew, dos + 0x3c, 4 );
-        if (e_lfanew > 0x1000 || !ios_stub_census_read( census.pe + e_lfanew, coff, sizeof(coff) )) return;
-        if (coff[0] != 'P' || coff[1] != 'E' || coff[2] || coff[3]) return;
-        if (!ios_stub_census_read( census.pe + e_lfanew + 24, opt, sizeof(opt) )) return;
+        if (e_lfanew > 0x1000 || !ios_stub_census_read( census.pe + e_lfanew, coff, sizeof(coff) ))
+        { dprintf( 2, "[stub-census] GAVE UP: COFF header unreadable at e_lfanew=0x%x\n", e_lfanew ); return; }
+        if (coff[0] != 'P' || coff[1] != 'E' || coff[2] || coff[3])
+        { dprintf( 2, "[stub-census] GAVE UP: no PE signature at %p+0x%x\n", (void *)census.pe, e_lfanew ); return; }
+        if (!ios_stub_census_read( census.pe + e_lfanew + 24, opt, sizeof(opt) ))
+        { dprintf( 2, "[stub-census] GAVE UP: optional header unreadable\n" ); return; }
         memcpy( &magic, opt, 2 );
         dir = (magic == 0x20b) ? 112 : (magic == 0x10b ? 96 : 0);
-        if (!dir) return;
+        if (!dir) { dprintf( 2, "[stub-census] GAVE UP: optional magic %#x\n", magic ); return; }
         memcpy( &exc_rva,  opt + dir + 3 * 8,     4 );
         memcpy( &exc_size, opt + dir + 3 * 8 + 4, 4 );
-        if (!exc_rva || exc_size < 12 || exc_size > 0x4000000) return;
+        if (!exc_rva || exc_size < 12 || exc_size > 0x4000000)
+        { dprintf( 2, "[stub-census] GAVE UP: exception directory rva=%#x size=%u\n", exc_rva, exc_size ); return; }
 
         tab = malloc( exc_size );
         if (!tab) return;
@@ -39404,6 +39492,13 @@ void ios_stub_census( double uptime_s )
      * page per MB, so a 16MB arena costs 16 pages per tick, not 16MB. */
     {
         int ai, big = -1;
+        /* ml2042: prefer the guest's own recorded RWX arena over the alias table. */
+        extern volatile uintptr_t ios_census_arena_va;
+        extern volatile size_t ios_census_arena_sz;
+        uintptr_t hint_va = ios_census_arena_va;
+        size_t hint_sz = ios_census_arena_sz;
+        uintptr_t a0_hint = 0;
+        size_t asz_hint = 0;
         for (ai = 0; ai < ios_jit_anon_alias_count; ai++)
         {
             if (!ios_jit_anon_aliases[ai].user_va) continue;
@@ -39412,10 +39507,17 @@ void ios_stub_census( double uptime_s )
                            (ios_jit_anon_aliases[big].user_va_end - ios_jit_anon_aliases[big].user_va))
                 big = ai;
         }
-        if (big >= 0)
+        if (hint_va && hint_sz >= 0x400000)
         {
-            uintptr_t a0 = ios_jit_anon_aliases[big].user_va;
-            size_t asz = ios_jit_anon_aliases[big].user_va_end - a0;
+            big = -2;   /* sentinel: use the recorded arena */
+            a0_hint = hint_va;
+            asz_hint = hint_sz;
+        }
+        if (big >= 0 || big == -2)
+        {
+            uintptr_t a0 = (big == -2) ? a0_hint : ios_jit_anon_aliases[big].user_va;
+            size_t asz = (big == -2) ? asz_hint
+                                     : ios_jit_anon_aliases[big].user_va_end - ios_jit_anon_aliases[big].user_va;
             unsigned pages = 0, hit = 0;
             size_t so;
             unsigned char *pg = malloc( 0x1000 );
@@ -39443,6 +39545,119 @@ void ios_stub_census( double uptime_s )
                     dprintf( 2, "[arena-progress] t=%.1fs largest anon RWX alias %p+0x%lx | %u of %u sampled "
                              "pages (%u per MB) touched%s\n", uptime_s, (void *)a0, (unsigned long)asz,
                              hit, pages, pages, hit == pages ? "  <== unpack finished" : "" );
+
+                /* ml2041: WHAT is in the arena?
+                 *
+                 * This is the question the whole thread turns on, and until now it has been
+                 * answered by inference. The census proves the image's .text is ciphertext at
+                 * fault time in both copies; the arena proves 12.5MB gets written into a fresh
+                 * RWX mapping right before the fault. If that content is decrypted x86 code,
+                 * then the protector DID decrypt -- into a staging buffer -- and everything
+                 * hinges on the copy-back into .text. If it is still ciphertext, the "decryptor
+                 * never produced plaintext" model holds and the staging theory is wrong.
+                 *
+                 * So read it: 24 bytes at the arena start, the same 24 bytes from the image's
+                 * .text at the same offset, and the share of 0xEA bytes in the first 4KB (a
+                 * ciphertext 4KB is ~1/256 * 4096 = 16 EAs; decrypted code is near zero).
+                 */
+                if (hit == pages && census.pe)
+                {                    unsigned char ab[24], ib[24];
+                    unsigned k, n_ea = 0, ok_a, ok_i;
+                    mach_vm_size_t got = 0;
+                    ok_a = mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)a0, sizeof(ab),
+                                                   (mach_vm_address_t)ab, &got ) == KERN_SUCCESS
+                           && got == sizeof(ab);
+                    if (ok_a)
+                    {
+                        unsigned char pg2[0x1000];
+                        mach_vm_size_t got2 = 0;
+                        if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)a0, 0x1000,
+                                                    (mach_vm_address_t)pg2, &got2 ) == KERN_SUCCESS
+                            && got2 == 0x1000)
+                            for (k = 0; k < 0x1000; k++) if (pg2[k] == 0xea) n_ea++;
+                    }
+                    /* The image's .text base is its section start, not the PE base. 0x1000 is
+                     * the usual first-section RVA and matches what the census watched
+                     * (rva=0x1500 read ciphertext), so compare like with like. */
+                    ok_i = ios_stub_census_read( census.pe + 0x1000, ib, sizeof(ib) );
+                    dprintf( 2, "[arena-content] t=%.1fs arena=%p:", uptime_s, (void *)a0 );
+                    if (ok_a) for (k = 0; k < sizeof(ab); k++) dprintf( 2, " %02x", ab[k] );
+                    else dprintf( 2, " unreadable" );
+                    dprintf( 2, " | image.text@0x1000:" );
+                    if (ok_i) for (k = 0; k < sizeof(ib); k++) dprintf( 2, " %02x", ib[k] );
+                    else dprintf( 2, " unreadable" );
+                    dprintf( 2, " | 0xEA in arena[0,4K)=%u of 4096 (ciphertext ~16, code ~0)"
+                             " | arena==image:%s\n", n_ea,
+                             (ok_a && ok_i && !memcmp( ab, ib, sizeof(ab) )) ? "YES" : "NO" );
+
+                    /* ml2043: IS THE ARENA A COPY OF PART OF THE IMAGE?
+                     *
+                     * Measured 20:46 (ml2042), 16MB arena at 0x16e900000, filled to 16/17
+                     * sampled pages, then the fault: the arena's own bytes are high-entropy
+                     * (80 dd df 44 ...) and 13/4096 of its first page is 0xEA, which is the
+                     * ciphertext signature, not code. So the protector's staging buffer holds
+                     * CIPHERTEXT at the moment it stops. The remaining question is whether it
+                     * is a copy of the image (an in-place section it meant to decrypt and write
+                     * back) or an independent blob.
+                     *
+                     * Answer it by searching the arena for the exact bytes of the stub that
+                     * faults: image+0x537099c = ea 49 f5 8a d5. If that 5-byte needle appears
+                     * in the arena at offset k, the arena is a copy of image[0x537099c - k],
+                     * and the write-back target is known exactly. One 16MB pass, once. */
+                    if (ok_a)
+                    {
+                        static int searched;
+                        static const uint32_t fault_rva = 0x537099c;
+                        if (!searched)
+                        {
+                            unsigned char needle[5];
+                            /* HEAP, not stack. This was a `unsigned char chunk[0x100000]`
+                             * local, and it crashed the app: the census runs on a thread
+                             * whose stack is the iOS pthread default, and a 1MB frame blew
+                             * it in the prologue (log showed ___chkstk_darwin + a Mach
+                             * exception). Same class of mistake as the 130-byte buffer, so:
+                             * no large frame, ever, on this thread. */
+                            unsigned char *chunk = malloc( 0x100000 );
+                            size_t off;
+                            unsigned found = 0;
+                            searched = 1;
+                            if (chunk && ios_stub_census_read( census.pe + fault_rva, needle, 5 ))
+                            {
+                                dprintf( 2, "[arena-needle] stub@%#x = %02x %02x %02x %02x %02x; "
+                                         "scanning %.1fMB arena for it\n", fault_rva,
+                                         needle[0], needle[1], needle[2], needle[3], needle[4],
+                                         (double)asz / 1048576.0 );
+                                for (off = 0; off + 5 <= asz && found < 4; off += 0x100000)
+                                {
+                                    mach_vm_size_t g = 0;
+                                    size_t n = (asz - off < 0x100000) ? asz - off : 0x100000;
+                                    if (mach_vm_read_overwrite( mach_task_self(),
+                                            (mach_vm_address_t)(a0 + off), n,
+                                            (mach_vm_address_t)chunk, &g ) != KERN_SUCCESS || !g)
+                                        continue;
+                                    {
+                                        size_t j;
+                                        for (j = 0; j + 5 <= g; j++)
+                                            if (chunk[j] == needle[0] && !memcmp( chunk + j, needle, 5 ))
+                                            {
+                                                dprintf( 2, "[arena-needle]   FOUND at arena+0x%lx "
+                                                         "-> arena is image[%#lx..] (write-back "
+                                                         "target for the faulting stub)\n",
+                                                         (unsigned long)(off + j),
+                                                         (unsigned long)(fault_rva - (off + j)) );
+                                                found++;
+                                                if (found >= 4) break;
+                                            }
+                                    }
+                                }
+                                if (!found)
+                                    dprintf( 2, "[arena-needle]   NOT FOUND: the arena is not a "
+                                             "copy of the image around the faulting stub\n" );
+                            }
+                            free( chunk );
+                        }
+                    }
+                }
             }
         }
     }
@@ -39457,6 +39672,80 @@ void ios_stub_census( double uptime_s )
              (img != pool_cipher) ? "  <== THE COPIES DISAGREE: the write landed in the guest view "
              "and did not reach the executing pool copy (Madeira dual-map bug, not a protector failure)"
              : (img == 0 ? "  <== every entry decrypted" : "") );
+
+    /* ml2035: the raw bytes at one still-encrypted stub, from both copies.
+     *
+     * Every "it was / it was not decrypted" argument in this project so far has been
+     * about a hex string, so print the hex string. First watched RVA that is still
+     * 0xEA, five bytes from each copy: identical bytes mean nobody wrote it at all;
+     * plaintext in `image=` and 0xEA in `pool=` mean the dual map ate it. */
+    if (img)
+    {
+        unsigned char bi[5], bp[5];
+        unsigned int k, ok_i = 0, ok_p = 0;
+        for (i = 0; i < census.n; i++)
+        {
+            unsigned char a = 0;
+            if (ios_stub_census_read( census.pe + census.rva[i], &a, 1 ) && a == 0xea) break;
+        }
+        if (i < census.n)
+        {
+            ok_i = ios_stub_census_read( census.pe + census.rva[i], bi, 5 );
+            ok_p = census.pool ? ios_stub_census_read( census.pool + census.rva[i], bp, 5 ) : 0;
+            dprintf( 2, "[stub-census]   rva=%#x bytes:", census.rva[i] );
+            if (ok_i) for (k = 0; k < 5; k++) dprintf( 2, " %02x", bi[k] );
+            else dprintf( 2, " image=unreadable" );
+            dprintf( 2, "  | pool:" );
+            if (ok_p) for (k = 0; k < 5; k++) dprintf( 2, " %02x", bp[k] );
+            else dprintf( 2, " unreadable" );
+            dprintf( 2, "%s\n", (ok_i && ok_p && !memcmp( bi, bp, 5 ))
+                     ? "  (IDENTICAL: neither copy was written)" : "" );
+        }
+    }
+}
+
+/* ml2035: the census owns its OWN timer, because the caller it used to depend on is
+ * not the copy that runs.
+ *
+ * Measured, 19:56 run with this exact function deployed: `[text-sync]` printed nine
+ * times (so the component dylib's virtual_ios.o is live) but `[stub-census]` printed
+ * once, ever, in any form -- and its byte-at-a-stub line never appeared. The sampler
+ * is `ios_stub_census()` called from server_ios.c, which is linked into the APP; it
+ * binds to the app's own copy of virtual_ios.o at link time. So rebuilding the
+ * component changed a function the app never calls, and every "the census printed
+ * nothing" conclusion in this thread was measuring the stale build.
+ *
+ * That is the same class of trap as the objcopy'd FEX drop-in: a probe must be owned
+ * by the component it ships in. A detached pthread started from the half's own
+ * constructor is called from the component's code, so it is this build or nothing.
+ *
+ * 250 ms is the cadence the old sampler used, and it is the right one: the decisive
+ * window is t=8.4s (arena mapped) to t=8.7s (fault), and a coarser timer would step
+ * straight over it. */
+static void *ios_stub_census_thread_start( void *arg )
+{
+    struct timespec ts = { 0, 250 * 1000 * 1000 };
+    struct timespec t0, now;
+    double beat = -1.0;
+    (void)arg;
+    clock_gettime( CLOCK_MONOTONIC, &t0 );
+    for (;;)
+    {
+        double up;
+        nanosleep( &ts, NULL );
+        clock_gettime( CLOCK_MONOTONIC, &now );
+        up = (now.tv_sec - t0.tv_sec) + (now.tv_nsec - t0.tv_nsec) / 1e9;
+        /* One beat per second for the first 15s: this proves the sampler is alive at a
+         * glance, instead of inferring it from the absence of census lines. Silence from
+         * a probe is ambiguous; a heartbeat is not. */
+        if (up < 15.0 && (int)(up * 4) % 4 == 0 && (int)(up * 4) / 4 != (int)(beat * 4) / 4)
+            dprintf( 2, "[stub-census] ml2037 beat t=%.1fs\n", up );
+        beat = up;
+        /* Bounded: the game dies at ~9s, and a probe that keeps walking a dead
+         * process's image tables for minutes only costs frames in a live one. */
+        if (up < 120.0) ios_stub_census( up );
+    }
+    return NULL;
 }
 
 #endif /* WINE_IOS */

@@ -803,6 +803,94 @@ times out. Order:
 Not a claim that `full` will then boot the game. It is the precondition for the
 experiment, and it is the first time that experiment can be run at all.
 
+### 4aa. Census v2 answers it directly: the arena holds ciphertext, and nothing ever writes it again
+
+This closes the question §4w left open. Census v2 (`ml2040`+) runs on its own 250 ms
+thread inside the component and samples **both** copies of all 4,538 protected entries,
+plus the guest's 16 MB RWX arena. Raw log, run 20:44:
+
+```
+[stub-census] waiting for a >=32MB image at t=0.3s (iojit mappings=22)
+[stub-census] v2 armed at t=5.3s: image=0x16c340000 pool=0x1267a0000 size=0xb3c0000
+              | 4538 protected entries to watch (expected 4538)
+[stub-census] t=5.3s  of 4538 still 0xEA: image=4538 pool=4538 (pool readable=4538/4538)
+[stub-census] t=16.6s of 4538 still 0xEA: image=4538 pool=4538 (pool readable=4538/4538)
+[stub-census] t=36.3s of 4538 still 0xEA: image=4538 pool=4538 (pool readable=4538/4538)
+[stub-census]   rva=0x1500 bytes: ea 49 f5 8a d5 | pool: ea 49 f5 8a d5
+                (IDENTICAL: neither copy was written)
+```
+
+**1. Nothing is ever written to either copy.** Not at t=5.3 s, not at fault time, not
+30 s after the process is already dead. `image` and `pool` agree at every sample, so
+this is *not* the dual-map loss of §4x — there is simply no write to lose. The
+`[text-sync]` counter is 0 for the same reason: at protect-to-exec the two `.text`
+copies are identical.
+
+**2. The decryptor's output is not plaintext.** The arena's own contents, at the
+moment it is full (`ml2042`, 20:46):
+
+```
+[arena-content] t=74.4s arena=0x16e900000:
+   80 dd df 44 6d 7e 23 35 cc f2 b3 7a eb f6 09 35 c7 9d 19 49 d1 5b 1a 35
+ | image.text@0x1000:
+   48 8d 0d 09 a4 25 07 48 ff 25 6a b4 39 06 cc cc 48 8d 05 e9 ff ff ff c3
+ | 0xEA in arena[0,4K)=13 of 4096 (ciphertext ~16, code ~0)
+ | arena==image:NO
+```
+
+The image's `.text` at `0x1000` is ordinary x86 (`lea rcx,[rip+…]; jmp [rip+…]`) — so
+`.text` is *not* wholesale encrypted, only the protected region is. The arena is
+high-entropy with `13/4096` occurrences of `0xEA`, which is the random-incidence rate
+(4096/256 = 16), not the rate code shows (~0). So the 12.5 MB the protector staged is
+**ciphertext**, and no pass ever turns it into code.
+
+**3. It is not a copy of the image.** `[arena-needle]` searched all 16 MB of the arena
+for the exact bytes of the faulting stub (`stub@0x537099c = ea e9 6b e6 14`):
+`NOT FOUND`. So the arena is an independent blob, not a staging copy of the section
+the protector was about to patch back.
+
+**4. The arena is frozen after the fill.** Every `[arena-content]` sample from t=17.4 s
+to t=87.5 s reports byte-identical contents. There is no second pass, at any point,
+ever.
+
+**5. The fault tracks the END of the fill, not a fixed time.** In the 20:33 run the
+fault was at t=17.05 s with the arena at 17/17 sampled pages; in the 20:46 run the
+fault was at t=16.96 s with 16/17. Read together with the 19:22 run (fault at 15.38 s,
+12.5 MB staged) the sequence is: stage → **call the first protected stub** → `#UD`.
+The stage is the last work the protector does.
+
+So the refined statement, which replaces both "it decrypted nothing, ever" and "it
+decrypted into a staging buffer and we lost the copy-back", is:
+
+> The protector stages ~12.5 MB of ciphertext into a fresh 16 MB RWX mapping and then
+> immediately calls `image+0x537099c`, where the bytes are still `0xEA`. Nothing has
+> ever decrypted that entry, in any copy, and no write to either copy is ever observed.
+
+That makes the open question much narrower than it was: **what is supposed to turn
+`0xEA` into code before that first call, and why does it not run here?** §4e boundary
+applies — the answer has to be a platform-fidelity difference we can name, not
+something that convinces the protector we are Windows.
+
+**Tooling corrections from this run, because they cost several false negatives:**
+
+- `build/ntdll-unix/build.sh` does **not** produce `libntdll_unix.dylib`. It builds the
+  static archive for the app. The dylib is `build/ntdll-unix/build-dylib.sh`. Skipping
+  that step is silent: `build.sh` prints "41 succeeded", `make-native-wcp.sh` signs and
+  packages the **previous** library, and every probe reports the old build's output.
+  Five builds (`ml2035`…`ml2039`) were shipped this way. `tools/local/build-half.sh`
+  now runs both and refuses to package a dylib older than its newest source.
+- A `.wcp` pushed to `Import` installs on the *current* launch but only runs on the
+  *next* one, so `tools/local/dev-run-fh6.sh` counts packages before restarting and
+  restarts twice when there were any.
+- The interpreter lives under `Application Support`, so an unquoted `$PMD3` splits at
+  the space; every in-script log pull failed for six runs while the same command typed
+  by hand worked. Now a function.
+- `afc-pull.py` matched hard links by exact mtime, then by exact size. Both race a log
+  that is being appended to. It now matches the other `nlink>=2` entry in `logs/` by
+  closest size.
+- A 1 MB stack array in the census thread crashed the whole app
+  (`___chkstk_darwin` + Mach exception). Heap only on that thread.
+
 ### 4s. Reproduced, and the fault is RVA-invariant
 
 The 19:07 run (ml2029 still loaded — see below) died the same way, with the image
