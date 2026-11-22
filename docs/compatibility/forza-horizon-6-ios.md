@@ -2132,7 +2132,38 @@ game. The branch rewriter was taken back out of `signal_arm64ec.c`. The on-devic
 `kernel32` is the bundle's bare copy again, and the ntdll component is the build
 that only does the volatile read, not the rewriter. Unix half `ml261-rxmirror`
 (it also copies the NtProtect sync onto the RX data pages) was left enabled; it
-did not change this crash.
+did not change this crash. The phone was later put back on the 795-prologue
+`kernel32` for the runs in §4at; that is the copy it still has.
+
+### 4at. The RW-alias write does not change a fetch that already happened, and at copy time the target is not known yet
+
+Two runs, both with the 795-prologue `kernel32`. The dock dies at
+`ucrtbase+0x90f1c`, `pc=0`, `x16=0`, exit `0xc0000005`. `forzahorizon6.exe` does
+not spawn.
+
+`ml263-rwbl` installed the retarget into the ARM64EC child (the first build only
+installed it for the aarch64 ntdll, so it never ran). The log then shows 19
+ucrtbase sites rewritten. A kernel read of the executable address returns the new
+`bl` (`97eb034b`) and a kernel read of the slot returns ExitToX64
+(`0x11c4cdc44`). The CPU still executes the old `blr`: the link register is
+`ucrtbase+0x90f1c`. Writing the writable alias and invalidating the executable
+address, which is what the x18 patcher does, does not change an instruction the
+CPU has already fetched. 14:12 run.
+
+`ml264-copybl` moved that write to image-copy time, next to the x18 patch, which
+is before the guest can fetch. It patched nothing. `ntdll`, `libarm64ecfex`,
+`ucrtbase`, `kernel32` and `kernelbase` each logged that the exit thunk was not
+stored yet. The slot is filled in `arm64ec_process_init_dispatchers`, from
+xtajit64's `ExitToX64` export, and that runs only after those copies. 14:28 run.
+Same crash.
+
+The next write resolves `ExitToX64` from the export table while xtajit64 itself
+is being copied (it is copied before ucrtbase; the tree's `xtajit64.dll` exports
+it at RVA `0x118c44`) and patches the later images in that same window, ahead of
+the full-image invalidate the copy already does. That code is in
+`ios_jit_retarget_at_copy` and has not been on the phone. The phone is still on
+`ml264-copybl`, the 795-prologue `kernel32`, and the retarget ntdll, so Play
+crashes the dock.
 
 ---
 
@@ -2169,6 +2200,19 @@ and the fault is at `image+0x537099c`.
 ---
 
 ## 6. Next experiments, cheapest first
+
+0. **Finish the exit branch before anything else (§4at).** The dock dies on a
+   795-prologue `kernel32` at `ucrtbase+0x90f1c` and the game never starts, so
+   none of the decrypt measurements below can run. The unpushed code resolves
+   `ExitToX64` at xtajit64's copy and writes the `bl` before the first fetch.
+   Build it with `tools/local/build-half.sh`, launch, and read
+   `[retarget-copy]`. A line that names `ExitToX64` and `patched` above 0 for
+   `ucrtbase` is the test. If the dock still dies at `0x90f1c`, that write
+   window is also not what the CPU fetches. If the dock survives, the next
+   measurement is the ciphertext at `0x537099c`, not another thunk theory.
+   Until that ships, Play crashes the dock: the phone has the prologued
+   `kernel32`. Putting the bundle's bare `kernel32.dll` back on the
+   `kernel32-one.dll` component makes Play safe and gives up the test.
 
 1. **Catch the guest stack at the moment `.text` is unlocked (§4ah).**
    The decrypt question has narrowed to one moment: `prot-img` #45 takes `.text`
