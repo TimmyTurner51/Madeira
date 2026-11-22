@@ -2233,16 +2233,19 @@ and the fault is at `image+0x537099c`.
 
 0. **Finish the exit branch before anything else (§4at).** The dock dies on a
    795-prologue `kernel32` at `ucrtbase+0x90f1c` and the game never starts, so
-   none of the decrypt measurements below can run. The unpushed code resolves
-   `ExitToX64` at xtajit64's copy and writes the `bl` before the first fetch.
-   Build it with `tools/local/build-half.sh`, launch, and read
-   `[retarget-copy]`. A line that names `ExitToX64` and `patched` above 0 for
-   `ucrtbase` is the test. If the dock still dies at `0x90f1c`, that write
-   window is also not what the CPU fetches. If the dock survives, the next
-   measurement is the ciphertext at `0x537099c`, not another thunk theory.
-   Until that ships, Play crashes the dock: the phone has the prologued
-   `kernel32`. Putting the bundle's bare `kernel32.dll` back on the
-   `kernel32-one.dll` component makes Play safe and gives up the test.
+   none of the decrypt measurements below can run. The package is already
+   built: `dist/ml265-exitexport-native.wcp`. It is not on the phone. Push that
+   file (do not rebuild the app). `[retarget-copy]` should show `ExitToX64`,
+   `ucrtbase` `patched` above 0, `icall patched` above 0, and `constant calls
+   patched` near 181. The icall target is `arm64x_check_call`, matched by
+   `lsr x16, x11, #39` / `cbnz x16` after the x18 patcher has already replaced
+   the following load. If the dock still dies at `0x90f1c`, that write window
+   is also not what the CPU fetches. If the branch runs, `x9` on the last crash
+   was `kernel32+0x35a78` (`ff 25`, not the fast-forward sequence), so
+   `ExitToX64` falls into the emulator; the ciphertext at `0x537099c` is the
+   measurement only after the dock survives. Until that ships, Play crashes the
+   dock. Putting the bundle's bare `kernel32.dll` back on the `kernel32-one.dll`
+   component makes Play safe and gives up the test.
 
 1. **Catch the guest stack at the moment `.text` is unlocked (§4ah).**
    The decrypt question has narrowed to one moment: `prot-img` #45 takes `.text`
