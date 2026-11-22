@@ -592,6 +592,39 @@ The 5 remaining unhandled exceptions are unrelated addresses
 (`0x111f59bfc` `addr=0x8` twice, `0x198e1ff94` `addr=0x0` twice — the known wild
 pointer from 4b — and `0x1106c59ac` `type=6`).
 
+### 4r. The next probe: count the whole protected set, not one address
+
+§4q leaves one question, and it is not answerable from the faulting address:
+**is `image+0x537099c` the only protected entry still holding its ciphertext, or
+is the whole set?**
+
+* All (or nearly all) still `0xEA` → the protector's decrypt pass never ran, and
+  the game dies on the first protected call it makes. The search moves to why
+  the pass does not run under Wine.
+* Only that one still `0xEA` → the pass ran and missed this entry, and the
+  question becomes which call was made and why it lands on an encrypted stub.
+
+`[stub-census]` answers it by walking the image's own `.pdata` at run time and
+counting function entries whose first byte is still `0xEA` (4,538 at rest, which
+`tools/pe/protected-stubs.py` computes offline — an agreeing count is the
+probe's self-check). It rides the `[xp]` tick for six samples per session, so the
+log shows whether the count *moves*, and it only reads, through
+`mach_vm_read_overwrite`.
+
+Two copies exist because the two halves deploy differently:
+
+| where | ships as | state |
+|---|---|---|
+| `build/ntdll-unix/virtual_ios.c` | `dist/ml2030-stubcensus-native.wcp` | pushed and verified on device by read-back (sha256 `2a82f32f…`) |
+| `wine/dlls/ntdll/exception.c` (`7e73ce77`) | next IPA build | built, not deployed |
+
+The PE copy also reports the vectored-handler chain depth and each handler's
+answer for `#UD`; the existing `[veh]` probe is gated to
+`STATUS_ACCESS_VIOLATION`, so "Unhandled illegal instruction … starting
+debugger" could not distinguish *no handler registered* from *handlers
+declined*. A Wine `.wcp` cannot replace `ntdll.dll` (see `docs/COMPONENTS.md`),
+which is why that half of the probe waits for an IPA.
+
 ### 4q. The session fix exposes the original bug cleanly: 0xC000001D at t+16.6 s
 
 With the session now held open, the game's own end is unambiguous in the log:

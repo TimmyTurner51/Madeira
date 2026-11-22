@@ -3175,6 +3175,13 @@ static void ios_xprobe_main( void )
                           (pe.t_draw - ppe.t_draw) * qf, (pe.t_cmt - ppe.t_cmt) * qf, (pe.t_pool - ppe.t_pool) * qf,
                           (long long)(pe.ecl_calls - ppe.ecl_calls), (pe.t_ecl_caller - ppe.t_ecl_caller) * qf );
             wine_log_write( "%s", line );
+#ifdef WINE_IOS
+            {   /* iOS-Madeira ml2030: [stub-census] rides the same 250 ms tick; it prints at
+                 * most six samples per session (see virtual_ios.c). */
+                extern void ios_stub_census( double uptime_s );
+                ios_stub_census( XP_MS( now - t_start ) / 1000.0 );
+            }
+#endif
             /* threads: roles always, then the busiest; role + Windows TID : P ms / E ms : P GHz / E GHz : M instructions */
             {
                 int printed[1024] = {0}, shown = 0;

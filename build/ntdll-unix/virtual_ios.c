@@ -39167,3 +39167,122 @@ NTSTATUS WINAPI NtWow64IsProcessorFeaturePresent( UINT feature )
 }
 
 #endif  /* _WIN64 */
+
+#ifdef WINE_IOS
+/* iOS-Madeira ml2030: [stub-census] -- does the protector ever decrypt anything?
+ *
+ * ml2029 gave us one measured fact and one open question. The fact: when
+ * forzahorizon6.exe died on STATUS_ILLEGAL_INSTRUCTION at image+0x537099c, the
+ * bytes there were still `ea e9 6b e6 14` -- byte-identical to the file -- both
+ * before the fault ([rva-probe], twice) and at it ([guest-code], read from the
+ * pool copy the emulator was actually running).
+ *
+ * The question: is that ONE missed entry, or is the whole set still encrypted?
+ * tools/pe/protected-stubs.py says the image has 4,538 function entries
+ * beginning with 0xEA (a far jump, invalid in 64-bit mode: it cannot be
+ * executing its own file bytes). If, 16 seconds in, essentially all 4,538 are
+ * still 0xEA, the protector's decrypt pass never ran and the game dies on the
+ * first protected call it makes. If only a handful are, the pass ran and missed
+ * the one that matters. Those are different bugs with different fixes, and no
+ * single address can tell them apart.
+ *
+ * So count the whole set, in the image itself: walk .pdata, and for every
+ * RUNTIME_FUNCTION entry read the first byte at BeginAddress. No table to ship,
+ * no game-specific data in the unix half -- the image is the index, and the
+ * census reports itself (4,538 at rest) so a misparse is visible instead of
+ * silent. Printed from the [xp] heartbeat for a handful of samples per session.
+ *
+ * Read-only, via mach_vm_read_overwrite, so it cannot fault the game.
+ */
+static int ios_stub_census_read( uintptr_t addr, void *buf, size_t len )
+{
+    mach_vm_size_t got = 0;
+
+    if (!len) return 0;
+    if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)addr,
+                                (mach_vm_size_t)len, (mach_vm_address_t)buf, &got ) != KERN_SUCCESS)
+        return 0;
+    return got == len;
+}
+
+static void ios_stub_census_image( uintptr_t pe, size_t sz, double uptime_s )
+{
+    unsigned char dos[0x40], coff[24], opt[130];
+    uint32_t e_lfanew = 0, exc_rva = 0, exc_size = 0;
+    unsigned int dir, magic, i;
+    unsigned long long n = 0, cipher = 0, plain = 0, unread = 0;
+    unsigned long long first[8];
+    unsigned int nfirst = 0;
+    unsigned char *tab, *b;
+
+    if (sz < 0x1000 || !ios_stub_census_read( pe, dos, sizeof(dos) )) return;
+    if (dos[0] != 'M' || dos[1] != 'Z') return;
+    memcpy( &e_lfanew, dos + 0x3c, 4 );
+    if (e_lfanew > 0x1000 || e_lfanew + 24 + sizeof(opt) > sz) return;
+    if (!ios_stub_census_read( pe + e_lfanew, coff, sizeof(coff) )) return;
+    if (coff[0] != 'P' || coff[1] != 'E' || coff[2] || coff[3]) return;
+    if (!ios_stub_census_read( pe + e_lfanew + 24, opt, sizeof(opt) )) return;
+    memcpy( &magic, opt, 2 );
+    dir = (magic == 0x20b) ? 112 : (magic == 0x10b ? 96 : 0);
+    if (!dir || dir + 4 * 8 > sizeof(opt)) return;
+    memcpy( &exc_rva,  opt + dir + 3 * 8,     4 );   /* IMAGE_DIRECTORY_ENTRY_EXCEPTION */
+    memcpy( &exc_size, opt + dir + 3 * 8 + 4, 4 );
+    if (!exc_rva || exc_size < 12 || exc_size > 0x4000000) return;   /* 64 MB cap */
+    if ((size_t)exc_rva + exc_size > sz) return;                     /* not this image */
+
+    tab = malloc( exc_size );
+    if (!tab) return;
+    if (!ios_stub_census_read( pe + exc_rva, tab, exc_size )) { free( tab ); return; }
+
+    for (b = tab; b + 4 <= tab + exc_size; b += 12)
+    {
+        uint32_t rva;
+        unsigned char fb;
+
+        memcpy( &rva, b, 4 );
+        if (!rva || (size_t)rva >= sz) continue;
+        n++;
+        if (!ios_stub_census_read( pe + rva, &fb, 1 )) { unread++; continue; }
+        if (fb == 0xea)
+        {
+            if (nfirst < 8) first[nfirst++] = rva;
+            cipher++;
+        }
+        else plain++;
+    }
+    free( tab );
+
+    /* Only speak for images that are actually protected, or big enough that a
+     * zero would itself be the answer. Every other module stays silent. */
+    if (cipher < 8 && n < 100000) return;
+
+    dprintf( 2, "[stub-census] t=%.1fs image=%p (%lu bytes) .pdata functions=%llu | first byte "
+             "still 0xEA (ciphertext)=%llu  decrypted=%llu  unreadable=%llu | oldest 0xEA rvas:",
+             uptime_s, (void *)pe, (unsigned long)sz, n, cipher, plain, unread );
+    if (!nfirst) dprintf( 2, " none -- every entry decrypted" );
+    for (i = 0; i < nfirst; i++) dprintf( 2, " %#llx", first[i] );
+    dprintf( 2, "\n" );
+}
+
+/* Called from the [xp] sampler. A handful of samples per session, six seconds
+ * apart, so the log shows whether the count MOVES rather than just where it
+ * ended. Cheap: one .pdata walk per protected image per sample. */
+void ios_stub_census( double uptime_s )
+{
+    static double next_t = 4.0;
+    static int samples;
+    int mi;
+
+    if (samples >= 6 || uptime_s < next_t) return;
+    next_t = uptime_s + 6.0;
+    samples++;
+    for (mi = 0; mi < ios_jit_mapping_count; mi++)
+    {
+        uintptr_t pe = (uintptr_t)ios_jit_mappings[mi].pe_base;
+        size_t sz = ios_jit_mappings[mi].size;
+
+        if (!pe || sz < 0x100000) continue;   /* large images only: keeps the walk cheap */
+        ios_stub_census_image( pe, sz, uptime_s );
+    }
+}
+#endif /* WINE_IOS */
