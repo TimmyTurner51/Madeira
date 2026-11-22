@@ -39207,32 +39207,41 @@ static int ios_stub_census_read( uintptr_t addr, void *buf, size_t len )
 
 static void ios_stub_census_image( uintptr_t pe, size_t sz, double uptime_s )
 {
-    unsigned char dos[0x40], coff[24], opt[130];
+    /* 264 bytes of optional header, not 130. The data-directory table is 16
+     * entries x 8 bytes starting at offset 112 (PE32+) or 96 (PE32), so entry 3
+     * -- IMAGE_DIRECTORY_ENTRY_EXCEPTION, the one this probe needs -- lives at
+     * 136..143, past a 130-byte buffer. The first version of this probe read 130
+     * and its own bounds check then returned silently on every image: measured
+     * on device 2026-11-21, not a single line, and the log looked like a negative
+     * result. Hence the reason codes below as well. */
+    unsigned char dos[0x40], coff[24], opt[264];
     uint32_t e_lfanew = 0, exc_rva = 0, exc_size = 0;
     unsigned int dir, magic, i;
     unsigned long long n = 0, cipher = 0, plain = 0, unread = 0;
     unsigned long long first[8];
     unsigned int nfirst = 0;
     unsigned char *tab, *b;
+    const char *why = NULL;
 
-    if (sz < 0x1000 || !ios_stub_census_read( pe, dos, sizeof(dos) )) return;
+    if (sz < 0x1000) return;                       /* caller filtered; not an image */
+    if (!ios_stub_census_read( pe, dos, sizeof(dos) )) return;
     if (dos[0] != 'M' || dos[1] != 'Z') return;
     memcpy( &e_lfanew, dos + 0x3c, 4 );
-    if (e_lfanew > 0x1000 || e_lfanew + 24 + sizeof(opt) > sz) return;
-    if (!ios_stub_census_read( pe + e_lfanew, coff, sizeof(coff) )) return;
-    if (coff[0] != 'P' || coff[1] != 'E' || coff[2] || coff[3]) return;
-    if (!ios_stub_census_read( pe + e_lfanew + 24, opt, sizeof(opt) )) return;
+    if (e_lfanew > 0x1000 || e_lfanew + 24 + sizeof(opt) > sz) { why = "no-dos-header"; goto report; }
+    if (!ios_stub_census_read( pe + e_lfanew, coff, sizeof(coff) )) { why = "unreadable-coff"; goto report; }
+    if (coff[0] != 'P' || coff[1] != 'E' || coff[2] || coff[3]) { why = "not-pe32"; goto report; }
+    if (!ios_stub_census_read( pe + e_lfanew + 24, opt, sizeof(opt) )) { why = "unreadable-opt"; goto report; }
     memcpy( &magic, opt, 2 );
     dir = (magic == 0x20b) ? 112 : (magic == 0x10b ? 96 : 0);
-    if (!dir || dir + 4 * 8 > sizeof(opt)) return;
+    if (!dir) { why = "bad-magic"; goto report; }
     memcpy( &exc_rva,  opt + dir + 3 * 8,     4 );   /* IMAGE_DIRECTORY_ENTRY_EXCEPTION */
     memcpy( &exc_size, opt + dir + 3 * 8 + 4, 4 );
-    if (!exc_rva || exc_size < 12 || exc_size > 0x4000000) return;   /* 64 MB cap */
-    if ((size_t)exc_rva + exc_size > sz) return;                     /* not this image */
+    if (!exc_rva || exc_size < 12 || exc_size > 0x4000000) { why = "no-pdata"; goto report; }
+    if ((size_t)exc_rva + exc_size > sz) { why = "pdata-outside-image"; goto report; }
 
     tab = malloc( exc_size );
-    if (!tab) return;
-    if (!ios_stub_census_read( pe + exc_rva, tab, exc_size )) { free( tab ); return; }
+    if (!tab) { why = "nodata"; goto report; }
+    if (!ios_stub_census_read( pe + exc_rva, tab, exc_size )) { free( tab ); why = "pdata-unreadable"; goto report; }
 
     for (b = tab; b + 4 <= tab + exc_size; b += 12)
     {
@@ -39252,14 +39261,16 @@ static void ios_stub_census_image( uintptr_t pe, size_t sz, double uptime_s )
     }
     free( tab );
 
+report:
     /* Only speak for images that are actually protected, or big enough that a
      * zero would itself be the answer. Every other module stays silent. */
-    if (cipher < 8 && n < 100000) return;
+    if (!why && cipher < 8 && n < 100000) return;
 
     dprintf( 2, "[stub-census] t=%.1fs image=%p (%lu bytes) .pdata functions=%llu | first byte "
              "still 0xEA (ciphertext)=%llu  decrypted=%llu  unreadable=%llu | oldest 0xEA rvas:",
              uptime_s, (void *)pe, (unsigned long)sz, n, cipher, plain, unread );
-    if (!nfirst) dprintf( 2, " none -- every entry decrypted" );
+    if (why) dprintf( 2, " %s", why );
+    else if (!nfirst) dprintf( 2, " none -- every entry decrypted" );
     for (i = 0; i < nfirst; i++) dprintf( 2, " %#llx", first[i] );
     dprintf( 2, "\n" );
 }
@@ -39271,7 +39282,7 @@ void ios_stub_census( double uptime_s )
 {
     static double next_t = 4.0;
     static int samples;
-    int mi;
+    int mi, images = 0;
 
     if (samples >= 6 || uptime_s < next_t) return;
     next_t = uptime_s + 6.0;
@@ -39282,7 +39293,14 @@ void ios_stub_census( double uptime_s )
         size_t sz = ios_jit_mappings[mi].size;
 
         if (!pe || sz < 0x100000) continue;   /* large images only: keeps the walk cheap */
+        images++;
         ios_stub_census_image( pe, sz, uptime_s );
     }
+    /* Zero images is a fact about the table, not a quiet run: say so, because the
+     * first version of this probe was silent for its own bug and that read exactly
+     * like "the census found nothing" (device run 2026-11-21, ml2030). */
+    if (!images)
+        dprintf( 2, "[stub-census] t=%.1fs no image >=1MB in ios_jit_mappings "
+                 "(count=%d) -- nothing to count\n", uptime_s, ios_jit_mapping_count );
 }
 #endif /* WINE_IOS */

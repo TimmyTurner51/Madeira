@@ -592,6 +592,72 @@ The 5 remaining unhandled exceptions are unrelated addresses
 (`0x111f59bfc` `addr=0x8` twice, `0x198e1ff94` `addr=0x0` twice — the known wild
 pointer from 4b — and `0x1106c59ac` `type=6`).
 
+### 4u. The census was silent for its OWN bug: a 130-byte header read
+
+The 19:18 run (now with `ml2030` actually loaded — confirmed by the loader line,
+and this time the import ordering was right) still printed no `[stub-census]`
+line, while `[xp]` and `[jit-pool]` lines flowed normally.
+
+The dylib on the device contained the probe (format string and `_ios_stub_census`
+present, sha verified by read-back), so this was not a deployment miss. It was my
+own bounds check:
+
+```c
+unsigned char opt[130];
+...
+dir = (magic == 0x20b) ? 112 : 96;      /* data-directory table starts here */
+if (!dir || dir + 4 * 8 > sizeof(opt)) return;   /* 144 > 130 -> always return */
+```
+
+The PE32+ data-directory table is 16 entries of 8 bytes starting at optional-header
+offset 112, so `IMAGE_DIRECTORY_ENTRY_EXCEPTION` (index 3) lives at 136..143 — past a
+130-byte buffer. **Every image took the return, silently, on every sample.** Measured
+offline on the real image: the table needs 240 bytes.
+
+Two fixes, both about the same lesson:
+
+1. read 264 bytes of optional header;
+2. **a probe that can be silent is not a probe.** Every early return now carries a
+   reason code (`no-pdata`, `pdata-outside-image`, `unreadable-opt`, …) and the
+   sampler prints `no image >=1MB in ios_jit_mappings (count=N)` when the table
+   yields nothing. Zero samples is now a statement, not an absence.
+
+`tools/pe/check-stub-census.py` is the offline guard: it runs the same walk from the
+same field offsets against a real image and compares with
+`tools/pe/protected-stubs.py`. It found a second bug immediately — the offline walk
+treated RVA as a file offset, but `.pdata` lives at RVA `0xac00000` and file offset
+`0xa7c4600`, so it reported `pdata-outside-image` on a perfectly good image. With the
+section table applied, it reproduces the independent enumerator exactly:
+
+```
+.pdata functions : 414805
+0xEA entries     : 4538
+protected-stubs  : 4538 stubs
+OK: counts match the independent enumerator
+```
+
+(The device-side C code reads the *mapped* image, where RVA and address offset are
+the same number, so no translation is needed there — the mistake was only possible in
+the offline model, which is exactly why the model needed the check.)
+
+### 4v. Iteration win: a dylib change is one push, effective next launch
+
+The two-launch cost seen in §4s was an artefact of deploying through the `Import`
+inbox. A component's files are loaded from
+`Documents/Components/<id>/files/libntdll_unix.dylib`, and AFC can write that path
+directly, so replacing the half is now:
+
+```
+codesign -f -s "<dev identity>" /tmp/slot/libntdll_unix.dylib   # identifier + team
+pymobiledevice3 apps push ... <component>/files/libntdll_unix.dylib
+afc-pull.py <same path> /tmp/readback                          # sha256 must match
+```
+
+Measured this turn: 3.7 s for push + read-back, and the change applies on the *next*
+launch (no install pass). Keep the file name `libntdll_unix.dylib` when signing —
+`codesign` derives the identifier from it, and the previous slot's identifier is
+`libntdll_unix`.
+
 ### 4s. Reproduced, and the fault is RVA-invariant
 
 The 19:07 run (ml2029 still loaded — see below) died the same way, with the image
