@@ -35546,51 +35546,6 @@ NTSTATUS WINAPI NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *si
             dprintf(2, "[bigfree] #%u addr=%p size=0x%lx type=0x%x view=%p viewsize=0x%lx\n",
                     freebig_n, addr, (unsigned long)size, (unsigned)type,
                     fv ? fv->base : NULL, fv ? (unsigned long)fv->size : 0ul);
-
-#ifdef WINE_IOS
-            /* iOS-Madeira ml2033: [arena-census] -- what was ever unpacked into it?
-             *
-             * Every launch of Forza Horizon 6 allocates exactly two arenas of
-             * 0x1010000 (16 MB + one 64 KB page) and frees them ~300 ms later
-             * (measured: reserve #2/#3 at t=0.83 s, free #14/#15 at t=1.14 s).
-             * That shape is an unpacker's, and the later failure is that the game
-             * calls protected code that was never decrypted. The cheapest question
-             * left is whether anything was ever written into those arenas: an
-             * unpacker that ran leaves bytes, one that never ran leaves zeros.
-             *
-             * Sampled HERE, at the free, because that is the only moment the region
-             * is both still mapped and guaranteed complete -- sampling on a timer
-             * would race the 300 ms window. Read-only, and at most four arenas. */
-            if (fv && fv->size == 0x1010000)
-            {
-                static int arena_n;
-                unsigned char *buf = malloc( 0x100000 );
-                unsigned long long nz = 0, pages_nz = 0, off, j;
-
-                if (arena_n < 4) arena_n++;
-                if (buf && arena_n <= 4)
-                {
-                    for (off = 0; off + 0x100000 <= fv->size; off += 0x100000)
-                    {
-                        mach_vm_size_t got = 0;
-                        if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(uintptr_t)fv->base + off,
-                                0x100000, (mach_vm_address_t)buf, &got ) != KERN_SUCCESS || got != 0x100000)
-                            break;
-                        for (j = 0; j < 0x100000; j++) if (buf[j]) nz++;
-                        for (j = 0; j < 0x100000; j += 0x1000)
-                        {
-                            unsigned long long k;
-                            for (k = 0; k < 0x1000; k++) if (buf[j + k]) { pages_nz++; break; }
-                        }
-                    }
-                }
-                if (buf) free( buf );
-                dprintf( 2, "[arena-census] #%d arena=%p size=0x%lx | nonzero bytes=%llu in %llu of %lu "
-                         "pages%s\n", arena_n, fv->base, (unsigned long)fv->size, nz, pages_nz,
-                         (unsigned long)(fv->size / 0x1000),
-                         nz ? "" : "  <== ALL ZERO at free: nothing was ever unpacked into it" );
-            }
-#endif
         }
     }
 
@@ -36507,6 +36462,56 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
                         /* Copy only the parts OUTSIDE .text */
                         size_t overlap_start = text_abs_start > rgn_start ? text_abs_start - rgn_start : 0;
                         size_t overlap_end   = text_abs_end   < rgn_end   ? text_abs_end   - rgn_start : size;
+
+                        /* iOS-Madeira ml2034: [text-sync] -- measure the gap that this skip leaves.
+                         *
+                         * A PE image's JIT pool copy is a COPY, not an alias (contrast the anon
+                         * RWX path, which vm_remaps the same physical pages). So the ONLY way a
+                         * guest write to another module's code reaches the copy FEX executes is
+                         * through this sync -- and this branch deliberately does NOT copy .text.
+                         *
+                         * That is fine for us (we patch thunks in the pool and must not clobber
+                         * them with stale PE bytes) but it means a guest that decrypts its own
+                         * code through the guest view has its work thrown away one .text byte at
+                         * a time, then executes the stale ciphertext and takes
+                         * STATUS_ILLEGAL_INSTRUCTION.
+                         *
+                         * Rather than assume that is or is not happening, count it. Before the
+                         * copy, compare the overlapping .text window between the two copies.
+                         * A nonzero count at the moment the caller makes .text executable again
+                         * IS the decryption we are discarding. Capped and rate-limited; the
+                         * count is what matters, not the offsets. */
+                        {
+                            static unsigned text_sync_n;
+                            size_t lo = overlap_start, hi = overlap_end;
+                            size_t i, differ = 0;
+                            if (hi > lo && text_sync_n < 40)
+                            {
+                                const unsigned char *g = (const unsigned char *)base + lo;
+                                const unsigned char *p = (const unsigned char *)jit_rw_dest + lo;
+                                unsigned first[4];
+                                unsigned nfirst = 0;
+                                for (i = 0; i < hi - lo; i++)
+                                {
+                                    if (g[i] != p[i])
+                                    {
+                                        if (nfirst < 4) first[nfirst++] = (unsigned)(lo + i);
+                                        differ++;
+                                    }
+                                }
+                                if (differ)
+                                {
+                                    text_sync_n++;
+                                    dprintf( 2, "[text-sync] #%u %p region=0x%lx off=0x%lx: .text differ=%lu of %lu "
+                                             "bytes at protect-to-exec (guest view has edits the pool copy "
+                                             "does NOT get) | first offs:", text_sync_n, base,
+                                             (unsigned long)size, (unsigned long)off,
+                                             (unsigned long)differ, (unsigned long)(hi - lo) );
+                                    for (i = 0; i < nfirst; i++) dprintf( 2, " 0x%x", first[i] );
+                                    dprintf( 2, "\n" );
+                                }
+                            }
+                        }
 
                         if (overlap_start > 0)
                             memcpy(jit_rw_dest, (char *)base, overlap_start);
@@ -39293,6 +39298,8 @@ static struct {
     uint32_t *rva;
     unsigned int n;
     int      last_img, last_pool;
+    int      last_arena;
+    unsigned int last_arena_hit;
     unsigned int tick;
     unsigned int lines;
 } census;
@@ -39380,6 +39387,63 @@ void ios_stub_census( double uptime_s )
         {
             pool_read++;
             if (p == 0xea) pool_cipher++;
+        }
+    }
+
+    /* ml2034: [arena-progress] -- the OTHER half of this story.
+     *
+     * Measured, 19:22 run: the protector maps a 16MB RWX arena at t=8.10s, then
+     * fills it with 400,000 emulated 32-byte stores (one per Mach round trip,
+     * ~7.7us each) from a single thread. At t=10.35s it was 6.1MB in, at t=13.70s
+     * 12.5MB in, and the fault landed at t=15.38s. So the v1 census sample at
+     * t=10.4s was taken MID-UNPACK -- it could not have seen a post-unpack state.
+     * (v1 sampled every 6s and the run ended first.)
+     *
+     * Track how far the arena has got, so the next run says whether the unpack
+     * ever finished and how long the gap before the fault was. Sparse: one 4KB
+     * page per MB, so a 16MB arena costs 16 pages per tick, not 16MB. */
+    {
+        int ai, big = -1;
+        for (ai = 0; ai < ios_jit_anon_alias_count; ai++)
+        {
+            if (!ios_jit_anon_aliases[ai].user_va) continue;
+            if (ios_jit_anon_aliases[ai].user_va_end - ios_jit_anon_aliases[ai].user_va < 0x400000) continue;
+            if (big < 0 || (ios_jit_anon_aliases[ai].user_va_end - ios_jit_anon_aliases[ai].user_va) >
+                           (ios_jit_anon_aliases[big].user_va_end - ios_jit_anon_aliases[big].user_va))
+                big = ai;
+        }
+        if (big >= 0)
+        {
+            uintptr_t a0 = ios_jit_anon_aliases[big].user_va;
+            size_t asz = ios_jit_anon_aliases[big].user_va_end - a0;
+            unsigned pages = 0, hit = 0;
+            size_t so;
+            unsigned char *pg = malloc( 0x1000 );
+
+            if (pg)
+            {
+                for (so = 0; so < asz && pages < 64; so += 0x100000, pages++)
+                {
+                    mach_vm_size_t got = 0;
+                    unsigned k;
+                    if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(a0 + so), 0x1000,
+                            (mach_vm_address_t)pg, &got ) != KERN_SUCCESS || got != 0x1000)
+                        continue;
+                    for (k = 0; k < 0x1000; k++) if (pg[k]) { hit++; break; }
+                }
+                free( pg );
+            }
+            if ((int)(a0 & 0xffffffff) != census.last_arena || hit != census.last_arena_hit ||
+                (census.tick % 8) == 0)
+            {
+                census.last_arena = (int)(a0 & 0xffffffff);
+                census.last_arena_hit = hit;
+                census.lines++;
+                if (census.lines <= 80)
+                    dprintf( 2, "[arena-progress] t=%.1fs largest anon RWX alias %p+0x%lx | %u of %u sampled "
+                             "pages (%u per MB) touched%s\n", uptime_s, (void *)a0, (unsigned long)asz,
+                             hit, pages, pages, hit == pages ? "  <== unpack finished" : "" );
+            }
         }
     }
 

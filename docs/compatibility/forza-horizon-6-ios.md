@@ -658,7 +658,7 @@ launch (no install pass). Keep the file name `libntdll_unix.dylib` when signing 
 `codesign` derives the identifier from it, and the previous slot's identifier is
 `libntdll_unix`.
 
-### 4w. DECISIVE — the protector decrypted *nothing*, and the census can now prove it
+### 4w. The census works, and the answer it first seemed to give is NOT the answer
 
 The first working census sample (19:22 run, `ml2030`, game image reached at t=10.4 s):
 
@@ -669,7 +669,7 @@ The first working census sample (19:22 run, `ml2030`, game image reached at t=10
 
 Read this carefully, because the numbers are easy to misread:
 
-- `414805` is the whole `.pdata` function table, and it matches the offline
+- `414805` is the whole `.pdata` function table and it matches the offline
   enumerator exactly — so the walk, the header offsets and the section handling are
   right on the device, not just offline.
 - `4538` is *precisely* the protected set. Not "most of it", not "a few hundred" —
@@ -678,59 +678,74 @@ Read this carefully, because the numbers are easy to misread:
   never started with `0xEA` in the first place. Nothing went from ciphertext to
   plaintext.
 
-So, ~5 s before the fault, **not one of the 4,538 protected entries had been
-decrypted.** That kills the natural first reading of the crash ("the protector
-decrypts lazily and missed this one"): it did not decrypt any of them. The faulting
-stub is not an exception to a working decryptor, it is a member of a set in which
-*every* member was still ciphertext.
-
-That also removes most of the remaining hypothesis space. "Decryption ran and wrote
-somewhere the game could not see" would have to have produced at least one
-plaintext byte in the mapped image. Zero did.
-
-**What this sample could NOT see, and why that mattered.** The census read
-`pe_base + rva` — the guest view the protector sees. Madeira maps every PE twice:
-that guest view, and the JIT pool copy that FEX actually executes. A decryptor that
-writes the guest view and never reaches the pool would leave the game executing
-ciphertext while the image looks correct, and this probe would report a clean
-`4538/0` for it. That is the single most Madeira-specific hypothesis on the list —
-"Our dual map desynchronises writes to own code" — so it had to be excluded before
-anything else was believed.
-
-The evidence already on hand leans against it (the run-8 `[guest-code]` dump read
-the *pool* copy at the faulting address and saw `ea e9 6b e6 14`, the same ciphertext
-as the image), but one address at fault time is not a set. `[stub-census]` v2
-therefore reads the same 4,538 RVAs in **both** copies every sampler tick (250 ms),
-prints on change, and says which copy moved:
+**Correcting my own first reading of this line.** I initially wrote that this proves
+"the protector decrypted nothing, ever". The timeline says otherwise, and the
+timeline is the more interesting result:
 
 ```
-[stub-census] v2 armed at t=%.1fs: image=%p pool=%p size=0x%lx | %u protected entries to watch
-[stub-census] t=%.1fs of %u watched entries still 0xEA: image=%u pool=%u (pool readable=%u/%u)
-              <== THE COPIES DISAGREE: ... (Madeira dual-map bug, not a protector failure)
+t= 8.10  RWX arena 0x170e30000+0x1008000 mapped   ([guest-rwx] #1, [jit-pool] off=0x21214000)
+t=10.35  200,000 emulated 32-byte stores into it   ([fault-class] "200000 emulated stores so far")
+t=13.70  400,000 emulated stores, 12.5 MB spans    ([fault-class] "...400000")
+t=15.38  fault at image+0x537099c
 ```
 
-The pool offset is `jit_base + rva`, measured rather than assumed: run 8's
-`pool_rip=0x158db499c` minus `jit_base=0x153a44000` is `0x537099c`, the faulting RVA
-exactly. Cached `.pdata` walk, 9,076 one-byte reads per tick (~10 ms).
+So the t=10.4 sample was taken **in the middle of the unpack**, before any decrypt
+pass on the image could have run. The census is not wrong; it is simply early, and
+v1's 6-second cadence meant it never got a post-unpack sample in a session that ends
+at t=15.4. Two probes answer this properly (below); the claim "not one entry was
+decrypted ~5 s before the fault" is true but says nothing about the decrypt pass,
+because at t=10.4 the protector was still copying.
 
-**And the arena.** Every launch allocates exactly two regions of `0x1010000`
-(16 MB + one 64 KB page) and frees them ~300 ms later:
+**What the timeline does establish, and it is a lot:**
 
-```
-[guest-reserve] #2 0x7039810000+0x1010000 hinted=0 tid=0094 prot=0x4   (t=0.83 s)
-[guest-reserve] #3 0x703a820000+0x1010000 hinted=0 tid=0094 prot=0x4
-[bigfree] #14/15  ... viewsize=0x1010000                              (t=1.14 s)
-```
+1. The decryptor does run, and it is enormous: **400,000 emulated stores, one Mach
+   round trip each, 7.7 µs average, 1.5 s of pure handler time**, writing ~12.5 MB
+   contiguously at 32 bytes per store into the RWX arena. On Windows that is a
+   `memcpy` of a few milliseconds. 99 % of it comes from a single thread
+   (`[fault-by-thread] port=0x139e3 faults=399996 (99%)`).
+2. The arena is entered through the pool path because iOS refuses host EXEC:
+   ```
+   [guest-rwx] #1 0x170e30000+0x1008000 prot=rwx — ... applying rw- instead
+   [guest-rwx] #1 ... HONOURING guest EXEC (MADEIRA_GUEST_RWX_EXEC=1 ...)
+   iOS mprotect(rwx) appeared to succeed but EXEC not actually granted (qkr=0 prot=0x3)
+   → falling through to JIT-pool path
+   [jit-copy] ml634 #5 PRE-REMAP ... 0/16809984 bytes nonzero — copied into pool off=0x21214000
+   D E8 Add SMC interval: 170E30000 - 171E35000
+   ```
+   Note `Add SMC interval`: FEX is told this range is self-modifying. But every store
+   into it arrives through the **emulated Mach store path**, not through a write to
+   the RX page — and that path is documented in `signal_arm64_ios.c` as never
+   invalidating FEX's cached translation. For a *data* destination that is merely
+   slow; for code it is the difference between executing the unpacked bytes and
+   executing whatever FEX translated the page as when it was still zeros.
+3. The two copies of a PE image are **not** aliases. Anon RWX uses `vm_remap` on the
+   pool slot, so guest VA and RW alias are the same physical pages. A PE image's pool
+   copy is a `memcpy`, and `NtProtectVirtualMemory`'s sync explicitly refuses to copy
+   `.text`:
+   ```
+   iOS JIT IAT sync: partial copy %p+0x%lx → JIT (skipping text [0x%lx-0x%lx])
+   ```
+   So a decryptor that writes image `.text` through the guest view has its work
+   discarded, then executes stale ciphertext — which is exactly our symptom, and
+   exactly the one hypothesis the t=10.4 census sample cannot see (it was too early).
 
-That is an unpacker arena's shape, allocated and released before the game reaches the
-protected call at t=15.5 s. The free is also the only instant at which the region is
-both still mapped and definitely complete, so `[arena-census]` samples the nonzero
-byte count right there. All-zero at free means the stage that would have filled it
-never ran; bytes mean it ran and the failure is downstream. Either answer is a real
-result, and neither needs another hypothesis about `VirtualAlloc` return values.
+### 4x. Two probes that close the gap instead of guessing
 
-Both probes are in one dylib (`ml2030` slot, sha `cecdace4…` verified by read-back,
-push+verify 4.0 s).
+`[text-sync]` (virtual_ios.c, at the sync that skips `.text`) compares the two copies
+of the overlapping `.text` window *before* the copy and reports how many bytes differ
+at the moment the caller protects `.text` executable. Nonzero is the decryption being
+thrown away, with the byte count as the size of the loss. Rate-limited, 40 reports.
+
+`[arena-progress]` samples one 4 KB page per MB of the largest live anon RWX alias
+every 250 ms, so the log says how far the unpack had got and whether it finished
+before the fault — the fact v1's cadence missed.
+
+`[stub-census]` v2 also reads the same 4,538 RVAs in **both** copies every 250 ms and
+prints on change, with a loud `THE COPIES DISAGREE` line. Pool address is measured,
+not assumed: run 8's `pool_rip=0x158db499c − jit_base=0x153a44000 = 0x537099c`, the
+faulting RVA exactly.
+
+All three ship in one dylib (`ml2030` slot, sha `2d606889…` verified by read-back).
 
 ### 4s. Reproduced, and the fault is RVA-invariant
 
