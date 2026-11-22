@@ -2068,6 +2068,47 @@ Consequences worth keeping:
   `VirtualSize` rule, `pe-unthunk.py` reverses. `tools/wcp/make-pe-wcp.sh` packages PE
   builtins as prefix links (kind `Wine`) instead of `pe/` staging.
 
+### 4ar. The dock dies on a NULL exit thunk in the pool copy — partially fixed
+
+The reference Wine (`TimmyTurner51/proton-wine`, branch `fh6`, `dlls/ntdll/signal_arm64ec.c`)
+does **not** skip a hotpatch prologue. Its `arm64x_check_call` still matches only `ff 25` and
+still reads the TEB from `x18`. That works on Android, where `x18` is the TEB. The same
+README says the thunk patch is not required for the in-world result once DroidDeck-Proton
+11-12.5 is installed; the FEX package is what gets the game playing. There is no separate
+local Wine tree beyond those two patch files in `fh6-wine-fex/wine/`.
+
+Our crash is the iOS pool copy, and it is now named. The faulting instruction is in
+`ucrtbase.dll` at RVA `0x91028`:
+
+```
+adrp x8, ...
+ldr  x16, [x8, #0x898]
+blr  x16          ; x16 = 0, pc = 0, exit 0xc0000005
+```
+
+The slot is RVA `0xe3898`, which is `IMAGE_ARM64EC_METADATA.__os_arm64x_dispatch_call_no_redirect`.
+ntdll's own copy of that slot is initialised (`ExitToX64`). The copy ucrtbase actually
+executes, in the JIT pool, is still zero. `arm64ec_update_hybrid_metadata` writes the PE
+image and relies on the NtProtect sync to mirror it; that mirror is not reaching this slot.
+
+`update_hybrid_pointer` now also writes the pool alias (`xlate_ios_jit`). Shipped as
+`dist/FH6-iOS-1.14-poolslot-builtin.wcp`. It only loads when a unix half that knows about
+builtin overrides is enabled (`ml2136`); the app's static unix ignores the package and the
+log then has no `[builtin-override]` line. One run in this series was that void case.
+
+With the fixed ntdll confirmed loaded:
+
+| `kernel32` in `sysx64` | game spawns | `pc=0` |
+|---|---|---|
+| bundle plus 16 prologues | **yes** | 0 |
+| bundle plus all 792 prologues | no | 6 |
+| build-tree `kernel32` (795 prologues) | no | 6 |
+
+So the slot we filled is the one a small prologue set hits, and a full set still finds
+another NULL call. The game that did spawn was still ciphertext at 85 s (4538/4538 entries
+`0xEA`, no `#UD` in that window). Decrypt has not started. The component file was put back
+to the bundle's bare `kernel32` afterwards; `1.14` and `ml2136` were left enabled.
+
 ---
 
 ## 5. Premise corrections
