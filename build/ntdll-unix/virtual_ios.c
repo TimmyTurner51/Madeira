@@ -35546,6 +35546,51 @@ NTSTATUS WINAPI NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *si
             dprintf(2, "[bigfree] #%u addr=%p size=0x%lx type=0x%x view=%p viewsize=0x%lx\n",
                     freebig_n, addr, (unsigned long)size, (unsigned)type,
                     fv ? fv->base : NULL, fv ? (unsigned long)fv->size : 0ul);
+
+#ifdef WINE_IOS
+            /* iOS-Madeira ml2033: [arena-census] -- what was ever unpacked into it?
+             *
+             * Every launch of Forza Horizon 6 allocates exactly two arenas of
+             * 0x1010000 (16 MB + one 64 KB page) and frees them ~300 ms later
+             * (measured: reserve #2/#3 at t=0.83 s, free #14/#15 at t=1.14 s).
+             * That shape is an unpacker's, and the later failure is that the game
+             * calls protected code that was never decrypted. The cheapest question
+             * left is whether anything was ever written into those arenas: an
+             * unpacker that ran leaves bytes, one that never ran leaves zeros.
+             *
+             * Sampled HERE, at the free, because that is the only moment the region
+             * is both still mapped and guaranteed complete -- sampling on a timer
+             * would race the 300 ms window. Read-only, and at most four arenas. */
+            if (fv && fv->size == 0x1010000)
+            {
+                static int arena_n;
+                unsigned char *buf = malloc( 0x100000 );
+                unsigned long long nz = 0, pages_nz = 0, off, j;
+
+                if (arena_n < 4) arena_n++;
+                if (buf && arena_n <= 4)
+                {
+                    for (off = 0; off + 0x100000 <= fv->size; off += 0x100000)
+                    {
+                        mach_vm_size_t got = 0;
+                        if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(uintptr_t)fv->base + off,
+                                0x100000, (mach_vm_address_t)buf, &got ) != KERN_SUCCESS || got != 0x100000)
+                            break;
+                        for (j = 0; j < 0x100000; j++) if (buf[j]) nz++;
+                        for (j = 0; j < 0x100000; j += 0x1000)
+                        {
+                            unsigned long long k;
+                            for (k = 0; k < 0x1000; k++) if (buf[j + k]) { pages_nz++; break; }
+                        }
+                    }
+                }
+                if (buf) free( buf );
+                dprintf( 2, "[arena-census] #%d arena=%p size=0x%lx | nonzero bytes=%llu in %llu of %lu "
+                         "pages%s\n", arena_n, fv->base, (unsigned long)fv->size, nz, pages_nz,
+                         (unsigned long)(fv->size / 0x1000),
+                         nz ? "" : "  <== ALL ZERO at free: nothing was ever unpacked into it" );
+            }
+#endif
         }
     }
 
@@ -39205,102 +39250,149 @@ static int ios_stub_census_read( uintptr_t addr, void *buf, size_t len )
     return got == len;
 }
 
-static void ios_stub_census_image( uintptr_t pe, size_t sz, double uptime_s )
-{
-    /* 264 bytes of optional header, not 130. The data-directory table is 16
-     * entries x 8 bytes starting at offset 112 (PE32+) or 96 (PE32), so entry 3
-     * -- IMAGE_DIRECTORY_ENTRY_EXCEPTION, the one this probe needs -- lives at
-     * 136..143, past a 130-byte buffer. The first version of this probe read 130
-     * and its own bounds check then returned silently on every image: measured
-     * on device 2026-11-21, not a single line, and the log looked like a negative
-     * result. Hence the reason codes below as well. */
-    unsigned char dos[0x40], coff[24], opt[264];
-    uint32_t e_lfanew = 0, exc_rva = 0, exc_size = 0;
-    unsigned int dir, magic, i;
-    unsigned long long n = 0, cipher = 0, plain = 0, unread = 0;
-    unsigned long long first[8];
-    unsigned int nfirst = 0;
-    unsigned char *tab, *b;
-    const char *why = NULL;
 
-    if (sz < 0x1000) return;                       /* caller filtered; not an image */
-    if (!ios_stub_census_read( pe, dos, sizeof(dos) )) return;
-    if (dos[0] != 'M' || dos[1] != 'Z') return;
-    memcpy( &e_lfanew, dos + 0x3c, 4 );
-    if (e_lfanew > 0x1000 || e_lfanew + 24 + sizeof(opt) > sz) { why = "no-dos-header"; goto report; }
-    if (!ios_stub_census_read( pe + e_lfanew, coff, sizeof(coff) )) { why = "unreadable-coff"; goto report; }
-    if (coff[0] != 'P' || coff[1] != 'E' || coff[2] || coff[3]) { why = "not-pe32"; goto report; }
-    if (!ios_stub_census_read( pe + e_lfanew + 24, opt, sizeof(opt) )) { why = "unreadable-opt"; goto report; }
-    memcpy( &magic, opt, 2 );
-    dir = (magic == 0x20b) ? 112 : (magic == 0x10b ? 96 : 0);
-    if (!dir) { why = "bad-magic"; goto report; }
-    memcpy( &exc_rva,  opt + dir + 3 * 8,     4 );   /* IMAGE_DIRECTORY_ENTRY_EXCEPTION */
-    memcpy( &exc_size, opt + dir + 3 * 8 + 4, 4 );
-    if (!exc_rva || exc_size < 12 || exc_size > 0x4000000) { why = "no-pdata"; goto report; }
-    if ((size_t)exc_rva + exc_size > sz) { why = "pdata-outside-image"; goto report; }
+/* iOS-Madeira ml2032: [stub-census] v2 -- watch the count, and watch BOTH copies.
+ *
+ * v1 answered the first question and raised a second one that it could not see.
+ * Measured (device, 2026-11-21, ml2030):
+ *
+ *   [stub-census] t=10.4s image=0x133a40000 (188481536 bytes) .pdata functions=414805
+ *                 | first byte still 0xEA (ciphertext)=4538  decrypted=410267  unreadable=0
+ *
+ * 4,538 is exactly the set tools/pe/protected-stubs.py enumerates offline, so the
+ * walk is right, and NOT ONE protected entry had been decrypted ~5 s before the
+ * fault. That kills "the protector decrypted and missed this one": it decrypted
+ * nothing at all.
+ *
+ * What v1 could not distinguish, and v2 exists to:
+ *
+ *   (a) the protector never wrote, anywhere            -> its unpacker never ran
+ *   (b) it wrote the IMAGE but not the POOL COPY       -> OUR bug. Madeira maps
+ *       every PE twice: the guest view the protector sees, and the JIT pool copy
+ *       that FEX actually executes. A decryptor that writes the guest view would
+ *       leave the executing copy stale, and the game would #UD on code that is
+ *       plaintext where it is looking. v1 only ever read the guest view, so its
+ *       clean 4538/0 cannot rule this out -- and it is the most Madeira-specific
+ *       hypothesis on the list, so it has to be excluded before anything else.
+ *   (c) it decrypted, then something re-encrypted       -> unlikely, would show.
+ *
+ * So: same set, two reads per entry, image at pe_base+rva and pool at
+ * jit_base+rva (run8 measured the pool layout as exactly jit_base + rva:
+ * 0x158db499c - 0x153a44000 = 0x537099c = the faulting RVA). Print on CHANGE,
+ * plus a compact line every 2 s, so a decrypt burst in the last second before
+ * the fault is caught rather than missed between 6 s samples.
+ *
+ * Cheap: the .pdata walk and the RVA list are computed once and cached; a tick is
+ * 9,076 one-byte reads (~10 ms).
+ */
+static struct {
+    int      armed;         /* 0 = not looked yet, 1 = cached, -1 = gave up */
+    uintptr_t pe;
+    size_t   sz;
+    uintptr_t pool;
+    uint32_t *rva;
+    unsigned int n;
+    int      last_img, last_pool;
+    unsigned int tick;
+    unsigned int lines;
+} census;
 
-    tab = malloc( exc_size );
-    if (!tab) { why = "nodata"; goto report; }
-    if (!ios_stub_census_read( pe + exc_rva, tab, exc_size )) { free( tab ); why = "pdata-unreadable"; goto report; }
-
-    for (b = tab; b + 4 <= tab + exc_size; b += 12)
-    {
-        uint32_t rva;
-        unsigned char fb;
-
-        memcpy( &rva, b, 4 );
-        if (!rva || (size_t)rva >= sz) continue;
-        n++;
-        if (!ios_stub_census_read( pe + rva, &fb, 1 )) { unread++; continue; }
-        if (fb == 0xea)
-        {
-            if (nfirst < 8) first[nfirst++] = rva;
-            cipher++;
-        }
-        else plain++;
-    }
-    free( tab );
-
-report:
-    /* Only speak for images that are actually protected, or big enough that a
-     * zero would itself be the answer. Every other module stays silent. */
-    if (!why && cipher < 8 && n < 100000) return;
-
-    dprintf( 2, "[stub-census] t=%.1fs image=%p (%lu bytes) .pdata functions=%llu | first byte "
-             "still 0xEA (ciphertext)=%llu  decrypted=%llu  unreadable=%llu | oldest 0xEA rvas:",
-             uptime_s, (void *)pe, (unsigned long)sz, n, cipher, plain, unread );
-    if (why) dprintf( 2, " %s", why );
-    else if (!nfirst) dprintf( 2, " none -- every entry decrypted" );
-    for (i = 0; i < nfirst; i++) dprintf( 2, " %#llx", first[i] );
-    dprintf( 2, "\n" );
-}
-
-/* Called from the [xp] sampler. A handful of samples per session, six seconds
- * apart, so the log shows whether the count MOVES rather than just where it
- * ended. Cheap: one .pdata walk per protected image per sample. */
 void ios_stub_census( double uptime_s )
 {
-    static double next_t = 4.0;
-    static int samples;
-    int mi, images = 0;
+    unsigned int i, img = 0, pool_cipher = 0, pool_read = 0;
+    int mi, best = -1;
 
-    if (samples >= 6 || uptime_s < next_t) return;
-    next_t = uptime_s + 6.0;
-    samples++;
-    for (mi = 0; mi < ios_jit_mapping_count; mi++)
+    if (census.armed == -1) return;
+
+    if (!census.armed)
     {
-        uintptr_t pe = (uintptr_t)ios_jit_mappings[mi].pe_base;
-        size_t sz = ios_jit_mappings[mi].size;
+        unsigned char dos[0x40], coff[24], opt[264];
+        uint32_t e_lfanew = 0, exc_rva = 0, exc_size = 0;
+        unsigned int dir, magic;
+        unsigned char *tab, *b;
 
-        if (!pe || sz < 0x100000) continue;   /* large images only: keeps the walk cheap */
-        images++;
-        ios_stub_census_image( pe, sz, uptime_s );
+        census.armed = -1;
+
+        /* The game is by far the largest image in the table (188 MB; the next is
+         * 9.9 MB), and it is the only one this question is about. Taking the
+         * largest avoids guessing which PEB this thread owns. */
+        for (mi = 0; mi < ios_jit_mapping_count; mi++)
+        {
+            uintptr_t pe = (uintptr_t)ios_jit_mappings[mi].pe_base;
+            size_t sz = ios_jit_mappings[mi].size;
+            if (pe && sz >= 0x2000000 && (best < 0 || sz > ios_jit_mappings[best].size)) best = mi;
+        }
+        if (best < 0) return;   /* no big image yet: try again next tick */
+
+        census.pe   = (uintptr_t)ios_jit_mappings[best].pe_base;
+        census.sz   = ios_jit_mappings[best].size;
+        census.pool = (uintptr_t)ios_jit_mappings[best].jit_base;
+
+        if (!ios_stub_census_read( census.pe, dos, sizeof(dos) ) || dos[0] != 'M' || dos[1] != 'Z') return;
+        memcpy( &e_lfanew, dos + 0x3c, 4 );
+        if (e_lfanew > 0x1000 || !ios_stub_census_read( census.pe + e_lfanew, coff, sizeof(coff) )) return;
+        if (coff[0] != 'P' || coff[1] != 'E' || coff[2] || coff[3]) return;
+        if (!ios_stub_census_read( census.pe + e_lfanew + 24, opt, sizeof(opt) )) return;
+        memcpy( &magic, opt, 2 );
+        dir = (magic == 0x20b) ? 112 : (magic == 0x10b ? 96 : 0);
+        if (!dir) return;
+        memcpy( &exc_rva,  opt + dir + 3 * 8,     4 );
+        memcpy( &exc_size, opt + dir + 3 * 8 + 4, 4 );
+        if (!exc_rva || exc_size < 12 || exc_size > 0x4000000) return;
+
+        tab = malloc( exc_size );
+        if (!tab) return;
+        if (!ios_stub_census_read( census.pe + exc_rva, tab, exc_size )) { free( tab ); return; }
+        census.rva = malloc( (exc_size / 12) * sizeof(uint32_t) );
+        if (!census.rva) { free( tab ); return; }
+        for (b = tab; b + 4 <= tab + exc_size; b += 12)
+        {
+            uint32_t rva;
+            unsigned char fb;
+            memcpy( &rva, b, 4 );
+            if (!rva || (size_t)rva >= census.sz) continue;
+            if (!ios_stub_census_read( census.pe + rva, &fb, 1 )) continue;
+            if (fb == 0xea) census.rva[census.n++] = rva;
+        }
+        free( tab );
+
+        /* Report the budget for the new 5-byte stub values: the enumerator says
+         * 4,538 of 414,805 entries start with 0xEA. A very different number means
+         * this is not the image (or not the build) we think it is. */
+        if (census.n < 64 && census.sz < 0x4000000) { census.armed = -1; return; }
+        census.armed = 1;
+        census.last_img = census.last_pool = -1;
+        dprintf( 2, "[stub-census] v2 armed at t=%.1fs: image=%p pool=%p size=0x%lx | "
+                 "%u protected entries to watch (expected 4538)\n",
+                 uptime_s, (void *)census.pe, (void *)census.pool,
+                 (unsigned long)census.sz, census.n );
+        if (!census.n) { census.lines = 9999; return; }
     }
-    /* Zero images is a fact about the table, not a quiet run: say so, because the
-     * first version of this probe was silent for its own bug and that read exactly
-     * like "the census found nothing" (device run 2026-11-21, ml2030). */
-    if (!images)
-        dprintf( 2, "[stub-census] t=%.1fs no image >=1MB in ios_jit_mappings "
-                 "(count=%d) -- nothing to count\n", uptime_s, ios_jit_mapping_count );
+
+    census.tick++;
+    for (i = 0; i < census.n; i++)
+    {
+        unsigned char a = 0, p = 0;
+        uint32_t rva = census.rva[i];
+
+        if (ios_stub_census_read( census.pe + rva, &a, 1 ) && a == 0xea) img++;
+        if (census.pool && ios_stub_census_read( census.pool + rva, &p, 1 ))
+        {
+            pool_read++;
+            if (p == 0xea) pool_cipher++;
+        }
+    }
+
+    if ((int)img == census.last_img && (int)pool_cipher == census.last_pool && (census.tick % 8)) return;
+    if (census.lines++ > 60) return;
+    census.last_img = (int)img;
+    census.last_pool = (int)pool_cipher;
+
+    dprintf( 2, "[stub-census] t=%.1fs of %u watched entries still 0xEA: image=%u pool=%u "
+             "(pool readable=%u/%u)%s\n", uptime_s, census.n, img, pool_cipher, pool_read, census.n,
+             (img != pool_cipher) ? "  <== THE COPIES DISAGREE: the write landed in the guest view "
+             "and did not reach the executing pool copy (Madeira dual-map bug, not a protector failure)"
+             : (img == 0 ? "  <== every entry decrypted" : "") );
 }
+
 #endif /* WINE_IOS */

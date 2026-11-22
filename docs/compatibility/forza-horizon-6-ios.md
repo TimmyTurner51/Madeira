@@ -658,6 +658,80 @@ launch (no install pass). Keep the file name `libntdll_unix.dylib` when signing 
 `codesign` derives the identifier from it, and the previous slot's identifier is
 `libntdll_unix`.
 
+### 4w. DECISIVE — the protector decrypted *nothing*, and the census can now prove it
+
+The first working census sample (19:22 run, `ml2030`, game image reached at t=10.4 s):
+
+```
+[stub-census] t=10.4s image=0x133a40000 (188481536 bytes) .pdata functions=414805
+              | first byte still 0xEA (ciphertext)=4538  decrypted=410267  unreadable=0
+```
+
+Read this carefully, because the numbers are easy to misread:
+
+- `414805` is the whole `.pdata` function table, and it matches the offline
+  enumerator exactly — so the walk, the header offsets and the section handling are
+  right on the device, not just offline.
+- `4538` is *precisely* the protected set. Not "most of it", not "a few hundred" —
+  the entire set is still `0xEA`.
+- `410267` is not "decrypted stubs". It is `414805 − 4538`: ordinary functions that
+  never started with `0xEA` in the first place. Nothing went from ciphertext to
+  plaintext.
+
+So, ~5 s before the fault, **not one of the 4,538 protected entries had been
+decrypted.** That kills the natural first reading of the crash ("the protector
+decrypts lazily and missed this one"): it did not decrypt any of them. The faulting
+stub is not an exception to a working decryptor, it is a member of a set in which
+*every* member was still ciphertext.
+
+That also removes most of the remaining hypothesis space. "Decryption ran and wrote
+somewhere the game could not see" would have to have produced at least one
+plaintext byte in the mapped image. Zero did.
+
+**What this sample could NOT see, and why that mattered.** The census read
+`pe_base + rva` — the guest view the protector sees. Madeira maps every PE twice:
+that guest view, and the JIT pool copy that FEX actually executes. A decryptor that
+writes the guest view and never reaches the pool would leave the game executing
+ciphertext while the image looks correct, and this probe would report a clean
+`4538/0` for it. That is the single most Madeira-specific hypothesis on the list —
+"Our dual map desynchronises writes to own code" — so it had to be excluded before
+anything else was believed.
+
+The evidence already on hand leans against it (the run-8 `[guest-code]` dump read
+the *pool* copy at the faulting address and saw `ea e9 6b e6 14`, the same ciphertext
+as the image), but one address at fault time is not a set. `[stub-census]` v2
+therefore reads the same 4,538 RVAs in **both** copies every sampler tick (250 ms),
+prints on change, and says which copy moved:
+
+```
+[stub-census] v2 armed at t=%.1fs: image=%p pool=%p size=0x%lx | %u protected entries to watch
+[stub-census] t=%.1fs of %u watched entries still 0xEA: image=%u pool=%u (pool readable=%u/%u)
+              <== THE COPIES DISAGREE: ... (Madeira dual-map bug, not a protector failure)
+```
+
+The pool offset is `jit_base + rva`, measured rather than assumed: run 8's
+`pool_rip=0x158db499c` minus `jit_base=0x153a44000` is `0x537099c`, the faulting RVA
+exactly. Cached `.pdata` walk, 9,076 one-byte reads per tick (~10 ms).
+
+**And the arena.** Every launch allocates exactly two regions of `0x1010000`
+(16 MB + one 64 KB page) and frees them ~300 ms later:
+
+```
+[guest-reserve] #2 0x7039810000+0x1010000 hinted=0 tid=0094 prot=0x4   (t=0.83 s)
+[guest-reserve] #3 0x703a820000+0x1010000 hinted=0 tid=0094 prot=0x4
+[bigfree] #14/15  ... viewsize=0x1010000                              (t=1.14 s)
+```
+
+That is an unpacker arena's shape, allocated and released before the game reaches the
+protected call at t=15.5 s. The free is also the only instant at which the region is
+both still mapped and definitely complete, so `[arena-census]` samples the nonzero
+byte count right there. All-zero at free means the stage that would have filled it
+never ran; bytes mean it ran and the failure is downstream. Either answer is a real
+result, and neither needs another hypothesis about `VirtualAlloc` return values.
+
+Both probes are in one dylib (`ml2030` slot, sha `cecdace4…` verified by read-back,
+push+verify 4.0 s).
+
 ### 4s. Reproduced, and the fault is RVA-invariant
 
 The 19:07 run (ml2029 still loaded — see below) died the same way, with the image
