@@ -2442,7 +2442,16 @@ With the temporary `[fh6-diag]` build (`ml289-fh6diag`), two delayed punishments
 
 **Cause.** ~7–8 s after launch FH6 checks the prologue bytes of ~28 exported `kernel32.dll` timing/system functions. Real Windows x64 emits the 8-byte hotpatch prologue `48 8d a4 24 00 00 00 00 ff 25` (`lea rsp,[rsp+0]; jmp [rip+rel32]`). Bare Wine ARM64EC emitted a bare `ff 25`, which FH6 classifies as a detoured timing API.
 
-**Fix — faithful, not a bypass.** `dist/ml290-k32hotpatch-pe.wcp` packages the stripped `wine/build-arm64ec/dlls/kernel32/arm64ec-windows/kernel32.dll` so the game sees the same prologues Windows has. Verify with `tools/local/pe-thunks.py kernel32.dll` → `hotpatch=795 bare-ff25=1 other=562`; the single remaining bare `ff 25` is the trailing thunk that respects `VirtualSize` (see `48b5692` and `4ao`).
+**Fix — faithful, not a bypass.** `dist/ml290-k32hotpatch-pe.wcp` packages the stripped `wine/build-arm64ec/dlls/kernel32/arm64ec-windows/kernel32.dll` so the game sees the same prologues Windows has. Verify with `tools/local/pe-thunks.py kernel32.dll` → `hotpatch=795 bare-ff25=1 other=562`; the single remaining bare `ff 25` is the trailing thunk that respects `VirtualSize` (see `48b5692` and `4ao`). Reproduce from source (the artifact is not committed — recent `.wcp`s are untracked by convention):
+
+```sh
+# the generator is wine commit cd01b9c0 "winebuild: give x86_64 -import exports
+# the 8-byte hotpatch prologue"
+cp wine/build-arm64ec/dlls/kernel32/arm64ec-windows/kernel32.dll /tmp/k32/kernel32.dll
+arm64ec-w64-mingw32-strip --strip-debug /tmp/k32/kernel32.dll
+python3 tools/local/pe-thunks.py /tmp/k32/kernel32.dll    # expect hotpatch=795 bare-ff25=1
+tools/wcp/make-pe-wcp.sh ml290-k32hotpatch /tmp/k32/kernel32.dll
+```
 
 **Result, measured on device:** FH6 survived **past +350 s** with **zero** `STATUS_TIMEOUT`, zero `0120`, zero `forzahorizon6.exe:4`, zero `SuspendThread`, 60 FPS, 3.7 GB footprint, GPU 13.8 ms/frame. The deterministic death is gone.
 
