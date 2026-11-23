@@ -2459,14 +2459,24 @@ Everything up to the card works: `CredEnumerateW`, `title.mgt.xboxlive.com`, `de
 - **WinRT factories.** `Windows.Internal.System.Profile.RegionPolicyEvaluator` fails hard at startup (line 169639), a full ~2 minutes *before* `oauth20_connect` (line 190795), and `EasClientDeviceInformation` is a harmless semi-stub. Neither correlates with the card.
 - **RETRACTED — do not repeat:** an "`nsrv` never reaches 742, so the QR is never sampled" test. `nsrv` is the **global SRV registry size** (2607 draws at `741`, 108 at `739`, none above), not a per-draw sampling count, so it cannot show which textures a draw reads.
 
-### 9.3 Independent blocker: the device-code poll is answered `302`, not `400`
+### 9.3 RETRACTED within the hour: "the poll is answered 302" — it is 302 *bytes*
 
-Every one of the **16** `POST login.live.com/oauth20_token.srf` polls (~5 s apart, matching `interval:5`) ends in `post=302:17 03` with a 17-byte body. The device-authorization flow is specified to answer **HTTP 400** with `{"error":"authorization_pending"}` until the user approves. A 302 means the POST is being handled as a navigation/redirect — so **even a visible card with a correctly entered code could not complete sign-in**. This gives the owner's "thread spinning after pressing A" a concrete shape: a 5 s poll loop that always lands on a redirect.
+An earlier reading of this section claimed every `oauth20_token.srf` poll returned an HTTP `302`. **That was a misreading of the `[sock-tl]` format string** and is withdrawn.
 
-Not the cause: all DNS resolutions succeeded (`go.microsoft.com` 2, `signinupcdn` 2, `login.live.com` 16 results); zero `winsock`/`winhttp` errors after the press; `winhttp` option `140` is `WINHTTP_OPTION_IPV6_FAST_FALLBACK` and is benign.
+`wine/dlls/ntdll/unix/socket.c:939-947` formats the field as
+
+```c
+snprintf( post, sizeof(post), "%d:%02x %02x", e->post_len, e->post5[0], e->post5[1] );
+```
+
+so `post=302:17 03` means **302 bytes read after the handshake tail, first bytes `0x17 0x03`** — a TLS application-data record header, not a status line. The "302" is a byte count. The `~5 s` in `tail->post=5003.9` is the server holding the long poll, which is exactly what the device flow does between `interval:5` polls.
+
+**Consequence:** there is no evidence of an HTTP-level fault in the poll loop. 302 bytes of application data is the size of a small JSON error body plus headers, consistent with `authorization_pending`. Combined with: all DNS resolutions succeeding (`go.microsoft.com` 2, `signinupcdn` 2, `login.live.com` 16 results), zero `winsock`/`winhttp` errors after the press, and `winhttp` option `140` being the benign `WINHTTP_OPTION_IPV6_FAST_FALLBACK` — **the network side is not implicated in the invisible card.** Treat §9.2 (no card draw emitted) as the single remaining fault.
+
+Recorded here rather than deleted because the misreading was plausible enough to repeat: `[sock-tl]` prints *bytes and raw TLS record bytes*, never an HTTP status. (The HTTP status of a response is not instrumented at all.) Before drawing a protocol conclusion from that line, read the format string.
 
 ### 9.4 Next experiments, cheapest first
 
-1. **Explain the 302.** Read `wine/dlls/winhttp` redirect handling for POST (301/302/303 are converted to GET and the form body may be dropped), and compare with the DroidDeck Proton `winhttp`. This is the cheapest real blocker and it is fully offline.
+1. **Find what gates the card draw.** The dialog text is *not* plaintext in `forzahorizon6.exe` or `xgameruntime.dll` (both scanned, ASCII and UTF-16, zero hits), so it lives in a Forza resource bundle — search the install's data files for the string table next. This is now the only open fault on this path.
 2. **Capture the sign-in frame's `Backbuffer` on device** and compare with the on-screen image. The census predicts no card; this closes the composite question with an image rather than an argument.
-3. **Find what gates the card draw.** The dialog text is *not* plaintext in `forzahorizon6.exe` or `xgameruntime.dll` (both scanned, ASCII and UTF-16, zero hits), so it lives in a Forza resource bundle — search the install's data files for the string table next.
+3. **Instrument the HTTP status directly** if the network ever needs to be re-examined: `[sock-tl]` does not print status lines (see §9.3), so any future protocol claim needs a dump of the response headers, not an inference from this line.
