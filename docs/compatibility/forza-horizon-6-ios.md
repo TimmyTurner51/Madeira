@@ -2375,3 +2375,98 @@ Note for whoever pulls the next log: `madeira-log.txt` is hard-linked into
 `logs/<exe>-<stamp>.txt`, and **AFC refuses to read or copy a file with
 `st_nlink > 1`** (`FILE_OPEN failed with status: 1`). Delete the `logs/` link
 first, or the copy silently produces a 0-byte file.
+
+---
+
+## 8. Milestone reached (2026-11-22): Live 1920×1080 rendered Forza Horizon 6 title screen on iPhone 17 Pro (46 FPS)
+
+Forza Horizon 6 (`forzahorizon6.exe`, Steam AppID `2483190`) now boots cleanly through its anti-tamper runtime decryption, hardware checks, D3D12 PSO compilation (2,946 pipelines), intro playback, and `ResizeBuffers(1920×1080)` to the **live rendered 3D title screen ("FORZA HORIZON 6 — [Enter] Start Game  [X] Accessibility/Settings") at 46 FPS (`21.9 ms` frame time, `5.2 ms` GPU time, `3,675 MB` footprint)** on iPhone 17 Pro (`iPhone18,1`, iOS 27.0.1), with live audio and zero app re-signing required for game-specific fixes (all shipped as `.wcp` packages + `madeira.cfg`).
+
+### 8.1 Root-cause chain resolved (chronological)
+
+1. **`ml272`–`ml276` (Runtime decryption, exception dispatch, memory & Win32 compatibility)**:
+   - `ml272-fastexc-fex.wcp` (`FEXCore`): dropped FEX DEBUG logging by default, sampled invalid-instruction logs, and added JIT-pool direct dispatch for `KiUserExceptionDispatcher` and `__wine_dbg_output`.
+   - `ml273-comctl32v6-pe.wcp` (`Wine`): ARM64EC `comctl32.dll` v6 exporting `TaskDialog` (#344) and `TaskDialogIndirect` (#345) so FH6's compatibility/error dialogs render and respond cleanly (`FH302` dismissed via *"Don't show again"*, `ret=4`).
+   - `ml275`/`ml276-veneer-native.wcp` (`UnixHalf`): `fastexc`, `hiexe`, `totalphys` (`16384 MB`), `winios_drv` UnixHalf exports, and ARM64EC retarget far-branch veneers.
+2. **`ml277-d3d12-dev10-pe.wcp` (`FH621` GPU check)**:
+   - Implemented `ID3D12Device10` (`IID_ID3D12Device10` = `{517f8718-aa66-49f9-b02b-a7ab89c06031}`, `CreateCommittedResource3`, `CreatePlacedResource2`, `CreateReservedResource2`) in `madeira-d3d12`, plus Enhanced Barriers (`OPTIONS12`, `ID3D12GraphicsCommandList7::Barrier`).
+   - Resolved `FH621` ("Your graphics card is not supported").
+3. **`madeira.cfg` virtual-memory & jetsam tuning (`FHD21` & 4,970 MB jetsam)**:
+   - FH6 allocates two virtual reserved DEFAULT buffers via `CreateReservedResource2` (`1024 MB` + `2048 MB` = `3072 MB`). Setting `d3d12-reserved-max-mb = 4096` resolved `FHD21` ("Out of Video Memory").
+   - Setting `swap-mb = 6144`, `default-buffer-swap = 2` (placing both reserved DEFAULT buffers on sparse file-backed storage), and `pso-lazy-libs = 1` (releasing 2,946 `MTLLibrary` objects at PSO creation) cut `phys_footprint` from `4,970 MB` (jetsam) to a stable **`3,413–3,675 MB`**.
+4. **`ml278-kernelbase-pe.wcp` (Post-intro `FHE21` abort)**:
+   - FH6 calls `api-ms-win-core-sysinfo-l1-2-3.dll!GetIntegratedDisplaySize` right after the intro video (`apisetschema.spec` routes `api-ms-win-core-sysinfo-l1-2-*` → `kernelbase.dll`, where `GetIntegratedDisplaySize` was commented out).
+   - Exported and implemented `HRESULT WINAPI GetIntegratedDisplaySize(double *size_in_inches)` in `wine/dlls/kernelbase/` (`E_INVALIDARG` on NULL, else `E_FAIL`).
+5. **`mip0-full = 1` (First 3D title-screen frame Metal assertion)**:
+   - FH6 created a `400×225` `MipLevels = 0` render target and then created SRVs for mip levels `1..7`, tripping `_mtlValidateArgumentsForTextureViewOnDevice` (`newLevelRange > mipmapLevelCount(1)`). Enabling existing `madeira.cfg` key `mip0-full = 1` gave `MipLevels = 0` textures their full mip chain and passed cleanly into `ResizeBuffers(1920×1080)`.
+6. **`ml281-d3d12-present-pe.wcp` (iOS `CAMetalLayer` pixel format conversion)**:
+   - FH6 creates its intro swapchain as `DXGI_FORMAT_R10G10B10A2_UNORM` (`MTLPixelFormatRGB10A2Unorm = 90`) and its title-screen swapchain as `DXGI_FORMAT_R8G8B8A8_UNORM` (`MTLPixelFormatRGBA8Unorm = 70`). Neither format is accepted by iOS `CAMetalLayer` (Apple's iOS `CAMetalLayer` only accepts `BGRA8Unorm` (`80`), `BGRA8Unorm_sRGB` (`81`), `RGBA16Float` (`115`), and XR10 formats — notably *not* `BGR10A2Unorm` (`94`) either, which is macOS-only and produced blank output in `ml279`).
+   - Added `mad_present_vs` + `mad_present_fs_arr` / `mad_present_fs_2d` in `madeira-d3d12/src/pe/mad_kernels.metal` and `mad_layer_pixel_format()` in `madeira-d3d12/src/pe/madeira_d3d12.c` mapping unsupported swapchain formats (`RGB10A2Unorm`, `BGR10A2Unorm`, `RGBA8Unorm(_sRGB)`) to `BGRA8Unorm(_sRGB)` and presenting via a fullscreen render pass when `s->layer_pf != s->pf`.
+7. **`ml282-zorder-native.wcp` + `Winios.m` (Win32 Z-order backdrop occlusion — the final black-screen root cause!)**:
+   - Frame capture (`auto-capture-present = 150` → `f151_sheet00.png`) proved `Backbuffer` already contained crisp rendered FH6 frames while the screen showed solid black.
+   - `[winios-tree]` revealed FH6 creates its Metal window `0x1005a` (`{128,0,1280,648}`) *first*, then creates an opaque black `1408×648` letterbox backdrop window `0x1006c` (`WS_POPUP | WS_VISIBLE | WS_DISABLED | WS_CLIPSIBLINGS`, `WS_EX_TOOLWINDOW`) *second*, and calls `SetWindowPos(0x1006c, hwndInsertAfter = 0x1005a, ...)` repeatedly to place `0x1006c` behind `0x1005a`.
+   - `Winios.m` appended `CALayer`s in creation order and never synced Win32 `insert_after` Z-order, so `0x1006c`'s opaque black GDI layer occluded `0x1005a`'s Metal layer for the entire session.
+   - Added `winios_window_zorder(HWND hwnd, HWND insert_after)` to `app/Madeira/Winios/Winios.m` (reordering top-level `CALayer`s in `g_compositor_view.layer` via `insertSublayer:below:`/`above:` while keeping `g_desk_bg` at bottom and `g_cursor_layer` at `zPosition = 10000`), wired it in `build/win32u-unix/driver_ios.c` via `dlsym(RTLD_DEFAULT, "winios_window_zorder")`, and added a safe fallback in `driver_ios.c` for older host app binaries that suppresses `WS_POPUP | WS_DISABLED | WS_EX_TOOLWINDOW` backdrops explicitly placed behind another top-level window.
+
+### 8.2 Active working `.wcp` + `madeira.cfg` set on iPhone 17 Pro
+
+- **Enabled `.wcp`s** (measured from `Components/state.json` on 2026-11-22 23:06):
+  - `ml288-cfnumber-native.wcp` (`UnixHalf`: the `ml288-cfnumber` NULL guards in `NtSetInformationFile`/`system.c`/`mountmgr.sys`)
+  - `ml290-k32hotpatch-pe.wcp` (`Wine`: `kernel32.dll`, 795 hotpatch prologues — see §9)
+  - `ml285-gs-stagein-pe.wcp` (`Wine`: `d3d12.dll`, `d3d12core.dll`; geometry-stage emulation)
+  - `ml287-poolslot-fex.wcp` (`FEXCore`)
+  - `ml278-kernelbase-pe.wcp` (`Wine`: `kernelbase.dll`)
+  - `FH6-iOS-1.14-poolslot-builtin.wcp` (`Wine-Builtin`: `ntdll.dll`)
+  - `ml273-comctl32v6-pe.wcp` (`Wine`: `comctl32.dll`)
+- **Not enabled, and why**: `FH6-iOS-1.13-k32one` installs `kernel32-one.dll`, a test file nothing loads — it never could have fixed the prologue check. `ml289-fh6diag` carried temporary `[fh6-diag]` probes that have since been removed from the tree.
+- **Required `madeira.cfg` settings**:
+  `d3d12-fl-12-1 = 1`, `d3d12-tiled-resources = 1`, `d3d12-typed-uav-load = 1`, `d3d12-binding-tier = 3`, `d3d12-sm-6-7 = 1`, `d3d12-tile-based = 0`, `d3d12-enhanced-barriers = 1`, `vram-mb = 8192`, `totalphys = 16384`, `swap-mb = 6144`, `d3d12-reserved-max-mb = 4096`, `default-buffer-swap = 2`, `pso-lazy-libs = 1`, `mip0-full = 1`.
+
+### 8.3 Local macOS iteration feasibility (honest assessment)
+
+- The full Forza Horizon 6 Steam installation exists locally on the Mac at `/Volumes/RETROBACKUP/SteamLibrary/steamapps/common/ForzaHorizon6/`.
+- However, Madeira's iOS runtime stack (iOS Mach exception delivery, 16 KB page JIT pool with `W^X` split aliases, `LiveContainer` guest container, iOS `CAMetalLayer` pixel format restrictions, and iOS Jetsam `phys_footprint` accounting) cannot be faithfully replicated by running under macOS Wine/CrossOver or the iOS Simulator (which lacks Metal ARM64EC JIT / iOS jetsam / real `AGXMetalG18P` shader validation).
+- **What IS fast and effective locally on macOS**: offline PE/DXIL inspection, host regression checks (`tests/host/check-*.py`), and rapid `.wcp` cross-compilation (`< 10 s` for `madeira-d3d12`, `kernelbase`, `win32u-unix`, and `UnixHalf`) pushed directly over USB via `pymobiledevice3` without rebuilding or re-signing the iOS IPA. This `.wcp` hot-swap workflow gave ~15–20s build+push turnaround directly on real iPhone 17 Pro hardware.
+
+
+---
+
+## 9. Milestone (2026-11-22/23): the anti-tamper now passes *faithfully*, and the invisible sign-in card is isolated
+
+### 9.1 The 2.5–3.3 minute punishment is fixed by real hotpatch prologues (measured)
+
+With the temporary `[fh6-diag]` build (`ml289-fh6diag`), two delayed punishments were captured live in `/tmp/fh6-289-final.log`:
+
+1. **`0118`:** `NtWaitForSingleObject` expired with `STATUS_TIMEOUT` (`0x102`) after `-1264930000` (`126.5 s`).
+2. **`0120`:** the same after `-1978770000` (`197.9 s`); it spawned `02e4` (`+0x54f4418`), decrypted `+0x53e5b41`, shut down every Arxan sibling thread, called `NtSetInformationFile(FileAllocationInformation = 19)` on **`forzahorizon6.exe:4`** (`alloc=8`), called `NtSuspendThread` on every thread in the process, and ended with `0154` at `pc=0` (`rip = ForzaHorizon6 + 0x3545824`, identical in all three runs).
+
+**Cause.** ~7–8 s after launch FH6 checks the prologue bytes of ~28 exported `kernel32.dll` timing/system functions. Real Windows x64 emits the 8-byte hotpatch prologue `48 8d a4 24 00 00 00 00 ff 25` (`lea rsp,[rsp+0]; jmp [rip+rel32]`). Bare Wine ARM64EC emitted a bare `ff 25`, which FH6 classifies as a detoured timing API.
+
+**Fix — faithful, not a bypass.** `dist/ml290-k32hotpatch-pe.wcp` packages the stripped `wine/build-arm64ec/dlls/kernel32/arm64ec-windows/kernel32.dll` so the game sees the same prologues Windows has. Verify with `tools/local/pe-thunks.py kernel32.dll` → `hotpatch=795 bare-ff25=1 other=562`; the single remaining bare `ff 25` is the trailing thunk that respects `VirtualSize` (see `48b5692` and `4ao`).
+
+**Result, measured on device:** FH6 survived **past +350 s** with **zero** `STATUS_TIMEOUT`, zero `0120`, zero `forzahorizon6.exe:4`, zero `SuspendThread`, 60 FPS, 3.7 GB footprint, GPU 13.8 ms/frame. The deterministic death is gone.
+
+### 9.2 The "Sign In To Xbox" card is *never emitted* — it is not empty and not mis-composited
+
+Everything up to the card works: `CredEnumerateW`, `title.mgt.xboxlive.com`, `device.auth.xboxlive.com`, `sisu.xboxlive.com`, `POST login.live.com/oauth20_connect.srf` → **200** with `{"user_code":"Q79ZESJL","verification_uri":"https://www.microsoft.com/link","interval":5,"expires_in":900}`, `go.microsoft.com/fwlink/?linkid=2323820` → `signinupcdn.blob.core.windows.net/remoteconnect/xbox_remote_qrcode.png` → **200**, decoded to `345×345` BGRA32 via `windowscodecs.dll`, uploaded to D3D12 as `r#936`.
+
+**Frame census (`/tmp/fh6-290-245s.log`).** Title frame: `406 commands, 26 draws`. Sign-in frame: `544 commands, 32 draws`. The *only* `+6` draws are `enc#105828` (`cs 60×34`), `enc#105829..105831` (3× `120×67` blur), `enc#105832` (`1920×1080` blur quad, `idx=30`), `enc#105834` (`cs 60×34`). **No card geometry, no QR quad, no text.** `0 skipped`, `0` Metal errors.
+
+**Ruled out, with evidence:**
+
+- **A second window / GDK overlay.** `[winios-tree]` shows the same 12 top-level windows before and after `A`, one visible (`0x1005a` "Forza Horizon 6"). `d2d1.dll`, `dwrite.dll`, `dcomp.dll` and `d3d11.dll` are **never loaded** into the FH6 process although all four exist in the bundle, and there are **zero** `CreateSwapChain*` / `IDComposition*` calls. The `XGameUiShowWebAuthenticationAsync` path is not taken on this build.
+- **Presentation/composition.** The full-screen blur quad composites correctly, so `ml281`-style format conversion is not implicated.
+- **WinRT factories.** `Windows.Internal.System.Profile.RegionPolicyEvaluator` fails hard at startup (line 169639), a full ~2 minutes *before* `oauth20_connect` (line 190795), and `EasClientDeviceInformation` is a harmless semi-stub. Neither correlates with the card.
+- **RETRACTED — do not repeat:** an "`nsrv` never reaches 742, so the QR is never sampled" test. `nsrv` is the **global SRV registry size** (2607 draws at `741`, 108 at `739`, none above), not a per-draw sampling count, so it cannot show which textures a draw reads.
+
+### 9.3 Independent blocker: the device-code poll is answered `302`, not `400`
+
+Every one of the **16** `POST login.live.com/oauth20_token.srf` polls (~5 s apart, matching `interval:5`) ends in `post=302:17 03` with a 17-byte body. The device-authorization flow is specified to answer **HTTP 400** with `{"error":"authorization_pending"}` until the user approves. A 302 means the POST is being handled as a navigation/redirect — so **even a visible card with a correctly entered code could not complete sign-in**. This gives the owner's "thread spinning after pressing A" a concrete shape: a 5 s poll loop that always lands on a redirect.
+
+Not the cause: all DNS resolutions succeeded (`go.microsoft.com` 2, `signinupcdn` 2, `login.live.com` 16 results); zero `winsock`/`winhttp` errors after the press; `winhttp` option `140` is `WINHTTP_OPTION_IPV6_FAST_FALLBACK` and is benign.
+
+### 9.4 Next experiments, cheapest first
+
+1. **Explain the 302.** Read `wine/dlls/winhttp` redirect handling for POST (301/302/303 are converted to GET and the form body may be dropped), and compare with the DroidDeck Proton `winhttp`. This is the cheapest real blocker and it is fully offline.
+2. **Capture the sign-in frame's `Backbuffer` on device** and compare with the on-screen image. The census predicts no card; this closes the composite question with an image rather than an argument.
+3. **Find what gates the card draw.** The dialog text is *not* plaintext in `forzahorizon6.exe` or `xgameruntime.dll` (both scanned, ASCII and UTF-16, zero hits), so it lives in a Forza resource bundle — search the install's data files for the string table next.
