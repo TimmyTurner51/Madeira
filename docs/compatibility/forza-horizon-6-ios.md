@@ -2899,63 +2899,66 @@ Measured on the `ml1300` baseline and then on each change, in the open world
      finding), so the backtrace has to come from the fault handler's own
      record.
 
-### 9.20 `ml1304` — the world-load stall: Steam's overlay renderer deadlocked the present path (2026-11-26)
+### 9.20 `ml1304` — the frame graph lied about a stalled title, and the stall it hid (2026-11-26)
 
-**Symptom.** After the title screen (59-60 FPS, `16.7 ms`, GPU 14-17 %), pressing **A**
-to enter the world put the title on `LOADING... PLEASE WAIT` and it never came back.
-The HUD kept showing a healthy `60 Hz` link and a `13.4 s` last frame, and the app's
-`[promote]` reporter kept printing `601 ticks in 10.0 s = 60.0 Hz`, so the frame graph
-*looked* alive while nothing was being drawn.
+**Symptom.** After the title screen (59-60 FPS, 16.7 ms, GPU 14-17 %) pressing **A** to
+enter the world put the title on `LOADING... PLEASE WAIT` and it never came back. The HUD
+still showed `60 FPS` and `MS 13415`, the log still printed
+`[promote] link ran 601 ticks in 10.0 s = 60.0 Hz`, and nothing on screen or in the log
+said the title had stopped drawing.
 
-**What the logs actually said** (`madeira-log.txt` + the per-game log):
+**What the logs actually said about that freeze** (`madeira-log.txt`):
 
-| signal | value during the stall | meaning |
+| signal | value | meaning |
 |---|---|---|
-| last `[perf]` per-frame line | `14:46:50.280`, the exact instant of the A press | **zero frames rendered for 300+ s** |
-| `detach-wait: presents=` | frozen at **14281** from `14:47:09` onward | no `Present` calls at all |
-| `[promote] link` | 60.0 Hz throughout | the *host* present-link ticks; it is not the game |
-| `[xp] cpu=` | `60-80 ms` per `320 ms` sample (`~20 %` of one core), down from `1032 ms` | the work simply stopped; it is not slow |
-| GPU | `GPU 3-14 %`, `GPU MS 2.4` | the GPU has nothing to do |
+| last `[perf]` per-frame line | `14:46:50.280`, the instant of the A press | **zero frames for 300+ s** |
+| `detach-wait: presents=` | frozen at **14281** from `14:47:09` | no `Present` calls at all |
+| `[xp] cpu=` | 60-80 ms per 320 ms (was 1032 ms) | the work stopped |
+| `GPU` | 3-14 %, `GPU MS 2.4` | the GPU had nothing to do |
 | `[xp] rdKB=` | **0** | no disk reads while "loading" |
-| DNS / `NtCreateFile` | **none** after `14:46:54` | not waiting on the network or on I/O |
-| `[footprint]` | `3149 MB`, `compressed 329 MB`, peak `3331` | not memory pressure |
-| `[waiters]` | `parked=14 over60s=14`, inf waits aged `243-245 s` | threads parked exactly at the freeze |
-| `[xp-api]` | `x64->EC 2700-3200/s` with `wakes 0/s` | a *polling* loop crossing guest→host, not a blocked process |
-| `[xp-api-cs]` | `steamclient64.dll+0x1753230` = **100 %** of contended enters | one static critical section dominates |
-| images | `gameoverlayrenderer64.dll` resident (mapped `14:42:15`), one thread parked at `0x1597ffa28`, inside **its own JIT-pool copy** | the overlay renderer is in the present path |
+| DNS / `NtCreateFile` | **none** after `14:46:54` | not the network, not I/O |
+| `[footprint]` | 3149 MB, compressed 329 MB | not memory pressure |
+| `[waiters]` | 14 parked, inf waits aged 243-245 s | parked exactly at the freeze |
+| `[xp-api]` | `x64->EC 2700-3200/s`, `wakes 0/s` | a polling loop, not a blocked process |
+| `[xp-api-cs]` | `steamclient64.dll+0x1753230` = 100 % of contended enters | one static CS dominated |
 
-So the diagnosis is a deadlock in the **present path**, not a loading stall: the title
-did its 4 s of load work, then stopped presenting, with one thread spinning on a Steam
-critical section and the overlay's own image on the stack. The overlay renderer hooks
-DXGI/D3D12 `Present`, and the title only starts drawing the world after that point —
-which is why the title screen was fine for 4.5 minutes and the transition was fatal.
+So that event was a genuine present-path stop (work stops, no I/O, no network, no frames),
+not a slow load. **It has not reproduced since**, and the two candidate causes could not be
+separated with one sample: Steam's overlay renderer (`gameoverlayrenderer64.dll`, resident
+since `14:42:15`) hooks DXGI/D3D12 `Present`, and the title only exercises that once it
+starts drawing the world.
 
-**Fix (verified).** Neutralise the hook by renaming the DLL inside the guest prefix —
-no rebuild, no re-sign, no reinstall, fully reversible:
+**The overlay is *not* required to be off.** That was tested and it is exonerated: with
+`GameOverlayRenderer64.dll` restored, the same path walked title -> main menu (`Continue`
+/ `Sign Out` / `Exit`) -> world load, presenting continuously the whole way
+(`game presents +593`, `+557`, `+596` per 10 s at the menu) with `fpMB` climbing
+`3091 -> 4336 -> 5473 -> 5560`. The rename is therefore **not** a fix; `fh6-steam-overlay.sh`
+is kept only as a reversible switch for future deadlock hunting.
 
-```
-tools/local/fh6-steam-overlay.sh off     # renames GameOverlayRenderer64.dll -> .off
-tools/local/fh6-steam-overlay.sh on      # restores it
-```
+**What the freeze most likely was: a bad JIT pool.** `app/Madeira` refuses to run against
+one and says so — `BAD POOL — ... Relaunch the app.` — but this session produced a second,
+worse variant: the app was replaced by an IPA install *while the title was running*, so the
+guest was killed mid-flight and the next launches faulted in unmapped foreign memory
+(`exc-disp raise ... addr=0x71eae28fe4 pc=12b444fe4`, `p1=0x7f10371a73dd5af5`,
+`[fault-rgn] NO wine view — Wine doesn't own this addr`). Those are wild-pointer jumps, which
+is what a guest executes when its code buffer/pool state is stale. After a full LiveContainer
+restart the same install booted and ran normally, so the install itself is fine.
+Operational rule: **never replace the app bundle while a guest is running**, and if a launch
+fails, relaunch once before reading anything into the failure.
 
-**Same launch path after the rename:**
+**Fixed: the frame graph can no longer report a dead title as healthy.** All three readouts
+came from things that keep running when the title dies:
 
-| | before | after |
-|---|---|---|
-| presents | frozen at 14281 | `1603 -> 2740 -> 3650 -> 4769` over 90 s |
-| frames | none | `23.6-28.7 ms` = **35-42 FPS** |
-| GPU | 3-14 % | **74 %** |
-| `[xp] cpu` | 20 % of one core | `977 ms` per `342 ms` = ~2.9 cores |
-| `gameoverlayrenderer64.dll` in log | present | **0 references** |
-| "Unable to join session" | shown | **0 occurrences** |
-| `kerberos.dll` / `msv1_0.dll` | — | still loaded (the §9.19 fix is independent) |
+1. `[promote]` now reports the title's own present counter beside the link rate, and says so
+   when it stops, e.g.
+   `... = 60.0 Hz ... | game presents +0 (STALLED 120.0 s: the link is live, the title is not presenting)`
+   plus a one-shot `[stall] ml1304 the title has presented nothing for ... s` line. A healthy
+   run reads `| game presents +600`, which is how the world load above was verified.
+2. The HUD's `FPS`/`MS` cells show `STALL <n>s` in red after 2 s without a present instead of
+   the last computed values (the `60 FPS` next to `MS 13415` combination).
+3. The compact pill does the same.
 
-**Two instrumentation inconsistencies this exposed, worth fixing separately:**
-
-1. **The frame graph reports the link, not the game.** `[promote] ... = 60.0 Hz` and the
-   HUD's `FPS` come from the host present link and keep ticking while the title presents
-   nothing. Anything reading FPS should treat `madeira_frame_count()` as stale when it has
-   not advanced for >2 s (and the overlay should show `stalled`, not `60`).
-2. **`MS` shows the *last* frame, not the current one.** The `13.4 s` reading is the
-   overlays's last completed frame time; a stalled title should show the stall duration,
-   which is what makes "60 FPS / 13415 ms" appear on screen simultaneously.
+The load that follows is still slow — at the title-to-world transition the process ran
+`cpu=1072 ms` per `336 ms` sample (~3.2 cores), `rdKB=48-304`, `P=1.31/E=1.70 GHz` thermally
+clamped, presenting 16-19 frames/s. That is the standing load-time/P-core ceiling from §9.18,
+not the stall.

@@ -5,20 +5,23 @@
 #   tools/local/fh6-steam-overlay.sh on       # restore it
 #   tools/local/fh6-steam-overlay.sh status
 #
-# Why. FH6 loaded to the title screen at 60 FPS, then on pressing A to enter the
-# world it stopped presenting entirely and never recovered (see
-# docs/compatibility/forza-horizon-6-ios.md §9.20): presents frozen at 14281 for
-# 300+ s, no frames at all, ~20 % of one core, GPU idle, rdKB=0, no DNS and no
-# NtCreateFile after the freeze, 14 threads parked >60 s, and a static critical
-# section inside steamclient64.dll (steamclient64.dll+0x1753230) accounting for
-# 100 % of sampled contended enters. gameoverlayrenderer64.dll was resident in the
-# process with a thread parked in the JIT pool copy of its own image.
+# Why it exists. During the 2026-11-26 world-load stall this DLL was the leading
+# suspect: the title stopped presenting entirely (presents frozen at 14281 for
+# 300+ s, rdKB=0, no DNS, no NtCreateFile, ~20 % of one core) while
+# gameoverlayrenderer64.dll sat in the process with a thread parked in its own
+# JIT-pool copy and a static critical section in steamclient64.dll accounted for
+# 100 % of contended enters. The overlay hooks the DXGI/D3D12 present path, and
+# the title only exercises that once it draws the world.
 #
-# The overlay renderer hooks the DXGI/D3D12 present path, which the title only
-# exercises once it starts drawing the world. Neutralising it (a rename, so it
-# can be put back) took the same launch path to the open world: presents climbed
-# 1603 -> 4769 over 90 s, 35-42 FPS at 23.6-28.7 ms/frame, GPU 74 %, and the
-# "Unable to join session" message no longer appeared.
+# It is NOT the cause, and this script is not a fix. Tested: with the DLL
+# restored, the same path walked title -> main menu -> world load presenting
+# continuously (game presents +593 .. +596 per 10 s, fpMB 3091 -> 5560). The
+# freeze has not reproduced since the app was reinstalled/relaunched, and the
+# leading explanation is now stale JIT pool state from replacing the bundle
+# while the guest was running (see docs/compatibility/forza-horizon-6-ios.md
+# 9.20). Kept as a reversible switch for future present-path deadlock hunting:
+# it removes a hook from the present path, costs nothing, and is one command to
+# undo.
 #
 # The rename lives in the guest prefix, not the app bundle: nothing is re-signed
 # and nothing is reinstalled. Steam can restore the file during its own update,
