@@ -2858,3 +2858,43 @@ Measured on the `ml1300` baseline and then on each change, in the open world
    - **Practical consequence:** measure FPS only on a cool device (or accept
      that a long session reads 13-17 FPS no matter what the code does), and
      treat per-frame CPU work as a *heat* budget as much as a latency budget.
+
+### 9.19 `ml1303` — the two missing SSPI providers, and a separate guest null-deref crash on opening Settings (2026-11-26)
+
+1. **The only modules the title asked for and did not get were `kerberos.dll` and
+   `msv1_0.dll`.** `[file-fail] ... status=0xc0000034` (`OBJECT_NAME_NOT_FOUND`)
+   is logged 12 times each, and every other failed lookup in the session is one
+   of those two (plus a benign optional `microsoft.windows.common-controls.dll`
+   probe). They *are* built by the Wine pin
+   (`wine/build-arm64ec/dlls/{kerberos,msv1_0}/arm64ec-windows/*.dll`) but were
+   never in the shipped farm, so `secur32` had no Kerberos/NTLM provider to
+   enumerate. That is the emulation-side candidate for "Unable to join session"
+   after a successful sign-in: the profile name is on screen, so credentials are
+   fine and it is the security-package stack that is incomplete.
+   - **Fix:** packaged `dist/ml1303-sspi-pe.wcp` (`make-pe-wcp.sh`, kind `Wine`,
+     32 KB). A `Wine` component is linked into `drive_c/windows/system32/<name>`
+     after the bundle's links, so it needs no app rebuild and no re-sign.
+   - **Verified on-device:** `[jit-pool] image ... (kerberos.dll)` and
+     `(msv1_0.dll)`, and the `c0000034` count for both drops to **0**.
+   - Do **not** instead drop these into `app/Madeira/*-windows/`: that changes
+     `input_key`'s `farm-inventory` and invalidates `.runtime-cache/windows`,
+     which then needs a full `build-runtime-component.sh windows` — and that
+     currently fails earlier on unrelated FEX patch drift
+     (`0002-arm64x-x64-debug-registers.patch does not apply on FEX f199ce479`).
+2. **Four `[fault_rip]` records at boot are benign and unrelated.** They are
+   `rip=0x0 pc=<native>+0x6700 addr=0x0 x18=0x0`, repeat exactly 4 times, and the
+   title continues each time. `x18=0` places them in native code, and the same
+   four appear in every session including clean ones.
+3. **Opening Settings is a different, fatal fault, and it is a *guest*
+   dereference:** `[fault_rip] cnt=5 rip=0x7058ad0130 pc=0x17ab5ba38 addr=0x10
+   x18=0x0`, then `[win-name] ... "Forza Horizon 6 has terminated unexpectedly
+   due to an error."` `rip` is a guest address, so FH6 read/wrote `0x10` — a
+   null base plus field offset. `x18=0` means the FEX guest state was already
+   zero for that thread, i.e. the call arrived from a thread whose emulation
+   state was torn down, not a normal guest `mov` fault.
+   - Not caused by the SSPI gap: the crash happens after the providers are
+     present.
+   - Next step is a guest backtrace for that thread (`State.RIP=0`,
+     `x18=0`), not a sampler — arming the sampler kills this title (§9.18/prior
+     finding), so the backtrace has to come from the fault handler's own
+     record.
