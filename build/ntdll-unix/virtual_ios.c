@@ -25508,6 +25508,87 @@ static char *ios_swap_put_u( char *p, char *end, unsigned long long v )
     while (n && p < end) *p++ = t[--n];
     return p;
 }
+static char *ios_swap_put_x( char *p, char *end, uintptr_t v )
+{
+    char t[16];
+    int n = 0;
+    do { unsigned d = (unsigned)(v & 15u); t[n++] = (char)(d < 10 ? '0' + d : 'a' + d - 10); v >>= 4; } while (v && n < 16);
+    while (n && p < end) *p++ = t[--n];
+    return p;
+}
+/* ml1299: what the tier holds RIGHT NOW, by address band and size, plus the
+ * largest extents with their VA and age. The commit census counts requests since
+ * the start; this counts the live extents, which is the number that costs page-ins:
+ * Forza Horizon 6 sat at 4.2 GB in 13.6k extents (most of them ~300 KB, i.e. heap
+ * blocks, not one large allocation). Runs from the 30 s census, so it is built
+ * into a stack buffer and written with write(2) -- it runs under virtual_mutex. */
+static void ios_swap_live_census( void )
+{
+    static const char * const band_name[6] = { "guest<4G", "0x7000-0x7400", "0x7400-0x8000", "jit-pool", "images", "other" };
+    unsigned long long band[6] = { 0, 0, 0, 0, 0, 0 };
+    unsigned long long sz[5] = { 0, 0, 0, 0, 0 };   /* <64K, <1M, <16M, <256M, >=256M */
+    unsigned nsz[5] = { 0, 0, 0, 0, 0 };
+    unsigned big[6]; unsigned nbig = 0, i;
+    unsigned long long total = 0;
+    uint64_t now = ios_swap_now_ns();
+    char line[1024], *p = line, *end = line + sizeof(line) - 1;
+    for (i = 0; i < ios_swap_n; i++)
+    {
+        uintptr_t va = (uintptr_t)ios_swap_ext[i].va;
+        size_t len = ios_swap_ext[i].len;
+        unsigned b, s;
+        total += len;
+        if (ios_swap_ext[i].img) b = 4;
+        else if (ios_jit_rx_base_global && va >= (uintptr_t)ios_jit_rx_base_global
+                 && va < (uintptr_t)ios_jit_rx_base_global + ios_jit_pool_size_global) b = 3;
+        else if (va < 0x100000000ull) b = 0;
+        else if (va >= 0x7000000000ull && va < 0x7400000000ull) b = 1;
+        else if (va >= 0x7400000000ull && va < 0x8000000000ull) b = 2;
+        else b = 5;
+        band[b] += len;
+        s = len < (64u << 10) ? 0 : len < (1u << 20) ? 1 : len < (16u << 20) ? 2 : len < (256u << 20) ? 3 : 4;
+        sz[s] += len; nsz[s]++;
+        if (nbig < 6 || len > ios_swap_ext[big[nbig - 1]].len)
+        {
+            unsigned j = nbig < 6 ? nbig++ : nbig - 1;
+            while (j > 0 && ios_swap_ext[big[j - 1]].len < len) { big[j] = big[j - 1]; j--; }
+            big[j] = i;
+        }
+    }
+    p = ios_swap_put( p, end, "[swap-live] " ); p = ios_swap_put_u( p, end, total >> 20 );
+    p = ios_swap_put( p, end, "MB in " );       p = ios_swap_put_u( p, end, ios_swap_n );
+    p = ios_swap_put( p, end, " extents:" );
+    for (i = 1; i < 6; i++)
+    {
+        p = ios_swap_put( p, end, " " ); p = ios_swap_put( p, end, band_name[i] );
+        p = ios_swap_put( p, end, "=" ); p = ios_swap_put_u( p, end, band[i] >> 20 );
+    }
+    p = ios_swap_put( p, end, " MB | <64K " );  p = ios_swap_put_u( p, end, nsz[0] );
+    p = ios_swap_put( p, end, "/" );            p = ios_swap_put_u( p, end, sz[0] >> 20 );
+    p = ios_swap_put( p, end, " <1M " );        p = ios_swap_put_u( p, end, nsz[1] );
+    p = ios_swap_put( p, end, "/" );            p = ios_swap_put_u( p, end, sz[1] >> 20 );
+    p = ios_swap_put( p, end, " <16M " );       p = ios_swap_put_u( p, end, nsz[2] );
+    p = ios_swap_put( p, end, "/" );            p = ios_swap_put_u( p, end, sz[2] >> 20 );
+    p = ios_swap_put( p, end, " <256M " );      p = ios_swap_put_u( p, end, nsz[3] );
+    p = ios_swap_put( p, end, "/" );            p = ios_swap_put_u( p, end, sz[3] >> 20 );
+    p = ios_swap_put( p, end, " big " );        p = ios_swap_put_u( p, end, nsz[4] );
+    p = ios_swap_put( p, end, "/" );            p = ios_swap_put_u( p, end, sz[4] >> 20 );
+    for (i = 0; i < nbig; i++)
+    {
+        unsigned e = big[i];
+        p = ios_swap_put( p, end, " | " );      p = ios_swap_put_x( p, end, (uintptr_t)ios_swap_ext[e].va );
+        p = ios_swap_put( p, end, "+" );        p = ios_swap_put_u( p, end, ios_swap_ext[e].len >> 20 );
+        p = ios_swap_put( p, end, "M" );
+        p = ios_swap_put( p, end, ios_swap_ext[e].img ? "i" : "");
+        p = ios_swap_put( p, end, (ios_swap_ext[e].off & IOS_DONOR_FLAG) ? "d" : "f" );
+        p = ios_swap_put( p, end, ios_swap_ext[e].resv ? "r" : "" );
+        if (ios_swap_ext[e].born && now > ios_swap_ext[e].born)
+        { p = ios_swap_put( p, end, "a" ); p = ios_swap_put_u( p, end, (now - ios_swap_ext[e].born) / 1000000000ull ); }
+    }
+    p = ios_swap_put( p, end, "\n" );
+    if (p == end) p[-1] = '\n';
+    (void)!write( 2, line, p - line );
+}
 /* blocks/wide/broad: print the census when 30 s have passed since the last check
  * and anything changed (or 5 min passed); force prints now. */
 static void ios_swap_tick( int force )
@@ -25572,6 +25653,7 @@ static void ios_swap_tick( int force )
     p = ios_swap_put( p, end, "KB\n" );
     if (p == end) p[-1] = '\n';
     (void)!write( 2, line, p - line );
+    ios_swap_live_census();   /* ml1299: the live extents, right after the census */
 }
 static void ios_swap_note( int why, size_t size )
 {
@@ -36210,9 +36292,15 @@ retry_code_carve_reuse:
             }
             else
             {
-                dprintf(2, "[jit-pool] TAIL REFUSED (FEX EC_CODE): want=0x%lx tail_resv=0x%lx head_used=0x%lx/0x%lx — REFUSING honestly rev=ml421 (was: fall to normal alloc = guest-band non-exec buffer = ClearCache wild write)\n",
-                        (unsigned long)alloc_size, (unsigned long)reserve_offset,
-                        (unsigned long)jit_pool_offset, (unsigned long)ios_jit_pool_size_global);
+                /* 265k of these in one run is 40 MB of log written from an
+                 * allocation slow path, during the load it is meant to explain.
+                 * Keep the first few and a sparse sample after that. */
+                static unsigned tail_refused_n;
+                unsigned n = __sync_add_and_fetch( &tail_refused_n, 1 );
+                if (n <= 8 || (n & 4095) == 0)
+                    dprintf(2, "[jit-pool] TAIL REFUSED (FEX EC_CODE): want=0x%lx tail_resv=0x%lx head_used=0x%lx/0x%lx #%u — REFUSING honestly rev=ml421 (was: fall to normal alloc = guest-band non-exec buffer = ClearCache wild write)\n",
+                            (unsigned long)alloc_size, (unsigned long)reserve_offset,
+                            (unsigned long)jit_pool_offset, (unsigned long)ios_jit_pool_size_global, n);
             }
             return STATUS_NO_MEMORY;
         }
