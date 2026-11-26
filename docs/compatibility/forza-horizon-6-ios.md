@@ -2802,3 +2802,59 @@ Evaluated `/Applications/CrossOver GPTK4.app` as a potential fast local iteratio
 
 
 
+
+### 9.18 `ml1301`/`ml1302` — barrier-batch split (neutral) and the real FPS limiter: thermal P-core loss (2026-11-26)
+
+Measured on the `ml1300` baseline and then on each change, in the open world
+(`Horizon Invitational`, Japan). Frame time is what the game itself reports
+(`[perf] ml1119 ... (frame N ms)`), so it is the same number the HUD shows.
+
+1. **`ml1301` — a full barrier batch no longer becomes a global sync.**
+   `list_ResourceBarrier` folds entries into one `MC_BARRIER` record of 8
+   resources; the 9th used to set `u.barrier.all` and discard every class in
+   the batch, i.e. "synchronise everything". FH6 folds ~86 entries per batch,
+   so the overflow was the *normal* path. A full record now starts a **new**
+   batch instead.
+   - **Result: neutral.** Barrier-caused syncs/frame `139.6 → 125-133`
+     ("all" `122.3 → 112-119`), and the game's own fence wait was already only
+     `1.5 ms/frame = 2% of wall`. The remaining `all` syncs come from genuine
+     transitions *into* write states, which must sync. Kept (more precise
+     classification, no measured regression), but it is not an FPS lever.
+2. **`ml1302` — the command-list `Reset` wait sleeps instead of spinning.**
+   `mad_list_wait_idle` spun (`256 × YieldProcessor`, then `3840 × Sleep(0)`,
+   then `Sleep(1)`), which is `16.9 ms` of a `50 ms` frame — and on a
+   throttled phone the spinning game thread competes with the submission
+   worker it is waiting on. It now spins 512 times and then blocks on a
+   per-list condition variable that the worker signals when `inflight` hits 0.
+   - **Result: neutral in wall time** (reset wait `17.3 → 14.0-19.8 ms`), which
+     is the useful finding: the wait is the worker's *replay*, not spin waste.
+     Kept — it no longer burns the CPU it is waiting for.
+3. **The real limiter is thermal, and it is visible in `[xp]`.** `P=` and `E=`
+   are `ri_pcycles` vs `cpu − pcycles` from `proc_pid_rusage`, i.e. the whole
+   process's performance- vs efficiency-core time. Over one 8.5-minute session:
+
+   | window | P-core share |
+   |---|---|
+   | `13:58:16..13:58:46` (first 30 s) | **61.8 %** |
+   | `13:59:47..14:00:19` | 31.4 % |
+   | `14:01:26..14:02:09` | 16.0 % |
+   | `14:02:09..14:02:59` | 2.7 % |
+   | `14:05:16..14:05:58` | **0.7 %** |
+
+   E-core clock falls to **1.63–1.66 GHz** and the HUD reads thermal `• Hot`.
+   Frame time tracks it exactly:
+
+   | frame-time window | ms/frame | FPS |
+   |---|---|---|
+   | first samples (cool) | 20.7–25.8 | **38–48** |
+   | after heat soak | 58.5–74.8 | **13–17** |
+
+   So the ~2.8× FPS collapse is the process being moved off the performance
+   cores as the phone heat-soaks — not a regression in the port. QoS is not
+   the cause: no `[eco]` line was ever emitted (`eco` defaults off, so every
+   guest thread is set `USER_INTERACTIVE`), no `eco-prio` refusal was logged,
+   and `[bg-qos]` never fired (it only ever demotes the listed *helper*
+   processes, never the game's own).
+   - **Practical consequence:** measure FPS only on a cool device (or accept
+     that a long session reads 13-17 FPS no matter what the code does), and
+     treat per-frame CPU work as a *heat* budget as much as a latency budget.

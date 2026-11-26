@@ -1954,6 +1954,10 @@ struct mad_list {
      * chunks. A draw's root arguments must survive until the GPU reads them,
      * so a single buffer rewritten per draw would race the previous draw. */
     volatile LONG inflight;   /* ml1120: submission-worker jobs still holding this list; Reset waits for 0 */
+    /* ml1302: the Reset wait sleeps here instead of spinning (see mad_list_wait_idle):
+     * the thread that waits is the one that would otherwise compete with the
+     * submission worker for the CPU it is waiting on. */
+    CRITICAL_SECTION idle_lock; CONDITION_VARIABLE idle_cv;
     obj_handle_t *rings; void **ring_cpu; UINT64 *ring_gpu; unsigned nrings; unsigned ring_used;
     struct mad_queue *ring_q; UINT64 ring_batch;   /* ml1061: the batch that last read these chunks */
     /* ml1008: ring_gpu is each chunk's GPU address. The DXBC backend's constant
@@ -11373,8 +11377,13 @@ static DWORD WINAPI mad_sub_worker(void *arg) {
             UINT i;
             mad_ecl_run((ID3D12CommandQueue *)q, j->count, (ID3D12CommandList *const *)j->lists);
             for (i = 0; i < j->count; i++) {
-                InterlockedDecrement(&j->lists[i]->inflight);
-                list_Release((ID3D12GraphicsCommandList *)j->lists[i]);
+                struct mad_list *jl = j->lists[i];
+                if (InterlockedDecrement(&jl->inflight) == 0) {   /* ml1302: a Reset may be sleeping on this list */
+                    EnterCriticalSection(&jl->idle_lock);
+                    WakeAllConditionVariable(&jl->idle_cv);
+                    LeaveCriticalSection(&jl->idle_lock);
+                }
+                list_Release((ID3D12GraphicsCommandList *)jl);
             }
             break;
         }
@@ -11472,12 +11481,23 @@ static void mad_present_throttle(struct mad_queue *q) {
     InterlockedExchangeAdd64(&g_perf_drain_ticks, t1.QuadPart - t0.QuadPart);
 }
 static void mad_list_wait_idle(struct mad_list *l) {
+    /* ml1302: a Reset that finds the worker still replaying this list used to
+     * spin: 256 YieldProcessor, then 3840 Sleep(0), then Sleep(1) a millisecond
+     * at a time. That wait is 16.94 ms of a 50 ms frame in Forza Horizon 6, and
+     * on a thermally-throttled phone the spinning game thread competes with the
+     * submission worker for the very CPU it is waiting on -- the wait makes the
+     * work it waits for later. A short spin still catches the common "already
+     * done" case with no syscall; past that the thread blocks on the list's own
+     * condition variable and the worker wakes it when the count reaches 0. */
     LARGE_INTEGER t0, t1; unsigned spins = 0;
     QueryPerformanceCounter(&t0);
-    while (l->inflight) {
-        if (++spins < 256) YieldProcessor();
-        else if (spins < 4096) Sleep(0);
-        else Sleep(1);
+    while (__atomic_load_n(&l->inflight, __ATOMIC_ACQUIRE)) {
+        if (++spins < 512) { YieldProcessor(); continue; }
+        EnterCriticalSection(&l->idle_lock);
+        while (__atomic_load_n(&l->inflight, __ATOMIC_ACQUIRE))
+            SleepConditionVariableCS(&l->idle_cv, &l->idle_lock, 20);   /* the timeout only guards a lost wake */
+        LeaveCriticalSection(&l->idle_lock);
+        break;
     }
     QueryPerformanceCounter(&t1);
     InterlockedExchangeAdd64(&g_perf_resetwait_ticks, t1.QuadPart - t0.QuadPart);
@@ -12150,6 +12170,7 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommandList(ID3D12Device *This, UI
     if (!l) return E_OUTOFMEMORY;
     l->type = type;
     l->vtbl = &g_list_vtbl; l->refs = 1; l->iid = &IID_ID3D12GraphicsCommandList; l->name = "GraphicsCommandList";
+    InitializeCriticalSection(&l->idle_lock); InitializeConditionVariable(&l->idle_cv);   /* ml1302 */
     l->device = (struct mad_device *)This;
     l->alloc = (struct mad_alloc *)allocator;
     ID3D12CommandAllocator_AddRef(allocator);
@@ -13431,7 +13452,12 @@ static UINT64 mad_texture_view_id(struct mad_device *d, struct mad_resource *r, 
     if (!mad_view_grow(r, (void **)&r->xview, &r->xview_cap, r->nxview + 1, sizeof *r->xview)) {
         NSObject_release(tex); LeaveCriticalSection(&d->view_lock); return r->gpu_resource_id;
     }
-    mad_resident(d, tex);
+    /* A Metal texture view aliases its parent texture's allocation, which is
+     * already resident via r->texture, r->hp_heap (ml1072), or r->placed_heap
+     * (ml1145). Only borrowed textures (swapchain drawables) have no resident
+     * parent in d->resset; adding every view bloated d->resset to 3,600-5,400
+     * members and forced repeated MTLResidencySet_commit() calls. */
+    if (r->borrowed) mad_resident(d, tex);
     InterlockedIncrement(&g_xview_live);   /* ml1126 */
     k = r->nxview;
     r->xview[k].type = (UINT)want; r->xview[k].lvl0 = lvl0; r->xview[k].nlvl = nlvl; r->xview[k].sl0 = sl0; r->xview[k].nsl = nsl;
@@ -14756,7 +14782,7 @@ static ULONG STDMETHODCALLTYPE res_Release(ID3D12Resource *This) {
         }
         if (r->cpu) mad_tvs_forget(r);   /* madeira-bcd typed-view-shadow: before its memory goes */
         { unsigned k; for (k = 0; k < r->ntview; k++) if (r->tview[k].tex) { NSObject_release(r->tview[k].tex); InterlockedDecrement(&g_tview_live); } }   /* ml905; ml1126: never set members */
-        { unsigned k; for (k = 0; k < r->nxview; k++) if (r->xview[k].tex) { mad_unresident(r->owner, r->xview[k].tex); NSObject_release(r->xview[k].tex); InterlockedDecrement(&g_xview_live); } }   /* ml913 */
+        { unsigned k; for (k = 0; k < r->nxview; k++) if (r->xview[k].tex) { if (r->borrowed) mad_unresident(r->owner, r->xview[k].tex); NSObject_release(r->xview[k].tex); InterlockedDecrement(&g_xview_live); } }   /* ml913 */
         if (r->metal_bytes) {   /* madeira-bcd metal-gap */
             InterlockedExchangeAdd64(&g_sa_tex_bytes, -(LONG64)r->metal_bytes);
             InterlockedExchangeAdd64(&g_sa_tex_logical, -(LONG64)r->acct_bytes);
@@ -14764,7 +14790,7 @@ static ULONG STDMETHODCALLTYPE res_Release(ID3D12Resource *This) {
         }
         if (r->acct_bytes) mad_acct(r, r->acct_cat, r->acct_bytes, -1);   /* ml1057 */
         if (r->reserved_bytes) { InterlockedExchangeAdd64(&g_reserved_live_bytes, -(LONG64)r->reserved_bytes); InterlockedDecrement(&g_reserved_live_n); }   /* d3d12-tiled-resources census */
-        if (r->buffer && (!r->placed_heap || r->tiled_alias_owner)) mad_unresident(r->owner, r->buffer);
+        if (r->buffer && (!r->placed_heap || (r->tiled_alias_owner && r->buffer != r->tiled_alias_owner->buffer))) mad_unresident(r->owner, r->buffer);
         if (r->texture && !r->borrowed && !r->hp_used && !r->placed_heap) mad_unresident(r->owner, r->texture);
         if (r->hp_used && r->owner) mad_hp_release(r->owner, r);   /* ml1072: block returns after the GPU is done with it */
         { unsigned k; for (k = 0; k < r->nview_old; k++) free(r->view_old[k]); free(r->tview); free(r->tvh); free(r->xview); }
@@ -14807,7 +14833,7 @@ static HRESULT STDMETHODCALLTYPE res_Map(ID3D12Resource *This, UINT sub,
      * hid the fact that an application was mapping TEXTURES. Applications
      * routinely ignore this HRESULT and write through the pointer, so null it:
      * a stale stack value is a wild write, NULL is at least an honest fault. */
-    if (sub != 0 || !r->cpu) {
+    if (sub != 0 || !r->cpu || r->heap == D3D12_HEAP_TYPE_DEFAULT) {
         static LONG said;
         if (InterlockedIncrement(&said) <= 24)
             d3d12_log("[madeira-d3d12] ml1038 Map REFUSED: %s sub=%u (%s, %ux%u) -- this runtime has no "
@@ -15063,13 +15089,21 @@ static int mad_texinfo_from_desc(const D3D12_RESOURCE_DESC *desc, struct WMTText
 static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap_type,
                                       const D3D12_RESOURCE_DESC *desc, REFIID riid, void **out,
                                       struct mad_memheap *ph, UINT64 poff);
+static HRESULT mad_create_resource_ex(struct mad_device *d, D3D12_HEAP_TYPE heap_type,
+                                      const D3D12_RESOURCE_DESC *desc, REFIID riid, void **out,
+                                      struct mad_memheap *ph, UINT64 poff, int is_reserved);
 static HRESULT mad_create_resource(struct mad_device *d, D3D12_HEAP_TYPE heap_type,
                                    const D3D12_RESOURCE_DESC *desc, REFIID riid, void **out) {
-    return mad_create_resource_at(d, heap_type, desc, riid, out, NULL, 0);
+    return mad_create_resource_ex(d, heap_type, desc, riid, out, NULL, 0, 0);
 }
 static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap_type,
                                       const D3D12_RESOURCE_DESC *desc, REFIID riid, void **out,
                                       struct mad_memheap *ph, UINT64 poff) {
+    return mad_create_resource_ex(d, heap_type, desc, riid, out, ph, poff, 0);
+}
+static HRESULT mad_create_resource_ex(struct mad_device *d, D3D12_HEAP_TYPE heap_type,
+                                      const D3D12_RESOURCE_DESC *desc, REFIID riid, void **out,
+                                      struct mad_memheap *ph, UINT64 poff, int is_reserved) {
     struct mad_resource *r;
     HRESULT hr;
     D3D12_RESOURCE_DESC dfix; int mip0 = 0;
@@ -15230,7 +15264,7 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
             struct mad_resource *tr = NULL;
             UINT64 toff = 0, tlen = 0;
             AcquireSRWLockShared(&ph->pl_lock);
-            if (ph->tiled_res && ph->tiled_res->own_mem) {
+            if (ph->tiled_res && (ph->tiled_res->own_mem || ph->tiled_res->cpu)) {
                 tr = ph->tiled_res;
                 toff = ph->tiled_byte_off;
                 tlen = ph->tiled_bytes;
@@ -15242,18 +15276,28 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
                 UINT64 want = info.length;
                 SIZE_T alen = (SIZE_T)((want + 0x3fff) & ~(UINT64)0x3fff);
                 UINT64 tr_alloc = (tr->size + 0xffff) & ~(UINT64)0xffff;
-                if ((aoff & 0x3fff) == 0 && aoff + alen <= tr_alloc) {
-                    void *alias_mem = (char *)tr->own_mem + aoff;
-                    info.length = alen;
-                    info.memory.ptr = alias_mem;
-                    info.options = WMTResourceStorageModeShared;
-                    r->buffer = MTLDevice_newBuffer(d->mtl_device, &info);
-                    if (!r->buffer && aoff == 0 && tr->buffer) {
-                        /* Fallback if Metal rejects overlapping no-copy at offset 0: reuse reserved buffer handle */
+                void *tr_base = tr->own_mem ? tr->own_mem : tr->cpu;
+                if (tr_base && (aoff & 0x3fff) == 0 && aoff + alen <= tr_alloc) {
+                    void *alias_mem = (char *)tr_base + aoff;
+                    if (!tr->own_mem && aoff == 0 && tr->buffer) {
+                        /* ml346: native Metal StorageModeShared reserved buffer:
+                         * retain the parent buffer directly with zero BytesNoCopy. */
                         NSObject_retain(tr->buffer);
                         r->buffer = tr->buffer;
                         info.gpu_address = tr->gpu_address;
                         info.memory.ptr = alias_mem;
+                    } else {
+                        info.length = alen;
+                        info.memory.ptr = alias_mem;
+                        info.options = WMTResourceStorageModeShared;
+                        r->buffer = MTLDevice_newBuffer(d->mtl_device, &info);
+                        if (!r->buffer && aoff == 0 && tr->buffer) {
+                            /* Fallback if Metal rejects overlapping no-copy at offset 0: reuse reserved buffer handle */
+                            NSObject_retain(tr->buffer);
+                            r->buffer = tr->buffer;
+                            info.gpu_address = tr->gpu_address;
+                            info.memory.ptr = alias_mem;
+                        }
                     }
                     if (r->buffer) {
                         r->tiled_alias_owner = tr;
@@ -15263,11 +15307,12 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
                         r->placed_size = alen;
                         mad_pl_add(ph, r);
                         ID3D12Heap_AddRef((ID3D12Heap *)ph);
-                        mad_resident(d, r->buffer);
-                        d3d12_log("[d3d12-tiled] ml345 placed buffer r#%u (%llu MB, heap-type %u) in heap%u aliased onto reserved r#%u +%llu MB (cpu=%p, gpu=0x%llx)\n",
+                        if (r->buffer != r->tiled_alias_owner->buffer) mad_resident(d, r->buffer);
+                        d3d12_log("[d3d12-tiled] ml345 placed buffer r#%u (%llu MB, heap-type %u) in heap%u aliased onto reserved r#%u +%llu MB (cpu=%p, gpu=0x%llx%s)\n",
                                   r->serial, (unsigned long long)(want >> 20), (unsigned)heap_type, ph->serial,
                                   r->tiled_alias_owner->serial, (unsigned long long)(aoff >> 20), alias_mem,
-                                  (unsigned long long)info.gpu_address);
+                                  (unsigned long long)info.gpu_address,
+                                  r->buffer == r->tiled_alias_owner->buffer ? ", shared-handle" : "");
                     } else {
                         d3d12_log("[d3d12-tiled] ml345 Metal REFUSED overlapping no-copy for r#%u on reserved r#%u +%llu MB (len %llu); falling back\n",
                                   r->serial, tr->serial, (unsigned long long)(aoff >> 20), (unsigned long long)alen);
@@ -15304,6 +15349,49 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
                         d3d12_log("[madeira-d3d12] ml1154 CPU-visible buffer %llu MB (heap type %u) on our storage %p: %s; %ld so far, %lld MB\n",
                                   (unsigned long long)(want >> 20), (unsigned)heap_type, mem, r->buffer ? "Metal accepted it" : "Metal REFUSED it, Metal-owned instead",
                                   g_upload_swap_n, (long long)(g_upload_swap_bytes >> 20));
+                }
+            }
+        }
+        /* ml346: native Metal StorageModeShared + capped backing for reserved buffers
+         * (opt-in via d3d12-reserved-buf-native = 1|2, d3d12-reserved-buf-cap-mb = N).
+         *   mode 1: all reserved buffers use native Metal shared storage (capped).
+         *   mode 2: <= 1 GB reserved buffers (e.g. dynamic UPLOAD ring r#15) use 64 MB
+         *           native Metal shared storage; > 1 GB reserved buffers (e.g. 2 GB
+         *           DEFAULT geometry pool r#16) are capped to cap_mb and fall through
+         *           to default-buffer-swap so they stay off phys_footprint while
+         *           eliminating 1.5+ GB of unused BytesNoCopy pages. */
+        if (!r->buffer && !ph && is_reserved) {
+            long long rmode = mad_cfg_int_pe("d3d12-reserved-buf-native", 0);
+            long long cap_mb = mad_cfg_int_pe("d3d12-reserved-buf-cap-mb", 0);
+            if (rmode > 0 || cap_mb > 0) {
+                UINT64 want = info.length;
+                UINT64 alloc_len = (want + 0xffff) & ~(UINT64)0xffff;
+                if (cap_mb > 0) {
+                    UINT64 limit = (want <= (1024ull << 20)) ? (64ull << 20) : ((UINT64)cap_mb << 20);
+                    if (limit > ((UINT64)cap_mb << 20)) limit = (UINT64)cap_mb << 20;
+                    if (alloc_len > limit) alloc_len = limit;
+                }
+                if (rmode == 1 || (rmode == 2 && want <= (1024ull << 20))) {
+                    info.length = alloc_len;
+                    info.memory.ptr = NULL;
+                    info.options = WMTResourceStorageModeShared;
+                    r->buffer = MTLDevice_newBuffer(d->mtl_device, &info);
+                    if (r->buffer) {
+                        r->size = alloc_len;
+                        d3d12_log("[d3d12-tiled] ml346 reserved buffer r#%u: logical %llu MB -> native Metal shared %llu MB (cpu=%p, gpu=0x%llx)\n",
+                                  r->serial, (unsigned long long)(want >> 20), (unsigned long long)(alloc_len >> 20),
+                                  info.memory.ptr, (unsigned long long)info.gpu_address);
+                    } else {
+                        info.length = want; info.memory.ptr = NULL; info.gpu_address = 0;
+                        info.options = WMTResourceStorageModePrivate;
+                    }
+                } else if (alloc_len < want) {
+                    /* Mode 2 for > 1 GB reserved buffer: cap allocation size and let
+                     * default-buffer-swap back only the capped range off phys_footprint. */
+                    info.length = alloc_len;
+                    r->size = alloc_len;
+                    d3d12_log("[d3d12-tiled] ml346 reserved buffer r#%u: logical %llu MB -> capped %llu MB (file-backed swap)\n",
+                              r->serial, (unsigned long long)(want >> 20), (unsigned long long)(alloc_len >> 20));
                 }
             }
         }
@@ -20442,7 +20530,16 @@ static void STDMETHODCALLTYPE list_ResourceBarrier(ID3D12GraphicsCommandList *Th
      * producer must finish before a consumer that reaches the resource through
      * an argument table. At replay it closes an open compute or blit encoder
      * (render passes are closed by their target changes), and the encoder
-     * fence chain does the rest. Consecutive barrier calls fold into one. */
+     * fence chain does the rest. Consecutive barrier calls fold into one.
+     *
+     * ml1301: a batch that ran out of the 8 recorded resources used to set
+     * `all` -- "synchronize everything" -- which threw away the classification
+     * of every entry in it. Forza Horizon 6 folds ~86 entries into a batch, so
+     * that overflow was the normal case: the census showed 122.3 of 139.6
+     * barrier-caused syncs a frame reported `all`, while only 6 batches a frame
+     * could be passed as read-to-read. A full record now starts a NEW batch
+     * instead, so each one keeps its own classes and only a barrier that really
+     * covers everything (a null resource, an alias) is a full sync. */
     struct mad_list *l = (struct mad_list *)This;
     struct mad_cmd *c; UINT i;
     if (!n) return;
@@ -20474,8 +20571,13 @@ static void STDMETHODCALLTYPE list_ResourceBarrier(ID3D12GraphicsCommandList *Th
             if (c->u.barrier.cls_noref == BC_NONE || cls > c->u.barrier.cls_noref) c->u.barrier.cls_noref = cls;
             continue;
         }
-        if (c->u.barrier.n < 8) { c->u.barrier.cls[c->u.barrier.n] = cls; c->u.barrier.res[c->u.barrier.n++] = r; }
-        else { c->u.barrier.all = 1; c->u.barrier.cls_noref = BC_ALL; }
+        if (c->u.barrier.n >= 8) {   /* ml1301: a full batch is not a reason to synchronize everything */
+            struct mad_cmd *nx = mad_list_push(l, MC_BARRIER);
+            if (!nx) { c->u.barrier.all = 1; c->u.barrier.cls_noref = BC_ALL; continue; }
+            nx->u.barrier.cls_noref = BC_NONE;
+            c = nx;
+        }
+        c->u.barrier.cls[c->u.barrier.n] = cls; c->u.barrier.res[c->u.barrier.n++] = r;
     }
 }
 static UINT8 mad_eb_classify(D3D12_BARRIER_ACCESS ab, D3D12_BARRIER_ACCESS aa) {
@@ -20519,8 +20621,12 @@ static void STDMETHODCALLTYPE list_Barrier(ID3D12GraphicsCommandList7 *This, UIN
                     if (c->u.barrier.cls_noref == BC_NONE || cls > c->u.barrier.cls_noref) c->u.barrier.cls_noref = cls;
                 } else if (c->u.barrier.n < 8) {
                     c->u.barrier.cls[c->u.barrier.n] = cls; c->u.barrier.res[c->u.barrier.n++] = r;
-                } else {
-                    c->u.barrier.all = 1; c->u.barrier.cls_noref = BC_ALL;
+                } else {   /* ml1301: a full record starts a new batch, it is not a reason to sync everything */
+                    struct mad_cmd *nx = mad_list_push(l, MC_BARRIER);
+                    if (!nx) { c->u.barrier.all = 1; c->u.barrier.cls_noref = BC_ALL; continue; }
+                    nx->u.barrier.cls_noref = BC_NONE;
+                    nx->u.barrier.cls[0] = cls; nx->u.barrier.res[0] = r; nx->u.barrier.n = 1;
+                    c = nx;
                 }
             }
         } else if (gr->Type == D3D12_BARRIER_TYPE_BUFFER && gr->pBufferBarriers) {
@@ -20532,8 +20638,12 @@ static void STDMETHODCALLTYPE list_Barrier(ID3D12GraphicsCommandList7 *This, UIN
                     if (c->u.barrier.cls_noref == BC_NONE || cls > c->u.barrier.cls_noref) c->u.barrier.cls_noref = cls;
                 } else if (c->u.barrier.n < 8) {
                     c->u.barrier.cls[c->u.barrier.n] = cls; c->u.barrier.res[c->u.barrier.n++] = r;
-                } else {
-                    c->u.barrier.all = 1; c->u.barrier.cls_noref = BC_ALL;
+                } else {   /* ml1301: a full record starts a new batch, it is not a reason to sync everything */
+                    struct mad_cmd *nx = mad_list_push(l, MC_BARRIER);
+                    if (!nx) { c->u.barrier.all = 1; c->u.barrier.cls_noref = BC_ALL; continue; }
+                    nx->u.barrier.cls_noref = BC_NONE;
+                    nx->u.barrier.cls[0] = cls; nx->u.barrier.res[0] = r; nx->u.barrier.n = 1;
+                    c = nx;
                 }
             }
         } else {
@@ -20975,7 +21085,7 @@ static HRESULT mad_create_reserved(struct mad_device *d, const D3D12_RESOURCE_DE
         return E_OUTOFMEMORY;
     }
     if (!out) return S_FALSE;   /* the documented capability test: valid, nothing created */
-    hr = mad_create_resource(d, D3D12_HEAP_TYPE_DEFAULT, desc, riid, out);
+    hr = mad_create_resource_ex(d, D3D12_HEAP_TYPE_DEFAULT, desc, riid, out, NULL, 0, 1);
     if (SUCCEEDED(hr) && *out) {
         struct mad_resource *r = (struct mad_resource *)*out;
         LONG n;
@@ -21078,12 +21188,13 @@ static void STDMETHODCALLTYPE queue_UpdateTileMappings(ID3D12CommandQueue *This,
         struct mad_resource *r = (struct mad_resource *)res;
         struct mad_memheap *h = (struct mad_memheap *)heap;
         int is_null = (rflags && nrange && (rflags[0] & D3D12_TILE_RANGE_FLAG_NULL));
-        if (!is_null && r->desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && r->own_mem) {
+        if (!is_null && r->desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && (r->own_mem || r->cpu)) {
             UINT64 res_off = starts ? (UINT64)starts[0].X * MAD_TILE_BYTES : 0;
             UINT64 heap_off = (heap_offs && nrange) ? (UINT64)heap_offs[0] * MAD_TILE_BYTES : 0;
             UINT64 ntiles = sizes ? (UINT64)sizes[0].NumTiles : 1;
             UINT64 nbytes = ntiles * MAD_TILE_BYTES;
-            if (heap_off == 0 && nbytes > 0 && res_off + nbytes <= ((r->size + 0xffff) & ~(UINT64)0xffff)) {
+            UINT64 backing = (r->size + 0xffff) & ~(UINT64)0xffff;
+            if (heap_off == 0 && nbytes > 0 && res_off + nbytes <= backing) {
                 struct mad_resource *prev = NULL;
                 unsigned existing_pl = 0;
                 ID3D12Resource_AddRef(res);
@@ -21098,6 +21209,10 @@ static void STDMETHODCALLTYPE queue_UpdateTileMappings(ID3D12CommandQueue *This,
                 d3d12_log("[d3d12-tiled] ml345 bound heap%u (%llu KB, type %u) -> reserved r#%u +%llu MB (%llu MB, existing placed=%u)\n",
                           h->serial, (unsigned long long)(h->desc.SizeInBytes >> 10), (unsigned)h->desc.Properties.Type,
                           r->serial, (unsigned long long)(res_off >> 20), (unsigned long long)(nbytes >> 20), existing_pl);
+            } else if (nbytes > 0 && res_off + nbytes > backing) {
+                d3d12_log("[d3d12-tiled] ml346 OVERFLOW: heap%u (%llu KB, type %u) -> reserved r#%u +%llu MB (%llu MB) exceeds backing %llu MB!\n",
+                          h->serial, (unsigned long long)(h->desc.SizeInBytes >> 10), (unsigned)h->desc.Properties.Type,
+                          r->serial, (unsigned long long)(res_off >> 20), (unsigned long long)(nbytes >> 20), (unsigned long long)(backing >> 20));
             }
         }
     }
@@ -21191,6 +21306,7 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommandList1(ID3D12Device10 *This,
     if (!l) return E_OUTOFMEMORY;
     l->type = type;
     l->vtbl = &g_list_vtbl; l->refs = 1; l->iid = &IID_ID3D12GraphicsCommandList; l->name = "GraphicsCommandList";
+    InitializeCriticalSection(&l->idle_lock); InitializeConditionVariable(&l->idle_cv);   /* ml1302 */
     l->device = (struct mad_device *)This;
     l->closed = 1;
     HRESULT hr = list_QI((ID3D12GraphicsCommandList *)l, riid, out);
