@@ -130,7 +130,9 @@ size_t ios_jit_low_size_global;
 /* ml2021: madeira.cfg swap-wow64 (default), no WoW64 guest window, and the donor guard's host free RAM */
 static long madeira_cfg_int( const char *key, long def ) { (void)key; return def; }
 static ULONG_PTR ios_wow_window_covering( const void *s, const void *e ) { (void)s; (void)e; return 0; }
+#ifndef __APPLE__
 static uint64_t ios_donor_system_free( void ) { return 0; }
+#endif
 /* the churn filter's limit check (ios_swap_footprint_tight); 0 = no limit known, never tight */
 size_t os_proc_available_memory( void ) { return 0; }
 /* the calling program is not a Chromium browser (ios_swap_browser) */
@@ -668,7 +670,7 @@ punch = body_of(virt, 'static void *ios_swap_punch_thread( void *arg )\n{')
 check(punch.index('ios_swap_punch_timed(') < punch.index('pthread_mutex_lock( &virtual_mutex );') < punch.index('ios_swap_free_add('),
       'ml1291: the punch runs without virtual_mutex, the free list is updated under it')
 rel = body_of(virt, 'static void ios_swap_release_range( void *base, size_t size, int copy_back )\n{')
-check('if (!copy_back) msync( oa, olen, MS_KILLPAGES );\n            ios_swap_give( ooff, olen );' in rel,
+check('msync( oa, olen, MS_KILLPAGES );' in rel and rel.index('msync( oa, olen, MS_KILLPAGES );') < rel.index('ios_swap_give( ooff, olen );'),
       'ml1293: a released range drops its dirty pages before it is given back')
 resv = body_of(virt, 'static int ios_swap_punch_resv( char *lo, size_t len )\n{')
 check('msync( lo, len, MS_KILLPAGES );' in resv and resv.index('msync( lo, len, MS_KILLPAGES );') < resv.index('ios_swap_punch_timed('),

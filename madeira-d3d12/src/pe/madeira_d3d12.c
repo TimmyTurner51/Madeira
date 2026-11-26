@@ -508,6 +508,7 @@ static volatile LONG64 g_defswap_bytes; static volatile LONG g_defswap_n;   /* f
 static volatile LONG64 g_defswap_wired; static volatile LONG g_defswap_nwired, g_defswap_wire_fail;   /* default-buffer-swap-wire (opt-in) */
 static void mad_dsw_census(void);   /* default-buffer-swap residency census (opt-in) */
 static volatile LONG64 g_reserved_live_bytes; static volatile LONG g_reserved_live_n;   /* d3d12-tiled-resources: reserved resources live */
+static volatile LONG64 g_mip_drop_saved; static volatile LONG g_mip_drop_n;   /* tex-drop-mip: sampled textures shrunk & estimated bytes saved */
 /* madeira-bcd metal-gap: what the ml1150 line's Metal total is made of, beyond
  * the ml1057 estimate. Red Dead Redemption 2 (build 467, 13:09) grew Metal's
  * currentAllocatedSize from 2366 to 2931 MB in its last minute while the
@@ -1116,6 +1117,9 @@ static void mad_acct_report(void) {
         d3d12_log("[madeira-d3d12] default-buffer-swap-wire: %ld of them wired, %lld MB; %ld refused by VirtualLock\n",
                   (long)g_defswap_nwired, (long long)(g_defswap_wired >> 20), (long)g_defswap_wire_fail);
     if (g_defswap_n) mad_dsw_census();   /* opt-in, env.MADEIRA_WSEX_MINCORE */
+    if (g_mip_drop_n)
+        d3d12_log("[madeira-d3d12] tex-drop-mip: %ld sampled textures dropped top mip(s), ~%lld MB saved\n",
+                  (long)g_mip_drop_n, (long long)(g_mip_drop_saved >> 20));
     if (g_hp_dev) d3d12_log("[madeira-d3d12] ml1072 texture heaps: %u (%lld MB reserved, %lld MB live in them), %ld textures placed, %ld fallbacks, %u blocks awaiting GPU\n",
                             g_hp_dev->ntheaps, (long long)(g_hp_dev->hp_total_bytes >> 20), (long long)(g_hp_dev->hp_live_bytes >> 20),
                             g_hp_dev->hp_textures, g_hp_dev->hp_fallbacks, g_hp_dev->nhret);
@@ -1178,6 +1182,7 @@ struct mad_resource {
     unsigned serial;                   /* madeira-bcd: creation number, names a resource in capture / alias logs */
     void *own_mem;                     /* ml1154: our VirtualAlloc'd storage behind a CPU-visible buffer */
     int own_wired;                     /* default-buffer-swap-wire: own_mem is VirtualLock'ed (VirtualFree unwires it) */
+    struct mad_resource *tiled_alias_owner; /* ml345: reserved buffer whose own_mem backs this placed buffer */
     unsigned track_seq;                /* ml1157: creation order in the address index (newest alias wins) */
     obj_handle_t buffer;
     void *cpu;                 /* NULL for GPU-private */
@@ -1220,6 +1225,7 @@ struct mad_resource {
     unsigned nxview, xview_cap;
     UINT64 reserved_bytes;   /* d3d12-tiled-resources: created by CreateReservedResource (fully backed), its tiles x 64 KB */
     UINT64 metal_bytes;      /* madeira-bcd metal-gap: a standalone texture, as Metal sizes it (0 = not counted) */
+    UINT mip_drop;           /* tex-drop-mip: top mip levels omitted from the Metal backing (D3D mip N -> Metal mip N - mip_drop) */
 };
 /* srv_res / uav_res membership, O(1) through the resource's slot (the linear
  * scan it replaces ran over ~15,000 textures on every view creation). */
@@ -9413,7 +9419,7 @@ static int mad_bc_upload_decoded(struct mad_exec *e, const struct mad_cmd *c) {
                       (unsigned long long)b->size, t->width, t->height);
         return 0;
     }
-    mad_mip_dims(t, c->u.bt.level, &mw, &mh, &md);
+    mad_mip_dims(t, c->u.bt.level + t->mip_drop, &mw, &mh, &md);
     cw = c->u.bt.x < mw ? mw - c->u.bt.x : 0; if (c->u.bt.w < cw) cw = c->u.bt.w;
     ch = c->u.bt.y < mh ? mh - c->u.bt.y : 0; if (c->u.bt.h < ch) ch = c->u.bt.h;
     cd = c->u.bt.d ? c->u.bt.d : 1;
@@ -11506,18 +11512,30 @@ static struct {
 #define g_list_vtbl (g_list_vtbl8.v7)
 static ID3D12FenceVtbl g_fence_vtbl;
 
+static int mad_enhanced_barriers_on(void) {
+    static int eb = -1;
+    if (eb < 0) {
+        eb = mad_cfg_int_pe("d3d12-enhanced-barriers", 0) ? 1 : 0;   /* 1: report EnhancedBarriersSupported=TRUE, answer ID3D12Device9/10, and lower ID3D12GraphicsCommandList7::Barrier into Metal encoder fences */
+        if (eb) d3d12_log("[d3d12-caps] enhanced-barriers=1 (d3d12-enhanced-barriers): OPTIONS12 + Device9/10 enabled\n");
+    }
+    return eb;
+}
+
 static HRESULT STDMETHODCALLTYPE device_QI(ID3D12Device *This, REFIID riid, void **out) {
     HRESULT hr;
     /* ml877: ID3D12Device1..8 are the same object with a longer vtable. UE 5.4
      * refuses to run without Device1 AND Device2 ("Missing full support for
      * Direct3D 12", D3D12Adapter.cpp:946) and uses Device2::CreatePipelineState,
      * Device4::CreateCommandList1/CreateCommittedResource1 when present.
-     * Device9/10 (shader cache sessions, enhanced barriers) stay refused so the
-     * log names them if a title asks. */
+     * Device9/10 (shader cache sessions, enhanced barriers) stay refused by
+     * default so the log names them if a title asks, and are answered when
+     * d3d12-enhanced-barriers = 1 is opted in. */
     if (out && riid && (IsEqualGUID(riid, &IID_ID3D12Device1) || IsEqualGUID(riid, &IID_ID3D12Device2) ||
                         IsEqualGUID(riid, &IID_ID3D12Device3) || IsEqualGUID(riid, &IID_ID3D12Device4) ||
                         IsEqualGUID(riid, &IID_ID3D12Device5) || IsEqualGUID(riid, &IID_ID3D12Device6) ||
-                        IsEqualGUID(riid, &IID_ID3D12Device7) || IsEqualGUID(riid, &IID_ID3D12Device8))) {
+                        IsEqualGUID(riid, &IID_ID3D12Device7) || IsEqualGUID(riid, &IID_ID3D12Device8) ||
+                        (mad_enhanced_barriers_on() &&
+                         (IsEqualGUID(riid, &IID_ID3D12Device9) || IsEqualGUID(riid, &IID_ID3D12Device10))))) {
         InterlockedIncrement(&((struct mad_obj *)This)->refs);
         *out = This;
         return S_OK;
@@ -11811,11 +11829,18 @@ static HRESULT STDMETHODCALLTYPE device_CheckFeatureSupport(ID3D12Device *This,
         if (tier) o->RaytracingTier = tier == 11 ? D3D12_RAYTRACING_TIER_1_1 : D3D12_RAYTRACING_TIER_1_0;
         return S_OK;
     }
+    case D3D12_FEATURE_D3D12_OPTIONS12: {
+        D3D12_FEATURE_DATA_D3D12_OPTIONS12 *o = data;
+        if (size < sizeof *o) return E_INVALIDARG;
+        memset(o, 0, sizeof *o);
+        if (mad_enhanced_barriers_on()) o->EnhancedBarriersSupported = TRUE;
+        return S_OK;
+    }
     case D3D12_FEATURE_D3D12_OPTIONS2:
     case D3D12_FEATURE_D3D12_OPTIONS3: case D3D12_FEATURE_D3D12_OPTIONS4:
     case D3D12_FEATURE_D3D12_OPTIONS6:
     case D3D12_FEATURE_D3D12_OPTIONS7: case D3D12_FEATURE_D3D12_OPTIONS8:
-    case D3D12_FEATURE_D3D12_OPTIONS10: case D3D12_FEATURE_D3D12_OPTIONS12:
+    case D3D12_FEATURE_D3D12_OPTIONS10:
     case D3D12_FEATURE_D3D12_OPTIONS13: case D3D12_FEATURE_D3D12_OPTIONS14:
     case D3D12_FEATURE_D3D12_OPTIONS15: case D3D12_FEATURE_D3D12_OPTIONS16:
     case D3D12_FEATURE_D3D12_OPTIONS17: case D3D12_FEATURE_D3D12_OPTIONS18:
@@ -11880,9 +11905,11 @@ static HRESULT STDMETHODCALLTYPE device_CheckFeatureSupport(ID3D12Device *This,
                           D3D12_FORMAT_SUPPORT1_SHADER_LOAD | D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE | D3D12_FORMAT_SUPPORT1_MIP |
                           D3D12_FORMAT_SUPPORT1_SHADER_GATHER | D3D12_FORMAT_SUPPORT1_MULTISAMPLE_LOAD;
             if (block == 1) {   /* uncompressed: render and unordered access too */
-                f->Support1 |= D3D12_FORMAT_SUPPORT1_RENDER_TARGET | D3D12_FORMAT_SUPPORT1_BLENDABLE | D3D12_FORMAT_SUPPORT1_DISPLAY |
+                f->Support1 |= D3D12_FORMAT_SUPPORT1_RENDER_TARGET | D3D12_FORMAT_SUPPORT1_DISPLAY |
                                D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RESOLVE | D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RENDERTARGET |
                                D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW;
+                if (!mad_format_is_int(f->Format))
+                    f->Support1 |= D3D12_FORMAT_SUPPORT1_BLENDABLE;
                 f->Support2 = D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD | D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE;
                 if (f->Format == DXGI_FORMAT_R32_UINT || f->Format == DXGI_FORMAT_R32_SINT)
                     f->Support2 |= D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_ADD | D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_BITWISE_OPS |
@@ -12279,6 +12306,21 @@ static UINT mad_full_mips(const D3D12_RESOURCE_DESC *d) {
     while (m > 1) { n++; m >>= 1; }
     return n;
 }
+static int g_tex_drop_mip = -1, g_tex_drop_min = 256;
+static int mad_tex_drop_mip_cfg(UINT *min_dim) {
+    if (g_tex_drop_mip < 0) {
+        int v = mad_cfg_int_pe("tex-drop-mip", 0);
+        int m = mad_cfg_int_pe("tex-drop-mip-min", 256);
+        if (v < 0) v = 0; else if (v > 4) v = 4;
+        if (m < 32) m = 32; else if (m > 4096) m = 4096;
+        g_tex_drop_min = m;
+        g_tex_drop_mip = v;
+        if (v) d3d12_log("[madeira-d3d12] tex-drop-mip = %d (min dim %d px)\n", v, m);
+    }
+    if (min_dim) *min_dim = (UINT)g_tex_drop_min;
+    return g_tex_drop_mip;
+}
+
 static const D3D12_RESOURCE_DESC *mad_desc_mips(const D3D12_RESOURCE_DESC *in, D3D12_RESOURCE_DESC *tmp) {
     if (!in || in->MipLevels || in->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER || in->Dimension == D3D12_RESOURCE_DIMENSION_UNKNOWN) return in;
     if (g_mip0_full < 0) g_mip0_full = mad_cfg_int_pe("mip0-full", 0) ? 1 : 0;   /* fix: a texture created with MipLevels 0 gets the full mip chain and GetDesc answers its count, as D3D12 does (FSR 3.1 frame generation's inpainting pyramid: Horizon Forbidden West's black squares); 0 = one level, GetDesc answers 0 */
@@ -14228,7 +14270,8 @@ static HRESULT STDMETHODCALLTYPE device_CreateQueryHeap(ID3D12Device *This,
     q->results = calloc(desc->Count ? desc->Count : 1, sizeof *q->results);   /* ml1088 */
     if (!q->results) { free(q); return E_OUTOFMEMORY; }
     InitializeCriticalSection(&q->lock);
-    InterlockedExchange(&q->device->has_query_heaps, 1);
+    if (desc->Type == D3D12_QUERY_HEAP_TYPE_OCCLUSION)
+        InterlockedExchange(&q->device->has_query_heaps, 1);
     d3d12_log("[madeira-d3d12] query heap: type %u, %u queries (%s)\n",
               (unsigned)desc->Type, desc->Count,
               (desc->Type == D3D12_QUERY_HEAP_TYPE_OCCLUSION) ? "ml1088: counted on the GPU" : "results resolve to zero");
@@ -14721,11 +14764,12 @@ static ULONG STDMETHODCALLTYPE res_Release(ID3D12Resource *This) {
         }
         if (r->acct_bytes) mad_acct(r, r->acct_cat, r->acct_bytes, -1);   /* ml1057 */
         if (r->reserved_bytes) { InterlockedExchangeAdd64(&g_reserved_live_bytes, -(LONG64)r->reserved_bytes); InterlockedDecrement(&g_reserved_live_n); }   /* d3d12-tiled-resources census */
-        if (r->buffer && !r->placed_heap) mad_unresident(r->owner, r->buffer);
+        if (r->buffer && (!r->placed_heap || r->tiled_alias_owner)) mad_unresident(r->owner, r->buffer);
         if (r->texture && !r->borrowed && !r->hp_used && !r->placed_heap) mad_unresident(r->owner, r->texture);
         if (r->hp_used && r->owner) mad_hp_release(r->owner, r);   /* ml1072: block returns after the GPU is done with it */
         { unsigned k; for (k = 0; k < r->nview_old; k++) free(r->view_old[k]); free(r->tview); free(r->tvh); free(r->xview); }
         if (r->buffer) NSObject_release(r->buffer);
+        if (r->tiled_alias_owner) ID3D12Resource_Release((ID3D12Resource *)r->tiled_alias_owner);
         if (r->texture && !r->borrowed) NSObject_release(r->texture);
         if (r->resolve_tmp) NSObject_release(r->resolve_tmp);
         if (r->placed_heap) { mad_pl_del(r->placed_heap, r); ID3D12Heap_Release((ID3D12Heap *)r->placed_heap); }   /* ml1145 */
@@ -14916,7 +14960,10 @@ struct mad_memheap {
     struct mad_device *device;
     D3D12_HEAP_DESC desc;
     obj_handle_t mtl;   /* ml1145: the Metal placement heap, or 0 */
+    int mtl_tried;      /* lazy placement heap: 1 once MTLDevice_newPlacementHeap has been attempted */
     SRWLOCK pl_lock; struct mad_resource **pl; unsigned npl, pl_cap; unsigned serial;   /* madeira-bcd: what is placed in it */
+    struct mad_resource *tiled_res;   /* ml345: reserved buffer mapped to this heap via UpdateTileMappings */
+    UINT64 tiled_byte_off, tiled_bytes;
 };
 static LONG g_res_serial, g_heap_serial;
 /* madeira-bcd: placed-resource registry per heap, for the alias report. */
@@ -15047,6 +15094,38 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
          * process in Metal's descriptor validation. Direct3D 12 refuses such a description with E_INVALIDARG; so does
          * this, with the game's own description in the log. */
         if ((!ti.width || !ti.height) && mad_zero_extent_guard()) { free(r); mad_refuse_log(desc, heap_type, "zero-size texture (Metal aborts the process on it)"); return E_INVALIDARG; }
+        /* tex-drop-mip (opt-in, default 0): drop top mip level(s) on committed / reserved read-only
+         * sampled 2D textures to cut wired Metal GPU footprint on memory-constrained iOS devices.
+         * r->desc stays unchanged so GetDesc / GetCopyableFootprints match the game's staging buffers;
+         * CopyTextureRegion skips dropped levels and shifts Metal level by mip_drop, and SRVs shift
+         * MostDetailedMip / ResourceMinLODClamp by mip_drop. */
+        if (!ph && heap_type == D3D12_HEAP_TYPE_DEFAULT && desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+            && !is_depth
+            && !(desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
+            && ti.sample_count <= 1 && ti.mipmap_level_count >= 2) {
+            UINT min_dim = 256;
+            int cfg_drop = mad_tex_drop_mip_cfg(&min_dim);
+            if (cfg_drop > 0) {
+                UINT fb = 0, blk = 1, w = ti.width, h = ti.height, m = ti.mipmap_level_count, drop = 0;
+                mad_format_info(desc->Format, &fb, &blk);
+                if (!blk) blk = 1;
+                while ((int)drop < cfg_drop && m > 1 && (w >= min_dim || h >= min_dim)) {
+                    UINT nw = w >> 1, nh = h >> 1;
+                    if (nw < blk || nh < blk || (nw & (blk - 1)) || (nh & (blk - 1))) break;
+                    w = nw; h = nh; m--; drop++;
+                }
+                if (drop) {
+                    UINT64 b0 = (UINT64)ti.width * ti.height * (ti.array_length ? ti.array_length : 1) * (fb ? fb : 4) / ((UINT64)blk * blk);
+                    UINT64 b1 = (UINT64)w * h * (ti.array_length ? ti.array_length : 1) * (fb ? fb : 4) / ((UINT64)blk * blk);
+                    b0 += b0 / 3;
+                    if (m > 1) b1 += b1 / 3;
+                    ti.width = w; ti.height = h; ti.mipmap_level_count = m;
+                    r->mip_drop = drop;
+                    InterlockedIncrement(&g_mip_drop_n);
+                    if (b0 > b1) InterlockedExchangeAdd64(&g_mip_drop_saved, (LONG64)(b0 - b1));
+                }
+            }
+        }
         if (ph && ph->mtl) {   /* ml1145: inside the application's heap, at its offset */
             UINT64 psz = 0, pal = 0;
             MTLDevice_heapTextureSizeAndAlign(d->mtl_device, &ti, &psz, &pal);
@@ -15137,6 +15216,70 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
                 r->buffer = MTLHeap_newBufferAtOffset(ph->mtl, &info, poff);
             if (r->buffer) { r->placed_heap = ph; r->placed_off = poff; r->placed_size = psz; mad_pl_add(ph, r); ID3D12Heap_AddRef((ID3D12Heap *)ph); InterlockedIncrement(&g_placed_in_heap); }
             else { mad_placed_fallback(ph, desc, poff, psz, pal); info.memory.ptr = NULL; info.gpu_address = 0; }
+        }
+        /* ml345: zero-copy tiled-buffer aliasing. D3D12 titles cannot Map() a
+         * CreateReservedResource buffer directly; they create an UPLOAD heap,
+         * map it into the reserved buffer via UpdateTileMappings, then call
+         * CreatePlacedResource(heap) + Map() to write per-frame transforms,
+         * instances and dynamic geometry that the GPU reads through the
+         * reserved buffer. When the reserved buffer has unified CPU/GPU storage
+         * (default-buffer-swap own_mem), alias this placed buffer directly onto
+         * own_mem + tiled_byte_off + poff so CPU writes appear immediately at
+         * the reserved buffer's GPU virtual address with zero extra RAM. */
+        if (!r->buffer && ph) {
+            struct mad_resource *tr = NULL;
+            UINT64 toff = 0, tlen = 0;
+            AcquireSRWLockShared(&ph->pl_lock);
+            if (ph->tiled_res && ph->tiled_res->own_mem) {
+                tr = ph->tiled_res;
+                toff = ph->tiled_byte_off;
+                tlen = ph->tiled_bytes;
+                ID3D12Resource_AddRef((ID3D12Resource *)tr);
+            }
+            ReleaseSRWLockShared(&ph->pl_lock);
+            if (tr) {
+                UINT64 aoff = toff + poff;
+                UINT64 want = info.length;
+                SIZE_T alen = (SIZE_T)((want + 0x3fff) & ~(UINT64)0x3fff);
+                UINT64 tr_alloc = (tr->size + 0xffff) & ~(UINT64)0xffff;
+                if ((aoff & 0x3fff) == 0 && aoff + alen <= tr_alloc) {
+                    void *alias_mem = (char *)tr->own_mem + aoff;
+                    info.length = alen;
+                    info.memory.ptr = alias_mem;
+                    info.options = WMTResourceStorageModeShared;
+                    r->buffer = MTLDevice_newBuffer(d->mtl_device, &info);
+                    if (!r->buffer && aoff == 0 && tr->buffer) {
+                        /* Fallback if Metal rejects overlapping no-copy at offset 0: reuse reserved buffer handle */
+                        NSObject_retain(tr->buffer);
+                        r->buffer = tr->buffer;
+                        info.gpu_address = tr->gpu_address;
+                        info.memory.ptr = alias_mem;
+                    }
+                    if (r->buffer) {
+                        r->tiled_alias_owner = tr;
+                        tr = NULL;
+                        r->placed_heap = ph;
+                        r->placed_off = poff;
+                        r->placed_size = alen;
+                        mad_pl_add(ph, r);
+                        ID3D12Heap_AddRef((ID3D12Heap *)ph);
+                        mad_resident(d, r->buffer);
+                        d3d12_log("[d3d12-tiled] ml345 placed buffer r#%u (%llu MB, heap-type %u) in heap%u aliased onto reserved r#%u +%llu MB (cpu=%p, gpu=0x%llx)\n",
+                                  r->serial, (unsigned long long)(want >> 20), (unsigned)heap_type, ph->serial,
+                                  r->tiled_alias_owner->serial, (unsigned long long)(aoff >> 20), alias_mem,
+                                  (unsigned long long)info.gpu_address);
+                    } else {
+                        d3d12_log("[d3d12-tiled] ml345 Metal REFUSED overlapping no-copy for r#%u on reserved r#%u +%llu MB (len %llu); falling back\n",
+                                  r->serial, tr->serial, (unsigned long long)(aoff >> 20), (unsigned long long)alen);
+                        info.length = want;
+                        info.memory.ptr = NULL;
+                        info.gpu_address = 0;
+                        info.options = heap_type == D3D12_HEAP_TYPE_DEFAULT ? WMTResourceStorageModePrivate : WMTResourceStorageModeShared;
+                    }
+                }
+                if (tr) ID3D12Resource_Release((ID3D12Resource *)tr);
+            }
+            (void)tlen;
         }
         /* ml1154: a large CPU-visible buffer gets storage WE allocate, handed to
          * Metal as a no-copy buffer. A fresh >= 8 MB guest commit is backed by
@@ -15278,6 +15421,7 @@ static ULONG STDMETHODCALLTYPE memheap_Release(ID3D12Heap *This) {
             if (!queued) { mad_unresident(hd, h->mtl); NSObject_release(h->mtl); }
             mad_mheap_reclaim(hd, 0);
         }
+        if (h->tiled_res) { ID3D12Resource_Release((ID3D12Resource *)h->tiled_res); h->tiled_res = NULL; }
         free(h->pl);   /* madeira-bcd: placed registry (every placed resource is gone by now) */
         free(o);
     }
@@ -15302,11 +15446,46 @@ static D3D12_HEAP_DESC * STDMETHODCALLTYPE memheap_GetDesc(ID3D12Heap *This, D3D
     return ret;
 }
 
+static int mad_heap_backing_cfg(int *lazy_out) {
+    static int backing = -1, lazy = -1;
+    if (backing < 0) {
+        int b = (int)mad_cfg_int_pe("heap-backing", 1);
+        int l = (int)mad_cfg_int_pe("heap-backing-lazy", mad_tiled_on() ? 1 : 0);
+        d3d12_log("[madeira-d3d12] ml1145 heap-backing = %d (lazy = %d; DEFAULT heaps %s)\n", b, l,
+                  !b ? "are descriptions only" : l ? "allocate Metal placement heaps on first CreatePlacedResource" : "are Metal placement heaps; placed resources alias");
+        lazy = l;
+        MemoryBarrier();
+        backing = b;
+    }
+    if (lazy_out) *lazy_out = lazy;
+    return backing;
+}
+static void mad_memheap_ensure_mtl(struct mad_memheap *h) {
+    static unsigned said_b;
+    struct mad_device *hd;
+    if (!h || h->mtl_tried) return;
+    if (!mad_heap_backing_cfg(NULL) || h->desc.Properties.Type != D3D12_HEAP_TYPE_DEFAULT || !h->desc.SizeInBytes) {
+        h->mtl_tried = 1;
+        return;
+    }
+    AcquireSRWLockExclusive(&h->pl_lock);
+    if (!h->mtl_tried) {
+        hd = h->device;
+        h->mtl = MTLDevice_newPlacementHeap(hd->mtl_device, h->desc.SizeInBytes, WMTResourceStorageModePrivate);
+        if (h->mtl) { mad_resident(hd, h->mtl); InterlockedExchangeAdd64(&g_mheap_bytes, (LONG64)h->desc.SizeInBytes); }   /* madeira-bcd metal-gap */
+        if (said_b++ < 32) d3d12_log("[madeira-d3d12] ml1145 heap %llu KB flags %#x %s\n", (unsigned long long)(h->desc.SizeInBytes >> 10),
+                                     (unsigned)h->desc.Flags, h->mtl ? "backed by a Metal placement heap" : "COULD NOT be backed; its resources stand alone");
+        MemoryBarrier();
+        h->mtl_tried = 1;
+    }
+    ReleaseSRWLockExclusive(&h->pl_lock);
+}
 static HRESULT STDMETHODCALLTYPE device_CreateHeap(ID3D12Device *This, const D3D12_HEAP_DESC *desc,
                                                    REFIID riid, void **out) {
     struct mad_memheap *h;
     HRESULT hr;
     static unsigned said;
+    int lazy = 0;
     if (!desc || !out) return E_INVALIDARG;
     *out = NULL;
     h = calloc(1, sizeof *h);
@@ -15315,17 +15494,7 @@ static HRESULT STDMETHODCALLTYPE device_CreateHeap(ID3D12Device *This, const D3D
     h->serial = (unsigned)InterlockedIncrement(&g_heap_serial);   /* madeira-bcd */
     h->device = (struct mad_device *)This;
     h->desc = *desc;
-    {   /* ml1145 */
-        static int backing = -1; static unsigned said_b;
-        struct mad_device *hd = (struct mad_device *)This;
-        if (backing < 0) { backing = (int)mad_cfg_int_pe("heap-backing", 1); d3d12_log("[madeira-d3d12] ml1145 heap-backing = %d (DEFAULT heaps %s)\n", backing, backing ? "are Metal placement heaps; placed resources alias" : "are descriptions only"); }
-        if (backing && desc->Properties.Type == D3D12_HEAP_TYPE_DEFAULT && desc->SizeInBytes) {
-            h->mtl = MTLDevice_newPlacementHeap(hd->mtl_device, desc->SizeInBytes, WMTResourceStorageModePrivate);
-            if (h->mtl) { mad_resident(hd, h->mtl); InterlockedExchangeAdd64(&g_mheap_bytes, (LONG64)desc->SizeInBytes); }   /* madeira-bcd metal-gap */
-            if (said_b++ < 32) d3d12_log("[madeira-d3d12] ml1145 heap %llu KB flags %#x %s\n", (unsigned long long)(desc->SizeInBytes >> 10),
-                                         (unsigned)desc->Flags, h->mtl ? "backed by a Metal placement heap" : "COULD NOT be backed; its resources stand alone");
-        }
-    }
+    if (mad_heap_backing_cfg(&lazy) && !lazy) mad_memheap_ensure_mtl(h);
     if (said < 4096) {   /* ml891: every heap, with its alignment -- the transient allocator lives here */
         said++;
         d3d12_log("[madeira-d3d12] heap: %llu KB, type %u, flags %#x, align %llu -> %p\n",
@@ -15345,6 +15514,7 @@ static HRESULT STDMETHODCALLTYPE device_CreatePlacedResource(ID3D12Device *This,
     static unsigned said;
     (void)state; (void)clear;
     if (!h || !desc || !out) { if (said++ < 8) d3d12_log("[madeira-d3d12] CreatePlacedResource: null heap/desc/out\n"); return E_INVALIDARG; }
+    mad_memheap_ensure_mtl(h);
     hr = mad_create_resource_at((struct mad_device *)This, h->desc.Properties.Type, desc, riid, out, h, offset);   /* ml1145 */
     if (SUCCEEDED(hr) && *out) {   /* madeira-bcd: every placement, so a capture's alias report can be followed back */
         static LONG psaid; const struct mad_resource *pr = (const struct mad_resource *)*out; char t[80];
@@ -16424,6 +16594,15 @@ static void STDMETHODCALLTYPE device_CreateShaderResourceView(ID3D12Device *This
         default: break;
         }
         if (r->tex_type == WMTTextureType2DMultisample || r->tex_type == WMTTextureType2DMultisampleArray) { lvl0 = 0; nlvl = 1; }
+        if (r->mip_drop) {
+            if (lvl0 >= r->mip_drop) lvl0 -= r->mip_drop;
+            else {
+                UINT cut = r->mip_drop - lvl0;
+                if (nlvl != ~0u) nlvl = nlvl > cut ? nlvl - cut : 1;
+                lvl0 = 0;
+            }
+            if (r->tex_mips && lvl0 >= r->tex_mips) lvl0 = r->tex_mips - 1;
+        }
         {   /* ml918: the view's format (typeless -> typed, sRGB/linear) and Shader4ComponentMapping */
             enum WMTPixelFormat pf = 0; int vd = 0, stencil_view = 0; UINT swz = 0, c, m = desc->Shader4ComponentMapping;
             if (desc->Format != DXGI_FORMAT_UNKNOWN && !r->is_depth && mad_map_texture_format(desc->Format, 0, &pf, &vd) && !vd && pf != r->tex_pf) { /* keep pf */ } else pf = 0;
@@ -16467,6 +16646,10 @@ static void STDMETHODCALLTYPE device_CreateShaderResourceView(ID3D12Device *This
          * the view's first mip becomes ceil(clamp). Implicit-LOD sampling is then
          * exactly the clamped result (LOD is computed against the view's base
          * level); only explicit mip indices see a shifted numbering. */
+        if (r->mip_drop && min_lod > 0.0f) {
+            min_lod -= (float)r->mip_drop;
+            if (min_lod < 0.0f) min_lod = 0.0f;
+        }
         if (min_lod > 0.0f) {
             UINT c = (UINT)(min_lod + 0.9999f);
             if (nlvl != ~0u && c >= nlvl) c = nlvl ? nlvl - 1 : 0;
@@ -16897,6 +17080,8 @@ static void mad_sc_key(const struct madeira_ir_convert_args *a, UINT64 key[2]) {
     } else mad_sc_feed_u64(&h, 0);
     mad_sc_feed_u64(&h, ((UINT64)a->ps_valid << 32) | a->ps_sample_mask);
     mad_sc_feed_u64(&h, ((UINT64)a->ps_flags << 32) | a->ps_unorm_output_mask);
+    if (a->ps_valid && (a->ps_flags & MADEIRA_IR_PS_DUAL_SOURCE_BLEND))
+        mad_sc_feed_u64(&h, 0x44534231ull);   /* DSB1: DXIL dual-source blend variant */
     mad_sc_feed_blob(&h, a->vs_bytecode, a->vs_bytecode_len);
     mad_sc_feed_u64(&h, ((UINT64)a->tess_stage << 32) | a->tess_index_format);
     mad_sc_feed_blob(&h, a->hs_bytecode, a->hs_bytecode_len);
@@ -19047,22 +19232,33 @@ static HRESULT device_CreateGraphicsPipelineState_impl(ID3D12Device *This,
             char gsname[64];
             if (!L) { pso_Release((ID3D12PipelineState *)p); return E_OUTOFMEMORY; }
             mad_build_input_layout(desc, p, L);
-            memset(&ov, 0, sizeof ov); ov.gs_emulation = 1; ov.topology = (UINT)desc->PrimitiveTopologyType; ov.layout = L->n ? L : NULL;
+            /* Even a 0-input-element VS (SV_VertexID vertex-pulling) needs a
+             * synthesized stage-in function to link in Metal's GS emulation
+             * pipeline (matching mad_dtess_convert above), so pass L directly. */
+            memset(&ov, 0, sizeof ov); ov.gs_emulation = 1; ov.topology = (UINT)desc->PrimitiveTopologyType; ov.layout = L;
             ov.lib2_out = &p->si_lib; ov.vs_output_size = &p->gs_vertex_size; ov.name_out = p->vs_name; ov.name_cap = sizeof p->vs_name;
-            p->vs_fn = mad_convert_stage_opts(d, rs, desc->VS.pShaderBytecode, desc->VS.BytecodeLength, NULL, &p->vs_lib, "VS(gs)",
-                                              vsin, 32, &nvsin, NULL, locs, &nl, &ov);
+            /* A VS feeding a GS may return void (no SV_Position) so Metal IR
+             * only exports the object-stage variant; geometry emulation links
+             * p->vs_lib directly, matching mad_dtess_convert above. */
+            ov.lib_only = 1;
+            {
+                obj_handle_t vl = mad_convert_stage_opts(d, rs, desc->VS.pShaderBytecode, desc->VS.BytecodeLength, NULL, &p->vs_lib, "VS(gs)",
+                                                         vsin, 32, &nvsin, NULL, locs, &nl, &ov);
+                if (vl) { NSObject_retain(vl); p->vs_fn = vl; }
+            }
             if (p->vs_fn) mad_apply_reflected_layout(p, rs, locs, nl, "VS");
             memset(&og, 0, sizeof og); og.gs_emulation = 1; og.topology = (UINT)desc->PrimitiveTopologyType; og.gs_max_prims = &p->gs_max_prims;
             og.name_out = gsname; og.name_cap = sizeof gsname; gsname[0] = 0;
+            og.lib_only = 1;
             nl = 0;
             {
-                obj_handle_t gfn = mad_convert_stage_opts(d, rs, desc->GS.pShaderBytecode, desc->GS.BytecodeLength, NULL, &p->gs_lib, "GS",
-                                                          NULL, 0, NULL, NULL, locs, &nl, &og);
-                if (gfn) { mad_apply_reflected_layout(p, rs, locs, nl, "GS"); NSObject_release(gfn); }
+                obj_handle_t gl = mad_convert_stage_opts(d, rs, desc->GS.pShaderBytecode, desc->GS.BytecodeLength, NULL, &p->gs_lib, "GS",
+                                                         NULL, 0, NULL, NULL, locs, &nl, &og);
+                if (gl) mad_apply_reflected_layout(p, rs, locs, nl, "GS");
                 else gsname[0] = 0;
             }
-            { UINT ln = L->n; free(L); L = NULL;
-            if (p->vs_fn && gsname[0] && (!ln || p->si_lib) && p->gs_max_prims) {
+            { free(L); L = NULL;
+            if (p->vs_fn && gsname[0] && p->si_lib && p->gs_max_prims) {
                 p->gs_emu = 1;
                 snprintf(p->gs_name, sizeof p->gs_name, "%s", gsname);
             } else {
@@ -19128,12 +19324,14 @@ static HRESULT device_CreateGraphicsPipelineState_impl(ID3D12Device *This,
             {   /* ml1023: what the pixel stage must be compiled against. */
                 UINT k, flags = 0, unorm = 0;
                 const D3D12_RENDER_TARGET_BLEND_DESC *b0 = &desc->BlendState.RenderTarget[0];
-                /* Dual-source blending is in use when any factor names SRC1. */
-                UINT f[4] = { b0->SrcBlend, b0->DestBlend, b0->SrcBlendAlpha, b0->DestBlendAlpha };
-                for (k = 0; k < 4; k++)
-                    if (f[k] == D3D12_BLEND_SRC1_COLOR || f[k] == D3D12_BLEND_INV_SRC1_COLOR ||
-                        f[k] == D3D12_BLEND_SRC1_ALPHA || f[k] == D3D12_BLEND_INV_SRC1_ALPHA)
-                        flags |= MADEIRA_IR_PS_DUAL_SOURCE_BLEND;
+                /* Dual-source blending is in use only when blending is enabled and a factor names SRC1. */
+                if (b0->BlendEnable) {
+                    UINT f[4] = { b0->SrcBlend, b0->DestBlend, b0->SrcBlendAlpha, b0->DestBlendAlpha };
+                    for (k = 0; k < 4; k++)
+                        if (f[k] == D3D12_BLEND_SRC1_COLOR || f[k] == D3D12_BLEND_INV_SRC1_COLOR ||
+                            f[k] == D3D12_BLEND_SRC1_ALPHA || f[k] == D3D12_BLEND_INV_SRC1_ALPHA)
+                            flags |= MADEIRA_IR_PS_DUAL_SOURCE_BLEND;
+                }
                 if (desc->DSVFormat == DXGI_FORMAT_UNKNOWN) flags |= MADEIRA_IR_PS_DISABLE_DEPTH;
                 for (k = 0; k < desc->NumRenderTargets && k < 8; k++)
                     if (mad_format_is_unorm(desc->RTVFormats[k])) unorm |= 1u << k;
@@ -19320,7 +19518,20 @@ static HRESULT device_CreateGraphicsPipelineState_impl(ID3D12Device *This,
             pso_Release((ID3D12PipelineState *)p); return E_NOTIMPL;
         }
         rp.colors[i].pixel_format = pf;
-        rp.colors[i].blending_enabled = b->BlendEnable != 0;
+        /* ml321: D3D12 ignores BlendEnable on integer RTVs (e.g. IndependentBlendEnable=FALSE
+         * with a blendable RT0 and an R8G8B8A8_UINT G-buffer RT1), whereas Metal fatally
+         * asserts in validateWithDevice if blendingEnabled is set on any non-blendable format. */
+        if (b->BlendEnable && mad_format_is_int(desc->RTVFormats[i])) {
+            static unsigned said_int_blend;
+            if (said_int_blend < 8) {
+                said_int_blend++;
+                d3d12_log("[madeira-d3d12] ml321 ignoring BlendEnable on integer RT%u (fmt=%u indep=%u)\n",
+                          i, (unsigned)desc->RTVFormats[i], (unsigned)desc->BlendState.IndependentBlendEnable);
+            }
+            rp.colors[i].blending_enabled = 0;
+        } else {
+            rp.colors[i].blending_enabled = b->BlendEnable != 0;
+        }
         rp.colors[i].rgb_blend_operation = mad_blend_op(b->BlendOp);
         rp.colors[i].alpha_blend_operation = mad_blend_op(b->BlendOpAlpha);
         rp.colors[i].src_rgb_blend_factor = mad_blend_factor(b->SrcBlend);
@@ -20267,6 +20478,69 @@ static void STDMETHODCALLTYPE list_ResourceBarrier(ID3D12GraphicsCommandList *Th
         else { c->u.barrier.all = 1; c->u.barrier.cls_noref = BC_ALL; }
     }
 }
+static UINT8 mad_eb_classify(D3D12_BARRIER_ACCESS ab, D3D12_BARRIER_ACCESS aa) {
+    const UINT W = D3D12_BARRIER_ACCESS_RENDER_TARGET | D3D12_BARRIER_ACCESS_UNORDERED_ACCESS |
+                   D3D12_BARRIER_ACCESS_DEPTH_STENCIL_WRITE | D3D12_BARRIER_ACCESS_STREAM_OUTPUT |
+                   D3D12_BARRIER_ACCESS_COPY_DEST | D3D12_BARRIER_ACCESS_RESOLVE_DEST;
+    UINT b = (UINT)ab, a = (UINT)aa;
+    if (b == (UINT)D3D12_BARRIER_ACCESS_NO_ACCESS) return BC_RAR;
+    if (!a || (a & W) || !b) return BC_ALL;
+    if (!(b & W)) return BC_RAR;
+    if (!(b & ~(UINT)(D3D12_BARRIER_ACCESS_RENDER_TARGET | D3D12_BARRIER_ACCESS_DEPTH_STENCIL_WRITE))) return BC_RAW_ATT;
+    if (b == (UINT)D3D12_BARRIER_ACCESS_COPY_DEST || b == (UINT)D3D12_BARRIER_ACCESS_RESOLVE_DEST) return BC_RAW_COPY;
+    if (b == (UINT)D3D12_BARRIER_ACCESS_UNORDERED_ACCESS) return BC_RAW_UAV;
+    return BC_ALL;
+}
+static void STDMETHODCALLTYPE list_Barrier(ID3D12GraphicsCommandList7 *This, UINT32 ngroups, const D3D12_BARRIER_GROUP *groups) {
+    /* Enhanced Barriers -> same Metal encoder fence model as list_ResourceBarrier. */
+    struct mad_list *l = (struct mad_list *)This;
+    struct mad_cmd *c;
+    UINT32 g, i;
+    if (!ngroups || !groups) return;
+    InterlockedIncrement(&g_barriers);
+    if (l->ncmds && l->cmds[l->ncmds - 1].kind == MC_BARRIER) c = &l->cmds[l->ncmds - 1];
+    else { c = mad_list_push(l, MC_BARRIER); if (!c) return; }
+    if (c->u.barrier.n == 0 && !c->u.barrier.all) c->u.barrier.cls_noref = BC_NONE;
+    for (g = 0; g < ngroups; g++) {
+        const D3D12_BARRIER_GROUP *gr = &groups[g];
+        if (!gr->NumBarriers) continue;
+        if (gr->Type == D3D12_BARRIER_TYPE_GLOBAL && gr->pGlobalBarriers) {
+            for (i = 0; i < gr->NumBarriers; i++) {
+                UINT8 cls = mad_eb_classify(gr->pGlobalBarriers[i].AccessBefore, gr->pGlobalBarriers[i].AccessAfter);
+                c->u.barrier.all = 1;
+                if (c->u.barrier.cls_noref == BC_NONE || cls > c->u.barrier.cls_noref) c->u.barrier.cls_noref = cls;
+            }
+        } else if (gr->Type == D3D12_BARRIER_TYPE_TEXTURE && gr->pTextureBarriers) {
+            for (i = 0; i < gr->NumBarriers; i++) {
+                struct mad_resource *r = (struct mad_resource *)gr->pTextureBarriers[i].pResource;
+                UINT8 cls = mad_eb_classify(gr->pTextureBarriers[i].AccessBefore, gr->pTextureBarriers[i].AccessAfter);
+                if (!r) {
+                    c->u.barrier.all = 1;
+                    if (c->u.barrier.cls_noref == BC_NONE || cls > c->u.barrier.cls_noref) c->u.barrier.cls_noref = cls;
+                } else if (c->u.barrier.n < 8) {
+                    c->u.barrier.cls[c->u.barrier.n] = cls; c->u.barrier.res[c->u.barrier.n++] = r;
+                } else {
+                    c->u.barrier.all = 1; c->u.barrier.cls_noref = BC_ALL;
+                }
+            }
+        } else if (gr->Type == D3D12_BARRIER_TYPE_BUFFER && gr->pBufferBarriers) {
+            for (i = 0; i < gr->NumBarriers; i++) {
+                struct mad_resource *r = (struct mad_resource *)gr->pBufferBarriers[i].pResource;
+                UINT8 cls = mad_eb_classify(gr->pBufferBarriers[i].AccessBefore, gr->pBufferBarriers[i].AccessAfter);
+                if (!r) {
+                    c->u.barrier.all = 1;
+                    if (c->u.barrier.cls_noref == BC_NONE || cls > c->u.barrier.cls_noref) c->u.barrier.cls_noref = cls;
+                } else if (c->u.barrier.n < 8) {
+                    c->u.barrier.cls[c->u.barrier.n] = cls; c->u.barrier.res[c->u.barrier.n++] = r;
+                } else {
+                    c->u.barrier.all = 1; c->u.barrier.cls_noref = BC_ALL;
+                }
+            }
+        } else {
+            c->u.barrier.all = 1; c->u.barrier.cls_noref = BC_ALL;
+        }
+    }
+}
 /* ml889: ExecuteIndirect. D3D12's argument records are byte-for-byte Metal's
  * indirect argument structs (DRAW_ARGUMENTS == MTLDrawPrimitivesIndirectArguments,
  * DRAW_INDEXED_ARGUMENTS == MTLDrawIndexedPrimitivesIndirectArguments,
@@ -20378,11 +20652,13 @@ static void STDMETHODCALLTYPE list_CopyTextureRegion(ID3D12GraphicsCommandList *
     if (!d || !s) return;
     if (d->texture && !s->texture) {           /* upload: buffer -> texture */
         const D3D12_PLACED_SUBRESOURCE_FOOTPRINT *f = &src->PlacedFootprint;
-        UINT w, h, dd;
+        UINT w, h, dd, lvl, sl, pl;
+        mad_subresource_plane(d, dst->SubresourceIndex, &lvl, &sl, &pl);
+        if (lvl < d->mip_drop) return;
         c = mad_list_push(l, MC_COPY_B2T);
         if (!c) return;
-        mad_subresource_plane(d, dst->SubresourceIndex, &c->u.bt.level, &c->u.bt.slice, &c->u.bt.plane);
-        mad_mip_dims(d, c->u.bt.level, &w, &h, &dd);
+        c->u.bt.level = lvl - d->mip_drop; c->u.bt.slice = sl; c->u.bt.plane = pl;
+        mad_mip_dims(d, lvl, &w, &h, &dd);
         mad_format_info(d->desc.Format, &bytes, &block);
         c->u.bt.tex = d; c->u.bt.buf = s; c->u.bt.off = f->Offset;
         c->u.bt.w = f->Footprint.Width ? f->Footprint.Width : w;
@@ -20404,11 +20680,19 @@ static void STDMETHODCALLTYPE list_CopyTextureRegion(ID3D12GraphicsCommandList *
     }
     if (s->texture && !d->texture) {           /* readback: texture -> buffer */
         const D3D12_PLACED_SUBRESOURCE_FOOTPRINT *f = &dst->PlacedFootprint;
-        UINT w, h, dd;
+        UINT w, h, dd, lvl, sl, pl;
+        mad_subresource_plane(s, src->SubresourceIndex, &lvl, &sl, &pl);
+        if (lvl < s->mip_drop) {
+            static LONG said_t2b;
+            if (InterlockedIncrement(&said_t2b) <= 32)
+                d3d12_log("[madeira-d3d12] tex-drop-mip: SKIPPED T2B readback r#%u %llux%u fmt %u lvl %u < mip_drop %u\n",
+                          s->serial, (unsigned long long)s->desc.Width, s->desc.Height, (unsigned)s->desc.Format, lvl, s->mip_drop);
+            return;
+        }
         c = mad_list_push(l, MC_COPY_T2B);
         if (!c) return;
-        mad_subresource_plane(s, src->SubresourceIndex, &c->u.bt.level, &c->u.bt.slice, &c->u.bt.plane);
-        mad_mip_dims(s, c->u.bt.level, &w, &h, &dd);
+        c->u.bt.level = lvl - s->mip_drop; c->u.bt.slice = sl; c->u.bt.plane = pl;
+        mad_mip_dims(s, lvl, &w, &h, &dd);
         mad_format_info(s->desc.Format, &bytes, &block);
         c->u.bt.tex = s; c->u.bt.buf = d; c->u.bt.off = f->Offset;
         c->u.bt.w = w; c->u.bt.h = h; c->u.bt.d = dd;
@@ -20424,12 +20708,15 @@ static void STDMETHODCALLTYPE list_CopyTextureRegion(ID3D12GraphicsCommandList *
         return;
     }
     if (s->texture && d->texture) {            /* texture -> texture */
-        UINT w, h, dd;
+        UINT w, h, dd, dlvl, dsl, dpl, slvl, ssl, spl;
+        mad_subresource_plane(d, dst->SubresourceIndex, &dlvl, &dsl, &dpl);
+        mad_subresource_plane(s, src->SubresourceIndex, &slvl, &ssl, &spl);
+        if (dlvl < d->mip_drop || slvl < s->mip_drop) return;
         c = mad_list_push(l, MC_COPY_T2T);
         if (!c) return;
-        mad_subresource_plane(d, dst->SubresourceIndex, &c->u.tt.dlevel, &c->u.tt.dslice, &c->u.tt.dplane);
-        mad_subresource_plane(s, src->SubresourceIndex, &c->u.tt.slevel, &c->u.tt.sslice, &c->u.tt.splane);
-        mad_mip_dims(s, c->u.tt.slevel, &w, &h, &dd);
+        c->u.tt.dlevel = dlvl - d->mip_drop; c->u.tt.dslice = dsl; c->u.tt.dplane = dpl;
+        c->u.tt.slevel = slvl - s->mip_drop; c->u.tt.sslice = ssl; c->u.tt.splane = spl;
+        mad_mip_dims(s, slvl, &w, &h, &dd);
         c->u.tt.dst = d; c->u.tt.src = s;
         c->u.tt.dx = x; c->u.tt.dy = y; c->u.tt.dz = z;
         c->u.tt.w = w; c->u.tt.h = h; c->u.tt.d = dd;
@@ -20525,7 +20812,8 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommittedResource3(ID3D12Device10 
         ID3D12ProtectedResourceSession *session, UINT32 ncast, DXGI_FORMAT *cast, REFIID riid, void **out) {
     D3D12_RESOURCE_DESC d;
     (void)layout; (void)cast;
-    if (session || ncast || !desc1) return E_NOTIMPL;
+    if (session || !desc1) return E_NOTIMPL;
+    if (ncast && !mad_enhanced_barriers_on()) return E_NOTIMPL;
     mad_desc1_to_desc(desc1, &d);
     return device_CreateCommittedResource((ID3D12Device *)This, hp, hf, &d, D3D12_RESOURCE_STATE_COMMON, clear, riid, out);
 }
@@ -20639,7 +20927,13 @@ static int mad_tiling_compute(unsigned dim, unsigned long long width, unsigned h
         if (!w) w = 1;
         if (!h) h = 1;
         if (!d) d = 1;
-        if (t->nstd == i && w >= t->tw && h >= t->th && d >= t->td) {
+        /* Single-mip tiled textures (MipLevels == 1) have no mip chain to pack:
+         * treat the lone subresource as standard (1+ tile(s), WidthInTiles >= 1)
+         * rather than packed (WidthInTiles = 0, D3D12_PACKED_TILE). D3D12 allows
+         * sub-tile mips to remain unpacked, and Forza Horizon 6 divides by
+         * tilings[0].WidthInTiles on small 1-mip reserved textures (32x32 BC1,
+         * 128x128 R16G16). */
+        if (t->nstd == i && ((w >= t->tw && h >= t->th && d >= t->td) || t->mips == 1)) {
             t->mw[i] = (w + t->tw - 1) / t->tw; t->mh[i] = (h + t->th - 1) / t->th; t->md[i] = (d + t->td - 1) / t->td;
             t->mstart[i] = run; run += t->mw[i] * t->mh[i] * t->md[i]; t->nstd++;
         } else {
@@ -20713,7 +21007,8 @@ static HRESULT STDMETHODCALLTYPE device_CreateReservedResource2(ID3D12Device10 *
         D3D12_BARRIER_LAYOUT layout, const D3D12_CLEAR_VALUE *clear, ID3D12ProtectedResourceSession *session,
         UINT32 ncast, DXGI_FORMAT *cast, REFIID riid, void **out) {
     if (!mad_tiled_on()) return stub_ID3D12Device10_CreateReservedResource2(This, desc, layout, clear, session, ncast, cast, riid, out);
-    if (session || ncast) return E_NOTIMPL;   /* as CreateCommittedResource3 */
+    if (session) return E_NOTIMPL;
+    if (ncast && !mad_enhanced_barriers_on()) return E_NOTIMPL;
     return mad_create_reserved((struct mad_device *)This, desc, riid, out, "CreateReservedResource2");
 }
 /* A resource that was not created reserved has no tiling: zeros, as nothing
@@ -20754,8 +21049,8 @@ static void STDMETHODCALLTYPE device_GetResourceTiling(ID3D12Device10 *This, ID3
         *nsub = n;
     }
     {
-        static LONG said;
-        if (InterlockedIncrement(&said) <= 16)
+        static LONG said, said_bad;
+        if (InterlockedIncrement(&said) <= 16 || (!ok && InterlockedIncrement(&said_bad) <= 32))
             d3d12_log("[d3d12-tiled] GetResourceTiling r#%u: %u tiles of %ux%ux%u, %u standard + %u packed mips (%u tile(s) from %u)%s\n",
                       r ? r->serial : 0, (unsigned)t.total, t.tw, t.th, t.td, t.nstd, t.npacked, t.packed_tiles,
                       t.npacked ? t.per_slice - t.packed_tiles : 0, ok ? "" : " -- not a reserved resource: zeros");
@@ -20776,6 +21071,36 @@ static void STDMETHODCALLTYPE queue_UpdateTileMappings(ID3D12CommandQueue *This,
                   starts && nreg ? starts[0].Subresource : 0, sizes && nreg ? sizes[0].NumTiles : 1, sizes && nreg && sizes[0].UseBox ? " box" : "",
                   (void *)heap, nrange, rflags && nrange ? (unsigned)rflags[0] : 0, heap_offs && nrange ? heap_offs[0] : 0,
                   counts && nrange ? counts[0] : 0, (unsigned)flags);
+    /* ml345: bind heap -> reserved buffer offset so placed buffers created on
+     * this heap (e.g. UPLOAD heaps mapped into a reserved ring buffer) alias
+     * directly onto the reserved buffer's unified memory. */
+    if (res && heap && nreg >= 1) {
+        struct mad_resource *r = (struct mad_resource *)res;
+        struct mad_memheap *h = (struct mad_memheap *)heap;
+        int is_null = (rflags && nrange && (rflags[0] & D3D12_TILE_RANGE_FLAG_NULL));
+        if (!is_null && r->desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && r->own_mem) {
+            UINT64 res_off = starts ? (UINT64)starts[0].X * MAD_TILE_BYTES : 0;
+            UINT64 heap_off = (heap_offs && nrange) ? (UINT64)heap_offs[0] * MAD_TILE_BYTES : 0;
+            UINT64 ntiles = sizes ? (UINT64)sizes[0].NumTiles : 1;
+            UINT64 nbytes = ntiles * MAD_TILE_BYTES;
+            if (heap_off == 0 && nbytes > 0 && res_off + nbytes <= ((r->size + 0xffff) & ~(UINT64)0xffff)) {
+                struct mad_resource *prev = NULL;
+                unsigned existing_pl = 0;
+                ID3D12Resource_AddRef(res);
+                AcquireSRWLockExclusive(&h->pl_lock);
+                prev = h->tiled_res;
+                h->tiled_res = r;
+                h->tiled_byte_off = res_off;
+                h->tiled_bytes = nbytes;
+                existing_pl = h->npl;
+                ReleaseSRWLockExclusive(&h->pl_lock);
+                if (prev) ID3D12Resource_Release((ID3D12Resource *)prev);
+                d3d12_log("[d3d12-tiled] ml345 bound heap%u (%llu KB, type %u) -> reserved r#%u +%llu MB (%llu MB, existing placed=%u)\n",
+                          h->serial, (unsigned long long)(h->desc.SizeInBytes >> 10), (unsigned)h->desc.Properties.Type,
+                          r->serial, (unsigned long long)(res_off >> 20), (unsigned long long)(nbytes >> 20), existing_pl);
+            }
+        }
+    }
 }
 static void STDMETHODCALLTYPE queue_CopyTileMappings(ID3D12CommandQueue *This, ID3D12Resource *dst, const D3D12_TILED_RESOURCE_COORDINATE *dst_start,
         ID3D12Resource *src, const D3D12_TILED_RESOURCE_COORDINATE *src_start, const D3D12_TILE_REGION_SIZE *size, D3D12_TILE_MAPPING_FLAGS flags) {
@@ -20805,7 +21130,8 @@ static HRESULT STDMETHODCALLTYPE device_CreatePlacedResource2(ID3D12Device10 *Th
         const D3D12_CLEAR_VALUE *clear, UINT32 ncast, DXGI_FORMAT *cast, REFIID riid, void **out) {
     D3D12_RESOURCE_DESC d;
     (void)layout; (void)cast;
-    if (!desc1 || ncast) return E_NOTIMPL;
+    if (!desc1) return E_NOTIMPL;
+    if (ncast && !mad_enhanced_barriers_on()) return E_NOTIMPL;
     mad_desc1_to_desc(desc1, &d);
     return device_CreatePlacedResource((ID3D12Device *)This, heap, offset, &d, D3D12_RESOURCE_STATE_COMMON, clear, riid, out);
 }
@@ -21335,6 +21661,7 @@ static void build_vtables(void) {
     g_device_vtbl.CreateComputePipelineState = (void *)device_CreateComputePipelineState;
     g_list_vtbl.CopyResource            = (void *)list_CopyResource;
     g_list_vtbl.ResourceBarrier         = (void *)list_ResourceBarrier;
+    g_list_vtbl.Barrier                 = (void *)list_Barrier;
     g_list_vtbl.Dispatch                = (void *)list_Dispatch;
     g_list_vtbl.ExecuteIndirect         = (void *)list_ExecuteIndirect;
     g_list_vtbl.WriteBufferImmediate    = (void *)list_WriteBufferImmediate;   /* write-buffer-immediate (the stub when off) */
@@ -21546,10 +21873,12 @@ struct mad_swapchain {
     DXGI_SWAP_CHAIN_DESC1 desc;
     DXGI_SWAP_CHAIN_FULLSCREEN_DESC fs;
     obj_handle_t view, layer;
-    enum WMTPixelFormat pf;
+    enum WMTPixelFormat pf, layer_pf;
+    obj_handle_t present_pso_arr, present_pso_2d;
     struct mad_resource *buffers[MAD_SWAP_MAX_BUFFERS];
     UINT nbuf, index;
     UINT64 presents;
+    volatile LONG64 last_present_qpc;   /* ml293: QPC recorded at last Present for GetFrameStatistics */
     UINT max_latency;
     HANDLE latency_event;
     UINT64 present_serial[8];   /* ml1070: GPU serial the frame presented N ago must have passed */
@@ -21645,14 +21974,66 @@ static void mad_swap_release_buffers(struct mad_swapchain *s) {
  * remembered (pointer compare only, never dereferenced); a Present on a
  * swapchain whose layer another one reconfigured applies its own drawable
  * size and format again first. Distinct layers (desktop mode) never trigger it. */
+static enum WMTPixelFormat mad_layer_pixel_format(enum WMTPixelFormat pf) {
+    /* On iOS, CAMetalLayer only accepts BGRA8Unorm(_sRGB), RGBA16Float, and
+     * XR10 formats -- NOT RGB10A2Unorm (90), BGR10A2Unorm (94), or
+     * RGBA8Unorm(_sRGB) (70/71). Present into BGRA8Unorm(_sRGB) via a
+     * fullscreen render pass when any unsupported layer format is requested. */
+    if (pf == WMTPixelFormatRGB10A2Unorm || pf == WMTPixelFormatBGR10A2Unorm ||
+        pf == WMTPixelFormatRGBA8Unorm)
+        return WMTPixelFormatBGRA8Unorm;
+    if (pf == WMTPixelFormatRGBA8Unorm_sRGB)
+        return WMTPixelFormatBGRA8Unorm_sRGB;
+    return pf;
+}
+static obj_handle_t mad_swap_present_pso(struct mad_swapchain *s, int is_2d) {
+    obj_handle_t *slot = is_2d ? &s->present_pso_2d : &s->present_pso_arr;
+    struct mad_device *d = s->dev;
+    obj_handle_t vs = 0, fs = 0, pso = 0, err = 0;
+    struct WMTRenderPipelineInfo rp;
+    if (*slot) return *slot;
+    if (!mad_kernels_ready(d) || !d->k_lib) return 0;
+    vs = MTLLibrary_newFunction(d->k_lib, "mad_present_vs");
+    fs = MTLLibrary_newFunction(d->k_lib, is_2d ? "mad_present_fs_2d" : "mad_present_fs_arr");
+    if (vs && fs) {
+        memset(&rp, 0, sizeof rp);
+        rp.vertex_function = vs;
+        rp.fragment_function = fs;
+        rp.rasterization_enabled = true;
+        rp.raster_sample_count = 1;
+        rp.input_primitive_topology = WMTPrimitiveTopologyClassTriangle;
+        rp.max_tessellation_factor = 16;
+        rp.depth_pixel_format = WMTPixelFormatInvalid;
+        rp.stencil_pixel_format = WMTPixelFormatInvalid;
+        rp.colors[0].pixel_format = s->layer_pf;
+        rp.colors[0].write_mask = WMTColorWriteMaskAll;
+        pso = MTLDevice_newRenderPipelineState(d->mtl_device, &rp, &err);
+        if (err) mad_log_nserror("present blit pipeline", err);
+    }
+    if (vs) NSObject_release(vs);
+    if (fs) NSObject_release(fs);
+    if (pso) *slot = pso;
+    d3d12_log("[madeira-d3d12] present blit pipeline (%s, format %u -> %u): %s\n",
+              is_2d ? "2d" : "2d_array", (unsigned)s->pf, (unsigned)s->layer_pf, pso ? "ready" : "FAILED");
+    return pso;
+}
 static obj_handle_t g_layer_cfg_layer;
 static const void *g_layer_cfg_owner;
 static void mad_swap_apply_layer(struct mad_swapchain *s) {
     struct WMTLayerProps props;
     double old_w, old_h, ms;
     unsigned old_pf;
+    enum WMTPixelFormat want_pf = mad_layer_pixel_format(s->pf);
     UINT64 t0;
     LONG seq;
+    if (s->layer_pf != want_pf) {
+        if (s->present_pso_arr) { NSObject_release(s->present_pso_arr); s->present_pso_arr = 0; }
+        if (s->present_pso_2d)  { NSObject_release(s->present_pso_2d);  s->present_pso_2d = 0; }
+        s->layer_pf = want_pf;
+        if (s->layer_pf != s->pf)
+            d3d12_log("[madeira-d3d12] swapchain layer format %u -> %u (render-pass present blit)\n",
+                      (unsigned)s->pf, (unsigned)s->layer_pf);
+    }
     memset(&props, 0, sizeof props);
     MetalLayer_getProps(s->layer, &props);
     old_w = props.drawable_width; old_h = props.drawable_height; old_pf = (unsigned)props.pixel_format;
@@ -21660,7 +22041,7 @@ static void mad_swap_apply_layer(struct mad_swapchain *s) {
     /* MetalFX upscaling: the drawable is the scaled size (fx_w x fx_h). */
     props.drawable_width = s->fx_w ? s->fx_w : s->desc.Width;
     props.drawable_height = s->fx_h ? s->fx_h : s->desc.Height;
-    props.pixel_format = s->pf;
+    props.pixel_format = s->layer_pf;
     props.framebuffer_only = false;
     props.display_sync_enabled = true;
     /* madeira-bcd: [swap-diag] winemetal applies the properties in a block on the
@@ -21674,6 +22055,13 @@ static void mad_swap_apply_layer(struct mad_swapchain *s) {
                     props.drawable_height, (unsigned)props.pixel_format);
     t0 = mad_tick();
     MetalLayer_setProps(s->layer, &props);
+    if (props.pixel_format && props.pixel_format != s->layer_pf) {
+        if (s->present_pso_arr) { NSObject_release(s->present_pso_arr); s->present_pso_arr = 0; }
+        if (s->present_pso_2d)  { NSObject_release(s->present_pso_2d);  s->present_pso_2d = 0; }
+        d3d12_log("[madeira-d3d12] layer reported actual pixel format %u (requested %u)\n",
+                  (unsigned)props.pixel_format, (unsigned)s->layer_pf);
+        s->layer_pf = props.pixel_format;
+    }
     ms = mad_swd_ms(t0);
     if (s->diag_seq)
         mad_swd_log("[swap-diag] #%ld layer 0x%llx set in %.1f ms\n", (long)s->diag_seq,
@@ -21752,6 +22140,8 @@ static ULONG STDMETHODCALLTYPE swap_Release(IDXGISwapChain4 *T) {
         if (s->queue && s->queue->sub_thread) mad_queue_drain(s->queue);   /* ml1121: queued presents name this swapchain */
         t1 = mad_tick();
         mad_swap_release_buffers(s);
+        if (s->present_pso_arr) { NSObject_release(s->present_pso_arr); s->present_pso_arr = 0; }
+        if (s->present_pso_2d)  { NSObject_release(s->present_pso_2d);  s->present_pso_2d = 0; }
         if (g_layer_cfg_owner == s) g_layer_cfg_owner = NULL;   /* the next Present re-applies its own layer settings */
         if (s->view) ReleaseMetalView(s->view);
         if (s->latency_event) CloseHandle(s->latency_event);
@@ -21963,6 +22353,14 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
     {   /* ml1098: manual frame capture -- finish the frame that just ended, then see whether the UI asked for another */
         struct madeira_ctl_args a;
         if (g_capture_on) { mad_capture_finish(s->queue->device, g_capture_frame); if (g_capture_left) g_capture_left--; g_capture_on = 0; }
+        {
+            static int auto_cap = -1;
+            if (auto_cap < 0) auto_cap = (int)mad_cfg_int_pe("auto-capture-present", 0);
+            if (auto_cap > 0 && s->presents == (UINT64)auto_cap) {
+                g_capture_left++;
+                d3d12_log("[capture] auto-capture-present triggered at present #%llu\n", (unsigned long long)s->presents);
+            }
+        }
         memset(&a, 0, sizeof a); a.op = 0; MadeiraCtl(&a);
         if (a.ret) { g_capture_left += a.ret; d3d12_log("[capture] %u frame(s) requested at present #%llu\n", a.ret, (unsigned long long)s->presents); }
         {   /* ml1136: live fence-chain switch from the overlay; lists already running keep their mode */
@@ -22087,28 +22485,78 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
     if (cb && tex) {
         obj_handle_t copy_src = src->texture;
         UINT copy_w = src->width, copy_h = src->height;
+        int src_is_2d = 0;
         if (s->fx_scaler && s->fx_out && s->fx_view[idx]) {   /* MetalFX spatial, then the copy below */
             /* After fence-chain 6 work the scaler waits for the frame's batches on
              * the device fence and updates it, so the blit's wait below orders after it. */
             obj_handle_t ff = (g_f6_used && s->queue->device->enc_fence) ? s->queue->device->enc_fence : 0;
             MTLCommandBuffer_encodeSpatialScale(cb, s->fx_scaler, s->fx_view[idx], s->fx_out, ff);
-            copy_src = s->fx_out; copy_w = s->fx_w; copy_h = s->fx_h;
+            copy_src = s->fx_out; copy_w = s->fx_w; copy_h = s->fx_h; src_is_2d = 1;
         }
-        enc = MTLCommandBuffer_blitCommandEncoder(cb); if (enc) g_enc_seq++;
-        if (enc && g_f6_used && s->queue->device->enc_fence) {   /* ml1134: after every committed batch, not just queue order */
-            obj_handle_t df = s->queue->device->enc_fence;
-            f6_encode(enc, F6_BLIT, &df, 1, 0);
-        }
-        if (enc) {
-            memset(&t2t, 0, sizeof t2t);
-            t2t.type = WMTBlitCommandCopyFromTextureToTexture;
-            t2t.src = copy_src;
-            t2t.src_size.width = copy_w;
-            t2t.src_size.height = copy_h;
-            t2t.src_size.depth = 1;
-            t2t.dst = tex;
-            MTLBlitCommandEncoder_encodeCommands(enc, (const struct wmtcmd_base *)&t2t);
-            MTLCommandEncoder_endEncoding(enc);
+        if (s->layer_pf != s->pf) {
+            obj_handle_t pso = mad_swap_present_pso(s, src_is_2d);
+            if (pso) {
+                struct WMTRenderPassInfo rpi;
+                struct wmtcmd_render_setpso c_pso;
+                struct wmtcmd_render_settexture c_tex;
+                struct wmtcmd_render_setviewport c_vp;
+                struct wmtcmd_render_draw c_draw;
+                memset(&rpi, 0, sizeof rpi);
+                rpi.colors[0].texture = tex;
+                rpi.colors[0].load_action = WMTLoadActionDontCare;
+                rpi.colors[0].store_action = WMTStoreActionStore;
+                rpi.render_target_width = copy_w;
+                rpi.render_target_height = copy_h;
+                rpi.default_raster_sample_count = 1;
+                enc = MTLCommandBuffer_renderCommandEncoder(cb, &rpi);
+                if (enc) {
+                    g_enc_seq++;
+                    if (g_f6_used && s->queue->device->enc_fence) {
+                        obj_handle_t df = s->queue->device->enc_fence;
+                        f6_encode(enc, F6_RENDER, &df, 1, 0);
+                    }
+                    memset(&c_pso, 0, sizeof c_pso);
+                    c_pso.type = WMTRenderCommandSetPSO;
+                    c_pso.pso = pso;
+                    memset(&c_tex, 0, sizeof c_tex);
+                    c_tex.type = WMTRenderCommandSetFragmentTexture;
+                    c_tex.texture = copy_src;
+                    c_tex.index = 0;
+                    memset(&c_vp, 0, sizeof c_vp);
+                    c_vp.type = WMTRenderCommandSetViewport;
+                    c_vp.viewport.originX = 0.0; c_vp.viewport.originY = 0.0;
+                    c_vp.viewport.width = (double)copy_w; c_vp.viewport.height = (double)copy_h;
+                    c_vp.viewport.znear = 0.0; c_vp.viewport.zfar = 1.0;
+                    memset(&c_draw, 0, sizeof c_draw);
+                    c_draw.type = WMTRenderCommandDraw;
+                    c_draw.primitive_type = WMTPrimitiveTypeTriangle;
+                    c_draw.vertex_start = 0;
+                    c_draw.vertex_count = 3;
+                    c_draw.instance_count = 1;
+                    c_pso.next.ptr = &c_tex;
+                    c_tex.next.ptr = &c_vp;
+                    c_vp.next.ptr = &c_draw;
+                    MTLRenderCommandEncoder_encodeCommands(enc, (const struct wmtcmd_base *)&c_pso);
+                    MTLCommandEncoder_endEncoding(enc);
+                }
+            }
+        } else {
+            enc = MTLCommandBuffer_blitCommandEncoder(cb); if (enc) g_enc_seq++;
+            if (enc && g_f6_used && s->queue->device->enc_fence) {   /* ml1134: after every committed batch, not just queue order */
+                obj_handle_t df = s->queue->device->enc_fence;
+                f6_encode(enc, F6_BLIT, &df, 1, 0);
+            }
+            if (enc) {
+                memset(&t2t, 0, sizeof t2t);
+                t2t.type = WMTBlitCommandCopyFromTextureToTexture;
+                t2t.src = copy_src;
+                t2t.src_size.width = copy_w;
+                t2t.src_size.height = copy_h;
+                t2t.src_size.depth = 1;
+                t2t.dst = tex;
+                MTLBlitCommandEncoder_encodeCommands(enc, (const struct wmtcmd_base *)&t2t);
+                MTLCommandEncoder_endEncoding(enc);
+            }
         }
         /* Submitted after the frame's own command buffers on the same queue,
          * which is what orders the copy after the rendering. */
@@ -22118,6 +22566,7 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
     InterlockedExchangeAdd64(&g_xp.t_cmt, mad_qpc() - tc); }
     mad_swd_step(s->queue, 0);
     /* ml1056: no release -- the drawable was never ours (see swap_Present). */
+    InterlockedExchange64(&s->last_present_qpc, mad_qpc());   /* ml293: SyncQPCTime for GetFrameStatistics */
     s->presents++;
     mad_perf_present();   /* ml1108 */
     if (g_vt_on > 0) mad_vt_present(s->queue->device, s->presents);
@@ -22323,16 +22772,22 @@ static HRESULT STDMETHODCALLTYPE swap_GetFrameStatistics(IDXGISwapChain4 *T, DXG
     struct mad_swapchain *s = (struct mad_swapchain *)T;
     static volatile LONG asked;   /* madeira-bcd: [swap-diag] the first 8 calls, then every 3600th */
     LONG n;
+    LONG64 qpc;
+    UINT count;
     if (!st) return E_INVALIDARG;
     memset(st, 0, sizeof *st);
-    st->PresentCount = (UINT)s->presents;
-    st->PresentRefreshCount = (UINT)s->presents;
-    /* SyncRefreshCount and SyncQPCTime stay 0: a game that waits for them to
-     * move would wait for ever, so a fast-climbing call count is worth seeing */
+    count = (UINT)s->presents;
+    qpc = InterlockedCompareExchange64(&s->last_present_qpc, 0, 0);
+    if (!qpc) qpc = mad_qpc();
+    st->PresentCount = count;
+    st->PresentRefreshCount = count;
+    st->SyncRefreshCount = count;
+    st->SyncQPCTime.QuadPart = qpc;
     n = InterlockedIncrement(&asked);
     if (n <= 8 || (n % 3600) == 0)
         mad_swd_log("[swap-diag] GetFrameStatistics call #%ld on swapchain %p (fullscreen %d) -> present count %u, "
-                    "sync refresh count 0; tid %04lx\n", (long)n, (void *)s, !s->fs.Windowed, st->PresentCount,
+                    "sync refresh count %u, sync qpc %lld; tid %04lx\n", (long)n, (void *)s, !s->fs.Windowed,
+                    st->PresentCount, st->SyncRefreshCount, (long long)st->SyncQPCTime.QuadPart,
                     (unsigned long)GetCurrentThreadId());
     return S_OK;
 }
