@@ -2898,3 +2898,64 @@ Measured on the `ml1300` baseline and then on each change, in the open world
      `x18=0`), not a sampler — arming the sampler kills this title (§9.18/prior
      finding), so the backtrace has to come from the fault handler's own
      record.
+
+### 9.20 `ml1304` — the world-load stall: Steam's overlay renderer deadlocked the present path (2026-11-26)
+
+**Symptom.** After the title screen (59-60 FPS, `16.7 ms`, GPU 14-17 %), pressing **A**
+to enter the world put the title on `LOADING... PLEASE WAIT` and it never came back.
+The HUD kept showing a healthy `60 Hz` link and a `13.4 s` last frame, and the app's
+`[promote]` reporter kept printing `601 ticks in 10.0 s = 60.0 Hz`, so the frame graph
+*looked* alive while nothing was being drawn.
+
+**What the logs actually said** (`madeira-log.txt` + the per-game log):
+
+| signal | value during the stall | meaning |
+|---|---|---|
+| last `[perf]` per-frame line | `14:46:50.280`, the exact instant of the A press | **zero frames rendered for 300+ s** |
+| `detach-wait: presents=` | frozen at **14281** from `14:47:09` onward | no `Present` calls at all |
+| `[promote] link` | 60.0 Hz throughout | the *host* present-link ticks; it is not the game |
+| `[xp] cpu=` | `60-80 ms` per `320 ms` sample (`~20 %` of one core), down from `1032 ms` | the work simply stopped; it is not slow |
+| GPU | `GPU 3-14 %`, `GPU MS 2.4` | the GPU has nothing to do |
+| `[xp] rdKB=` | **0** | no disk reads while "loading" |
+| DNS / `NtCreateFile` | **none** after `14:46:54` | not waiting on the network or on I/O |
+| `[footprint]` | `3149 MB`, `compressed 329 MB`, peak `3331` | not memory pressure |
+| `[waiters]` | `parked=14 over60s=14`, inf waits aged `243-245 s` | threads parked exactly at the freeze |
+| `[xp-api]` | `x64->EC 2700-3200/s` with `wakes 0/s` | a *polling* loop crossing guest→host, not a blocked process |
+| `[xp-api-cs]` | `steamclient64.dll+0x1753230` = **100 %** of contended enters | one static critical section dominates |
+| images | `gameoverlayrenderer64.dll` resident (mapped `14:42:15`), one thread parked at `0x1597ffa28`, inside **its own JIT-pool copy** | the overlay renderer is in the present path |
+
+So the diagnosis is a deadlock in the **present path**, not a loading stall: the title
+did its 4 s of load work, then stopped presenting, with one thread spinning on a Steam
+critical section and the overlay's own image on the stack. The overlay renderer hooks
+DXGI/D3D12 `Present`, and the title only starts drawing the world after that point —
+which is why the title screen was fine for 4.5 minutes and the transition was fatal.
+
+**Fix (verified).** Neutralise the hook by renaming the DLL inside the guest prefix —
+no rebuild, no re-sign, no reinstall, fully reversible:
+
+```
+tools/local/fh6-steam-overlay.sh off     # renames GameOverlayRenderer64.dll -> .off
+tools/local/fh6-steam-overlay.sh on      # restores it
+```
+
+**Same launch path after the rename:**
+
+| | before | after |
+|---|---|---|
+| presents | frozen at 14281 | `1603 -> 2740 -> 3650 -> 4769` over 90 s |
+| frames | none | `23.6-28.7 ms` = **35-42 FPS** |
+| GPU | 3-14 % | **74 %** |
+| `[xp] cpu` | 20 % of one core | `977 ms` per `342 ms` = ~2.9 cores |
+| `gameoverlayrenderer64.dll` in log | present | **0 references** |
+| "Unable to join session" | shown | **0 occurrences** |
+| `kerberos.dll` / `msv1_0.dll` | — | still loaded (the §9.19 fix is independent) |
+
+**Two instrumentation inconsistencies this exposed, worth fixing separately:**
+
+1. **The frame graph reports the link, not the game.** `[promote] ... = 60.0 Hz` and the
+   HUD's `FPS` come from the host present link and keep ticking while the title presents
+   nothing. Anything reading FPS should treat `madeira_frame_count()` as stale when it has
+   not advanced for >2 s (and the overlay should show `stalled`, not `60`).
+2. **`MS` shows the *last* frame, not the current one.** The `13.4 s` reading is the
+   overlays's last completed frame time; a stalled title should show the stall duration,
+   which is what makes "60 FPS / 13415 ms" appear on screen simultaneously.
