@@ -44,10 +44,18 @@ assert "l.hidden = NO" not in present
 harness = r'''
 #define _POSIX_C_SOURCE 200809L
 #include <assert.h>
+#include <dlfcn.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef RTLD_DEFAULT
+#define RTLD_DEFAULT ((void *)-2)
+#endif
+/* the production logs use Wine's HWND (a pointer); the model's HWND is a node
+   index, so the logs go through an untyped variadic sink */
+static int fake_dprintf(int fd, const char *fmt, ...) { (void)fd; (void)fmt; return 0; }
+#define dprintf fake_dprintf
 typedef uintptr_t HWND;
 typedef int BOOL;
 typedef unsigned int UINT, DWORD, ULONG;
@@ -59,9 +67,13 @@ enum coords_relative { COORDS_SCREEN, COORDS_PARENT };
 #define TRUE 1
 #define FALSE 0
 #define GWL_STYLE (-16)
+#define GWL_EXSTYLE (-20)
 #define GA_PARENT 1
 #define WS_VISIBLE 0x10000000u
 #define WS_CHILD 0x40000000u
+#define WS_POPUP 0x80000000u
+#define WS_DISABLED 0x08000000u
+#define WS_EX_TOOLWINDOW 0x00000080u
 #define SWP_SHOWWINDOW 0x40u
 #define SWP_HIDEWINDOW 0x80u
 #define SWP_NOSIZE 0x1u
@@ -69,10 +81,11 @@ enum coords_relative { COORDS_SCREEN, COORDS_PARENT };
 #define SWP_FRAMECHANGED 0x20u
 #define STATUS_BUFFER_TOO_SMALL ((NTSTATUS)0xc0000023u)
 #define DESKTOP 1
-static DWORD styles[512];
+static DWORD styles[512], ex_styles[512];
 static HWND parents[512];
 static int child_visible[512], visibility_calls, resize_calls, enum_error;
 static int desktop_mode = 1, game_windows, frame_calls, dialog_calls;
+static HWND winios_suppressed_backdrop_hwnd;
 static struct { HWND hwnd; int x,y,w,h,visible,cx,cy,cw,ch; } last;
 static struct window_rects queried_rects;
 static BOOL IsRectEmpty(const RECT *r) { return r->left >= r->right || r->top >= r->bottom; }
@@ -81,7 +94,12 @@ static UINT get_win_monitor_dpi(HWND hwnd, UINT *raw_dpi) { (void)hwnd; *raw_dpi
 static BOOL get_window_rects(HWND hwnd, enum coords_relative relative, struct window_rects *rects, UINT dpi) {
     (void)hwnd; (void)relative; assert(dpi == 96); *rects = queried_rects; return TRUE;
 }
-static DWORD get_window_long(HWND w, int index) { assert(index == GWL_STYLE && w < 512); return styles[w]; }
+static DWORD get_window_long(HWND w, int index) {
+    assert(w < 512);
+    if (index == GWL_STYLE) return styles[w];
+    assert(index == GWL_EXSTYLE);
+    return ex_styles[w];
+}
 static HWND get_desktop_window(void) { return DESKTOP; }
 static HWND NtUserGetAncestor(HWND w, UINT kind) { assert(kind == GA_PARENT); return parents[w]; }
 static HWND *list_window_parents(HWND w) {

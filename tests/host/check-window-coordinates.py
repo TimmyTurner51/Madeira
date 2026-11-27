@@ -56,10 +56,18 @@ assert "winios_place_metal_layer(key);" in bridge
 harness = r'''
 #define _POSIX_C_SOURCE 200809L
 #include <assert.h>
+#include <dlfcn.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef RTLD_DEFAULT
+#define RTLD_DEFAULT ((void *)-2)
+#endif
+/* the production logs use Wine's HWND (a pointer); the model's HWND is a node
+   index, so the logs go through an untyped variadic sink */
+static int fake_dprintf(int fd, const char *fmt, ...) { (void)fd; (void)fmt; return 0; }
+#define dprintf fake_dprintf
 typedef uintptr_t HWND;
 typedef int BOOL, NTSTATUS;
 typedef unsigned int UINT, DWORD, ULONG;
@@ -78,9 +86,13 @@ typedef struct { HWND parent; struct window_rects rects; DWORD dwExStyle; UINT f
 #define WS_EX_LAYOUTRTL 0x00400000u
 #define ERROR_INVALID_WINDOW_HANDLE 1400
 #define GWL_STYLE (-16)
+#define GWL_EXSTYLE (-20)
 #define GA_PARENT 1
 #define WS_VISIBLE 0x10000000u
 #define WS_CHILD 0x40000000u
+#define WS_POPUP 0x80000000u
+#define WS_DISABLED 0x08000000u
+#define WS_EX_TOOLWINDOW 0x00000080u
 #define SWP_NOSIZE 0x1u
 #define SWP_NOMOVE 0x2u
 #define SWP_FRAMECHANGED 0x20u
@@ -89,10 +101,10 @@ typedef struct { HWND parent; struct window_rects rects; DWORD dwExStyle; UINT f
 #define STATUS_BUFFER_TOO_SMALL ((NTSTATUS)0xc0000023u)
 static WND nodes[512];
 static HWND parents[512];
-static DWORD styles[512];
+static DWORD styles[512], ex_styles[512];
 static UINT window_dpi[512], raw_dpi = 96;
 static int foreign[512], query_calls, server_calls, dpi_fail, fail_relative = -1;
-static HWND fail_hwnd;
+static HWND fail_hwnd, winios_suppressed_backdrop_hwnd;
 static struct window_rects server_screen;
 static int desktop_mode = 1, game_windows;
 struct frame { int x,y,w,h,visible,cx,cy,cw,ch; };
@@ -120,7 +132,11 @@ static void RtlSetLastWin32Error(UINT error) { assert(error == ERROR_INVALID_WIN
 static UINT get_win_monitor_dpi(HWND hwnd, UINT *raw) {
     (void)hwnd; if (dpi_fail) return 0; *raw = raw_dpi; return 96;
 }
-static DWORD get_window_long(HWND w, int index) { assert(index == GWL_STYLE); return styles[w]; }
+static DWORD get_window_long(HWND w, int index) {
+    if (index == GWL_STYLE) return styles[w];
+    assert(index == GWL_EXSTYLE);
+    return ex_styles[w];
+}
 static HWND NtUserGetAncestor(HWND w, UINT kind) { assert(kind == GA_PARENT); return parents[w]; }
 static HWND *list_window_parents(HWND w) {
     HWND *list = calloc(64, sizeof(*list)); assert(list);
