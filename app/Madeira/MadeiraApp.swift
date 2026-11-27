@@ -79,11 +79,6 @@ struct MadeiraApp: App {
         // A package pushed into Documents/Import is installed on the next launch, so a
         // component release takes no UI interaction at all.
         Task { @MainActor in WCPComponentsModel.shared.installInboxAtLaunch() }
-        // A debugger that is attached now may be gone before Play is tapped: under
-        // LiveContainer it is the guest's launch session, which detaches as soon as it
-        // has set CS_DEBUGGED. Take the JIT pool inside that window so a later launch
-        // has one. No-op (one decision, no work) when nothing is attached.
-        Task.detached(priority: .userInitiated) { StikJITHelper.claimPoolWhileTraced() }
         // Opt-in iPhone pointer experiments (PhonePointer.m): before any scene exists.
         madeira_phone_pointer_setup()
         // madeira-bcd: the Metal Performance HUD's performance insights (the
