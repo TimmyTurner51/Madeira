@@ -10754,6 +10754,14 @@ static void mad_vis_retire(struct mad_device *d, obj_handle_t cb);
 static LONG g_perf_lock; static int g_perf_enabled = -1;
 static double g_perf_gpu_sum, g_perf_gpu_union, g_perf_last_end, g_perf_first_start, g_perf_wait_s;
 static LONG g_perf_cbs, g_perf_presents; static LONGLONG g_perf_t0;
+/* ml1140: per-frame census - the 5 s averages hide the hitch spikes. Raw
+ * intervals for the window's quantiles, the worst frame with its GPU/wait
+ * split, and immediate (rate-limited) hitch lines timestamped like [xp-api]
+ * so a hitch can be correlated with the samplers in the same log stream. */
+static double g_fh_ms[1024]; static int g_fh_n;
+static double g_fh_max, g_fh_max_gpu, g_fh_max_wait, g_frame_gpu, g_frame_wait;
+
+static int fh_cmp(const void *a, const void *b) { double x = *(const double *)a, y = *(const double *)b; return x < y ? -1 : x > y; }
 
 static void mad_perf_lock(void) { while (InterlockedCompareExchange(&g_perf_lock, 1, 0)) YieldProcessor(); }
 static void mad_perf_unlock(void) { InterlockedExchange(&g_perf_lock, 0); }
@@ -10766,9 +10774,11 @@ static void mad_perf_cb(obj_handle_t cb, double wait_s) {
     MadeiraCtl(&a);
     mad_perf_lock();
     g_perf_wait_s += wait_s; g_perf_cbs++;
+    g_frame_wait += wait_s;   /* ml1140: CPU side of the frame that is currently open */
     if (a.ret && t.end > t.start) {
         double s0 = t.start, e0 = t.end;
         g_perf_gpu_sum += e0 - s0;
+        g_frame_gpu += e0 - s0;   /* ml1140: GPU busy from the buffers retired during this frame */
         if (!g_perf_first_start) g_perf_first_start = s0;
         if (s0 < g_perf_last_end) s0 = g_perf_last_end;
         if (e0 > s0) g_perf_gpu_union += e0 - s0;
@@ -10782,6 +10792,26 @@ static void mad_perf_present(void) {
     QueryPerformanceCounter(&now); QueryPerformanceFrequency(&fq);
     mad_perf_lock();
     g_perf_presents++;
+    if (!g_perf_t0) { g_perf_t0 = now.QuadPart; mad_perf_unlock(); return; }
+    wall = (double)(now.QuadPart - g_perf_t0) / (double)fq.QuadPart;
+    {   /* ml1140: per-frame interval and rate-limited hitch lines */
+        static LONGLONG s_last_qpc, s_last_log;
+        double dt = 0;
+        if (s_last_qpc) dt = 1000.0 * (double)(now.QuadPart - s_last_qpc) / (double)fq.QuadPart;
+        s_last_qpc = now.QuadPart;
+        if (dt > 0) {
+            if (g_fh_n < 1024) g_fh_ms[g_fh_n++] = dt;
+            if (dt > g_fh_max) { g_fh_max = dt; g_fh_max_gpu = g_frame_gpu * 1000; g_fh_max_wait = g_frame_wait * 1000; }
+            if (dt >= 40.0 && (!s_last_log || now.QuadPart - s_last_log > fq.QuadPart / 4)) {
+                SYSTEMTIME st; GetLocalTime( &st );
+                d3d12_log("[perf] ml1140 hitch %02d:%02d:%02d.%03d: frame %.1fms (gpu done this frame %.1fms, cpu-wait %.1fms)\n",
+                          st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+                          dt, g_frame_gpu * 1000, g_frame_wait * 1000);
+                s_last_log = now.QuadPart;
+            }
+        }
+        g_frame_gpu = g_frame_wait = 0;
+    }
     if (!g_perf_t0) { g_perf_t0 = now.QuadPart; mad_perf_unlock(); return; }
     wall = (double)(now.QuadPart - g_perf_t0) / (double)fq.QuadPart;
     if (wall >= 5.0) {
@@ -10882,7 +10912,15 @@ static void mad_perf_present(void) {
             d3d12_log("[perf] fence-early: %ld fences advanced when the GPU reached them, %ld the old way (query results, a full ring or no retire thread)\n",
                       (long)fe, (long)fi);
         }
-        g_perf_t0 = now.QuadPart; g_perf_presents = 0; g_perf_cbs = 0; g_perf_gpu_sum = g_perf_gpu_union = g_perf_wait_s = 0; g_perf_first_start = 0;
+        if (g_fh_n > 0) {   /* ml1140: per-frame census */
+            int i, gt20 = 0, gt33 = 0, gt50 = 0, p99;
+            qsort( g_fh_ms, g_fh_n, sizeof(double), fh_cmp );
+            for (i = 0; i < g_fh_n; i++) { if (g_fh_ms[i] > 20) gt20++; if (g_fh_ms[i] > 33) gt33++; if (g_fh_ms[i] > 50) gt50++; }
+            p99 = (g_fh_n * 99) / 100; if (p99 >= g_fh_n) p99 = g_fh_n - 1;
+            d3d12_log("[perf] ml1140 frames %d: p50 %.1fms p99 %.1fms worst %.1fms | >20ms %d >33ms %d >50ms %d | worst frame: gpu %.1fms cpu-wait %.1fms\n",
+                      g_fh_n, g_fh_ms[g_fh_n / 2], g_fh_ms[p99], g_fh_max, gt20, gt33, gt50, g_fh_max_gpu, g_fh_max_wait);
+            g_fh_n = 0; g_fh_max = g_fh_max_gpu = g_fh_max_wait = 0;
+        }
         g_perf_ecl = g_perf_signals = g_perf_waits = g_perf_polls = g_perf_qwait_sleeps = 0; g_perf_wait_ticks = g_perf_sig_lat_ticks = 0; g_perf_sig_lat_n = 0;
     }
     mad_perf_unlock();
@@ -12595,6 +12633,19 @@ static void mad_hp_reclaim_locked(struct mad_device *d) {
         } else i++;
     }
 }
+/* ml1342: QPC delta -> microseconds. QueryPerformanceFrequency is constant for a
+ * process, so cache it. The fallback keeps the number meaningful if the call fails
+ * instead of printing raw ticks as though they were microseconds (a mistake that
+ * makes a 40 us cost look like 400). */
+static LONG64 mad_qpc_delta_us(LONG64 Delta) {
+    static LONG64 Freq = 0;
+    if (!Freq) {
+        LARGE_INTEGER f;
+        if (QueryPerformanceFrequency(&f) && f.QuadPart) Freq = f.QuadPart;
+        else Freq = 10000000;   /* the usual 100 ns QPC; never divide by zero */
+    }
+    return Delta * 1000000 / Freq;
+}
 /* Returns the heap index or -1; *off is the placed offset. */
 static int mad_hp_alloc(struct mad_device *d, UINT64 size, UINT64 align, UINT64 *off) {
     unsigned hi, bi; int found = -1;
@@ -12618,22 +12669,40 @@ static int mad_hp_alloc(struct mad_device *d, UINT64 size, UINT64 align, UINT64 
     }
     if (found < 0) {
         UINT64 hs = size > MAD_HP_HEAP_BYTES ? size : MAD_HP_HEAP_BYTES;
+        /* ml1342: time the heap creation. A 557 ms frame gap on device (2026-11-27)
+         * landed exactly on 'texture heap #6 created' followed by '#7 created' and a
+         * 192 MB tiled reservation, so the suspicion is that growing the placement
+         * heap is synchronous on whatever thread renders. Measure it instead of
+         * assuming: this is the same measure-then-fix loop that found the SMC CRC
+         * guard. 'create' is the MTLDevice call (kernel allocation of `hs` bytes),
+         * 'resident' is mad_resident over the whole heap, and 'total' is the cost
+         * the frame actually paid, all in microseconds. */
+        LONG64 t_create_us = 0, t_resident_us = 0, t0 = mad_qpc();
         obj_handle_t heap = MTLDevice_newPlacementHeap(d->mtl_device, hs, WMTResourceStorageModePrivate);
-        if (heap && mad_grow((void **)&d->theaps, &d->theaps_cap, d->ntheaps + 1, sizeof *d->theaps)) {
-            struct mad_texheap *h = &d->theaps[d->ntheaps];
-            memset(h, 0, sizeof *h);
-            h->heap = heap; h->size = hs;
-            mad_hp_free_locked(h, 0, hs);
-            mad_resident(d, heap);   /* residency follows the heap, not its textures */
-            InterlockedExchangeAdd64(&d->hp_total_bytes, (LONG64)hs);
-            found = (int)d->ntheaps++;
-            /* the whole heap is free, so the first block fits by construction */
-            memmove(&h->fl[0], &h->fl[1], (h->nfl - 1) * sizeof *h->fl); h->nfl--;
-            if (hs > size) mad_hp_free_locked(h, size, hs - size);
-            *off = 0;
-            d3d12_log("[madeira-d3d12] ml1072 texture heap #%u created (%llu MB; %lld MB in heaps, %ld small textures placed so far)\n",
-                      d->ntheaps, (unsigned long long)(hs >> 20), (long long)(d->hp_total_bytes >> 20), d->hp_textures);
-        } else if (heap) NSObject_release(heap);
+        if (heap) {
+            LONG64 t1 = mad_qpc();
+            t_create_us = mad_qpc_delta_us(t1 - t0);
+            if (mad_grow((void **)&d->theaps, &d->theaps_cap, d->ntheaps + 1, sizeof *d->theaps)) {
+                struct mad_texheap *h = &d->theaps[d->ntheaps];
+                memset(h, 0, sizeof *h);
+                h->heap = heap; h->size = hs;
+                mad_hp_free_locked(h, 0, hs);
+                mad_resident(d, heap);   /* residency follows the heap, not its textures */
+                t_resident_us = mad_qpc_delta_us(mad_qpc() - t1);
+                InterlockedExchangeAdd64(&d->hp_total_bytes, (LONG64)hs);
+                found = (int)d->ntheaps++;
+                /* the whole heap is free, so the first block fits by construction */
+                memmove(&h->fl[0], &h->fl[1], (h->nfl - 1) * sizeof *h->fl); h->nfl--;
+                if (hs > size) mad_hp_free_locked(h, size, hs - size);
+                *off = 0;
+                d3d12_log("[madeira-d3d12] ml1072 texture heap #%u created (%llu MB; %lld MB in heaps, %ld small textures placed so far) "
+                          "[ml1342 create=%lldus resident=%lldus total=%lldus]\n",
+                          d->ntheaps, (unsigned long long)(hs >> 20), (long long)(d->hp_total_bytes >> 20), d->hp_textures,
+                          (long long)t_create_us, (long long)t_resident_us, (long long)mad_qpc_delta_us(mad_qpc() - t0));
+            } else {
+                NSObject_release(heap);
+            }
+        }
     }
     if (found >= 0) InterlockedExchangeAdd64(&d->hp_live_bytes, (LONG64)size);
     LeaveCriticalSection(&d->heap_lock);
