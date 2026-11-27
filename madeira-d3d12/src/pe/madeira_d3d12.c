@@ -640,6 +640,8 @@ static LONG g_cb_errors, g_cb_retired, g_null_cbv_bound, g_vis_fallback;
 static LONGLONG g_perf_ecl_ticks, g_perf_present_ticks;   /* ml1119 */
 static int g_async_submit;   /* ml1120: defined with the worker below */
 static LONGLONG g_perf_worker_ticks, g_perf_drain_ticks, g_perf_resetwait_ticks, g_perf_waitjob_ticks; static LONG g_perf_resetwaits, g_perf_jobs;   /* ml1120 */
+static volatile LONG g_desc_gen;   /* madeira-bcd table-cache: bumped at every descriptor write (app thread) */
+static int g_tab_cache = -1;       /* table-cache: madeira.cfg table-cache, default 1; read at the first build */
 /* ml1128: TRANSITION PROBE (measurement only). Cumulative QPC ticks / counts,
  * published once to the unix side (MadeiraCtl op 5), which samples them every
  * 250 ms next to per-thread P/E-core CPU counters. The layout is mirrored in
@@ -2255,6 +2257,26 @@ struct mad_exec {
     struct mad_resource *rp_disc[16]; unsigned rp_ndisc;
     int rp_late;   /* madeira-bcd rp-discard: the open pass said Unknown store actions; exec_end decides them */
     unsigned rp_from;   /* madeira-bcd rp-discard: the command after the open pass's last draw (0 for a pass carried in) */
+    /* madeira-bcd table-cache: argument tables are a pure function of the state
+     * a build reads -- the root signature, the root/constant arrays, the PSO's
+     * AIR ranges, the descriptor heaps -- and every draw rebuilt them from
+     * scratch (RS_TABLES in the replay split). The cache remembers each build's
+     * ring offsets; a later draw with the same key re-binds those offsets
+     * (draw-dedup then elides the binds) instead of taking fresh ring slots.
+     * tc_gen is bumped when the REPLAY changes root/rootsig/heaps state (the
+     * only writers of those arrays on this thread); g_desc_gen is bumped by the
+     * application thread at every descriptor write. Scoped to one list replay:
+     * the ring offsets a hit returns live in this list's ring chunks. */
+    unsigned tc_gen;
+    struct {
+        int valid;
+        const struct mad_rootsig *rs; const UINT64 *root; const void *consts;
+        const struct mad_pso *pso; const void *airv;
+        unsigned nair, cb_bind, arg_bind, arg_qwords, vis_mask;
+        unsigned gen; LONG dgen;
+        obj_handle_t cb_buf, arg_buf; UINT64 cb_off, arg_off;
+    } tc[8];
+    unsigned tc_hit, tc_miss;
 };
 static void mad_capture_pass(struct mad_exec *e, struct mad_resource **rt, unsigned nrt, const struct mad_rtvp *rtp,
                              struct mad_resource *depth, const struct mad_rtvp *dp, unsigned seq, unsigned draws);
@@ -7845,11 +7867,46 @@ static int mad_air_build_tables_ex(struct mad_exec *e, const struct mad_rootsig 
                                    const struct madeira_ir_air_range *airv, unsigned vis_mask,   /* ml1083: one stage, described explicitly */
                                    obj_handle_t *cb_buf, UINT64 *cb_off,
                                    obj_handle_t *arg_buf, UINT64 *arg_off) {
+    /* madeira-bcd table-cache: a build is a pure function of these inputs --
+     * the root signature, the root/constant arrays, the PSO's AIR ranges, the
+     * bound heaps (whose contents move under g_desc_gen) -- so a draw that
+     * repeats an earlier build's state re-binds that build's ring offsets and
+     * skips the ring takes and the per-range resolve walk entirely. */
+    LONG dg = g_desc_gen;   /* captured before the build reads any descriptor */
+    __typeof__(e->tc[0]) *t = NULL;
+    if (g_tab_cache < 0) {
+        g_tab_cache = mad_cfg_int_pe("table-cache", 1) ? 1 : 0;
+        d3d12_log("[madeira-d3d12] ml1326 table-cache = %d (madeira.cfg; argument tables reused between same-state draws)\n", g_tab_cache);
+    }
+    if (g_tab_cache && !e->sk && !g_dump_tables) {
+        unsigned h = (unsigned)(((ULONG_PTR)pso >> 5) ^ ((ULONG_PTR)airv >> 4) ^ ((ULONG_PTR)root >> 3)
+                                ^ ((ULONG_PTR)cb_bind << 7) ^ ((ULONG_PTR)arg_bind << 13)
+                                ^ ((ULONG_PTR)arg_qwords << 19) ^ ((ULONG_PTR)nair << 2) ^ (ULONG_PTR)vis_mask);
+        t = &e->tc[h & 7];
+        if (t->valid && t->gen == e->tc_gen && t->dgen == g_desc_gen
+            && t->rs == rs && t->root == root && t->consts == (const void *)consts && t->pso == pso
+            && t->airv == (const void *)airv && t->nair == nair && t->cb_bind == cb_bind
+            && t->arg_bind == arg_bind && t->arg_qwords == arg_qwords && t->vis_mask == vis_mask) {
+            *cb_buf = t->cb_buf; *cb_off = t->cb_off; *arg_buf = t->arg_buf; *arg_off = t->arg_off;
+            e->tc_hit++;
+            return 1;
+        }
+    }
     /* madeira-bcd: replay split "of which argument tables" */
     UINT64 t0 = g_replay_split > 0 ? mad_tick() : 0;
     int ok = mad_air_build_tables_ex_body(e, rs, root, consts, pso, cb_bind, arg_bind, arg_qwords, nair, airv, vis_mask,
-                                          cb_buf, cb_off, arg_buf, arg_off);
+                                      cb_buf, cb_off, arg_buf, arg_off);
     if (t0) mad_rs_step(RS_TABLES, &t0);
+    if (ok && t) {
+        t->valid = 1;
+        t->rs = rs; t->root = root; t->consts = (const void *)consts; t->pso = pso; t->airv = (const void *)airv;
+        t->nair = nair; t->cb_bind = cb_bind; t->arg_bind = arg_bind; t->arg_qwords = arg_qwords; t->vis_mask = vis_mask;
+        t->gen = e->tc_gen;
+        t->dgen = dg;
+        t->cb_buf = *cb_buf; t->cb_off = *cb_off; t->arg_buf = *arg_buf; t->arg_off = *arg_off;
+        e->tc_miss++;
+    }
+    /* a failed build is not cached: the failure reasons and diagnostics run again */
     return ok;
 }
 static int mad_air_build_tables(struct mad_exec *e, const struct mad_rootsig *rs, const UINT64 *root,
@@ -10296,19 +10353,22 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
         case MC_PSO: if (c->u.pso && c->u.pso->is_compute) e.cpso = c->u.pso; else e.pso = c->u.pso;
             if (g_sd_state > 0 && g_pso_first && c->u.pso && !c->u.pso->first_used) mad_pso_first(c->u.pso);   /* madeira-bcd: pso-first-use */
             break;
-        case MC_CROOTSIG: e.crs = c->u.rootsig; memset(e.lat_va[1], 0, sizeof e.lat_va[1]); break;   /* madeira-bcd static-cbv: latches are per signature */
-        case MC_CROOT: if (c->u.root.index < MAD_ROOT_PARAM_MAX) e.croot[c->u.root.index] = c->u.root.value; break;
+        case MC_CROOTSIG: e.crs = c->u.rootsig; memset(e.lat_va[1], 0, sizeof e.lat_va[1]); e.tc_gen++; break;   /* madeira-bcd static-cbv: latches are per signature */
+        case MC_CROOT: if (c->u.root.index < MAD_ROOT_PARAM_MAX) { e.croot[c->u.root.index] = c->u.root.value; e.tc_gen++; } break;
         case MC_CROOT_CONST:
-            if (c->u.rconst.index < MAD_ROOT_PARAM_MAX && c->u.rconst.dst + c->u.rconst.n <= 64)
+            if (c->u.rconst.index < MAD_ROOT_PARAM_MAX && c->u.rconst.dst + c->u.rconst.n <= 64) {
                 memcpy(&e.cconsts[c->u.rconst.index][c->u.rconst.dst], &l->cdata[c->u.rconst.data], c->u.rconst.n * 4);
+                e.tc_gen++;   /* madeira-bcd table-cache */
+            }
             break;
         case MC_ROOT:
             if (c->u.root.index < MAD_ROOT_PARAM_MAX) {
                 e.root[c->u.root.index] = c->u.root.value;
                 if (c->u.root.index + 1 > e.nroot) e.nroot = c->u.root.index + 1;
+                e.tc_gen++;   /* madeira-bcd table-cache */
             }
             break;
-        case MC_HEAPS: if (c->u.heaps.srv) e.srv = c->u.heaps.srv; if (c->u.heaps.smp) e.smp = c->u.heaps.smp; break;
+        case MC_HEAPS: if (c->u.heaps.srv) e.srv = c->u.heaps.srv; if (c->u.heaps.smp) e.smp = c->u.heaps.smp; e.tc_gen++; break;   /* madeira-bcd table-cache */
         case MC_VP: e.vp = c->u.vp; e.has_vp = 1; break;
         case MC_SCISSOR: e.sc = c->u.scissor; e.has_sc = 1; break;
         case MC_TOPO: e.topo = c->u.topo; break;
@@ -10340,11 +10400,13 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
             if (c->u.clear.nrect) exec_clear_rects(&e, l, c);   /* madeira-bcd clear-rects */
             else exec_add_clear(&e, c->u.clear.res, &c->u.clear.v, NULL, c->u.clear.depth, 1, c->u.clear.stencil, c->u.clear.flags);
             break;
-        case MC_ROOTSIG: e.rs = c->u.rootsig; memset(e.lat_va[0], 0, sizeof e.lat_va[0]); break;   /* madeira-bcd static-cbv: latches are per signature */
+        case MC_ROOTSIG: e.rs = c->u.rootsig; memset(e.lat_va[0], 0, sizeof e.lat_va[0]); e.tc_gen++; break;   /* madeira-bcd static-cbv: latches are per signature */
         case MC_CBV_LATCH: mad_scbv_replay(&e, c); break;   /* madeira-bcd static-cbv */
         case MC_ROOT_CONST:
-            if (c->u.rconst.index < MAD_ROOT_PARAM_MAX && c->u.rconst.dst + c->u.rconst.n <= 64)
+            if (c->u.rconst.index < MAD_ROOT_PARAM_MAX && c->u.rconst.dst + c->u.rconst.n <= 64) {
                 memcpy(&e.consts[c->u.rconst.index][c->u.rconst.dst], &l->cdata[c->u.rconst.data], c->u.rconst.n * 4);
+                e.tc_gen++;   /* madeira-bcd table-cache */
+            }
             break;
         case MC_STENCIL_REF: e.stencil_ref = c->u.stencil_ref; break;
         case MC_BARRIER:   /* ml1091; ml1098: madeira.cfg barrier-render = 1 closes the render pass too (Astra's conservative experiment) */
@@ -10432,11 +10494,13 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
      * left nothing in the log about what the scene actually submitted. One line
      * per 600 lists costs nothing and says whether the scene draws at all. */
     {
-        static LONG acc_lists, acc_cmds, acc_draws, acc_skipped, acc_max_draws;
+        static LONG acc_lists, acc_cmds, acc_draws, acc_skipped, acc_max_draws, acc_tc_hit, acc_tc_miss;
         LONG n = InterlockedIncrement(&acc_lists);
         InterlockedExchangeAdd(&acc_cmds, (LONG)l->ncmds);
         InterlockedExchangeAdd(&acc_draws, (LONG)e.draws);
         InterlockedExchangeAdd(&acc_skipped, (LONG)e.skipped);
+        InterlockedExchangeAdd(&acc_tc_hit, (LONG)e.tc_hit);      /* madeira-bcd table-cache */
+        InterlockedExchangeAdd(&acc_tc_miss, (LONG)e.tc_miss);
         if ((LONG)e.draws > acc_max_draws) acc_max_draws = (LONG)e.draws;
         if ((n % 600) == 0) {
             d3d12_log("[madeira-d3d12] ml1042 last 600 lists: %ld commands, %ld draws (%ld skipped), "
@@ -10449,7 +10513,11 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
                       InterlockedExchange(&g_pass_end_clear, 0), InterlockedExchange(&g_pass_end_dispatch, 0), InterlockedExchange(&g_pass_end_blit, 0),
                       InterlockedExchange(&g_pass_end_list, 0), InterlockedExchange(&g_pass_end_attachless, 0), InterlockedExchange(&g_pass_clear_only, 0),
                       (long long)(InterlockedExchange64(&g_pass_attach_bytes, 0) >> 20));
-            if ((n % 3000) == 0) mad_skip_report();   /* ml1049 */
+            if ((n % 3000) == 0) {
+                d3d12_log("[madeira-d3d12] ml1326 last 3000 lists: table-cache %ld reused, %ld built (madeira.cfg table-cache)\n",
+                          InterlockedExchange(&acc_tc_hit, 0), InterlockedExchange(&acc_tc_miss, 0));
+                mad_skip_report();   /* ml1049 */
+            }
         }
     }
     /* ml1150: the memory census on a clock, not a list count. A title that dies
@@ -13937,6 +14005,7 @@ static void STDMETHODCALLTYPE device_CreateConstantBufferView(ID3D12Device *This
         const D3D12_CONSTANT_BUFFER_VIEW_DESC *desc, D3D12_CPU_DESCRIPTOR_HANDLE h) {
     struct mad_descriptor *e = (struct mad_descriptor *)h.ptr;
     if (!e) return;
+    InterlockedIncrement(&g_desc_gen);   /* madeira-bcd table-cache: any descriptor write invalidates cached tables */
     if (g_sd_state > 0) mad_dg_write(e, 1, "CreateConstantBufferView");   /* madeira-bcd: desc-guard */
     if (!desc || !desc->BufferLocation) {   /* a null view: defined to read as zeros (ml1049) */
         struct mad_device *nd = (struct mad_device *)This;
@@ -13989,6 +14058,7 @@ static void STDMETHODCALLTYPE device_CreateUnorderedAccessView(ID3D12Device *Thi
     struct mad_descriptor *e = (struct mad_descriptor *)h.ptr;
     static int said_counter, said_kind;
     if (!e) return;
+    InterlockedIncrement(&g_desc_gen);   /* madeira-bcd table-cache */
     if (g_sd_state > 0) mad_dg_write(e, 1, "CreateUnorderedAccessView");   /* madeira-bcd: desc-guard */
     if (!r) { memset(e, 0, sizeof *e); return; }                                /* a null view */
     if (counter && !said_counter++)
@@ -14111,6 +14181,7 @@ static void STDMETHODCALLTYPE device_CopyDescriptorsSimple(ID3D12Device *This, U
         D3D12_CPU_DESCRIPTOR_HANDLE dst, D3D12_CPU_DESCRIPTOR_HANDLE src, D3D12_DESCRIPTOR_HEAP_TYPE type) {
     (void)This;
     if (!n || !dst.ptr || !src.ptr) return;
+    InterlockedIncrement(&g_desc_gen);   /* madeira-bcd table-cache */
     if (g_sd_state > 0) mad_dg_write((const void *)dst.ptr, n, "CopyDescriptorsSimple");   /* madeira-bcd: desc-guard */
     memmove((void *)dst.ptr, (const void *)src.ptr, (size_t)n * mad_descriptor_stride(type));
 }
@@ -14122,6 +14193,7 @@ static void STDMETHODCALLTYPE device_CopyDescriptors(ID3D12Device *This,
     UINT stride = mad_descriptor_stride(type);
     UINT di = 0, si = 0, dpos = 0, spos = 0;
     (void)This;
+    InterlockedIncrement(&g_desc_gen);   /* madeira-bcd table-cache */
     /* Sizes may be NULL, meaning every range is one descriptor long. */
     while (di < ndst && si < nsrc) {
         UINT dlen = dst_sizes ? dst_sizes[di] : 1, slen = src_sizes ? src_sizes[si] : 1;
@@ -16633,6 +16705,7 @@ static void STDMETHODCALLTYPE device_CreateShaderResourceView(ID3D12Device *This
     struct mad_resource *r = (struct mad_resource *)res;
     struct mad_descriptor *e = (struct mad_descriptor *)h.ptr;
     if (!e) return;
+    InterlockedIncrement(&g_desc_gen);   /* madeira-bcd table-cache */
     if (g_sd_state > 0) mad_dg_write(e, 1, "CreateShaderResourceView");   /* madeira-bcd: desc-guard */
     if (!r) { memset(e, 0, sizeof *e); return; }                                /* a null view */
     if (r->buffer) {
@@ -16860,6 +16933,7 @@ static void STDMETHODCALLTYPE device_CreateSampler(ID3D12Device *This,
     struct mad_device *d = (struct mad_device *)This;
     struct mad_descriptor *e = (struct mad_descriptor *)h.ptr;
     if (!e) return;
+    InterlockedIncrement(&g_desc_gen);   /* madeira-bcd table-cache */
     if (g_sd_state > 0) mad_dg_write(e, 1, "CreateSampler");   /* madeira-bcd: desc-guard */
 
     struct WMTSamplerInfo si;

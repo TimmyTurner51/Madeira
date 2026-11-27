@@ -219,6 +219,13 @@ OVERLAY = {
                         "draw before it; a buffer bound again with only a new offset is sent as an offset. Every draw "
                         "still runs with exactly the state it set (about half of a Horizon Zero Dawn draw's Metal "
                         "calls were such repeats). 0: every draw sends all of it, as before. Read once per game start."},
+    "table-cache": {"category": "Direct3D 12", "title": "Reuse argument tables between same-state draws",
+                "kind": "bool", "default": "1",
+                "note": "Default on. A draw or dispatch whose descriptors, root arguments and constants are all "
+                        "unchanged since an earlier one re-uses that draw's argument tables instead of building "
+                        "them again (fresh ring memory and a resolve of every shader binding, the largest piece "
+                        "of command-list replay). Every draw still runs with the exact state it set. 0: every "
+                        "draw rebuilds them, as before. Read once per game start."},
     "addr-scan": {"category": "Direct3D 12", "title": "Quicker GPU-address lookups",
                 "kind": "bool", "default": "1",
                 "note": "Default on. Finding the buffer behind a GPU address (every vertex buffer, index buffer and root "

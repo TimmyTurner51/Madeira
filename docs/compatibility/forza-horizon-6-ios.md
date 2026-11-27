@@ -3234,3 +3234,52 @@ name the dispatch path; a watchpoint/log at `+0x1598` writes (`0x49a0182`,
 `0x49a07bb`, `0x49a07ee`) names the writer. `signal_arm64_ios.c` `ml1312`
 already prints the object's vtable slot count and first slots at fault time —
 extend it with the caller-frame RVA to settle 1 vs 2 vs 3.
+
+### 9.26 `ml1326` — table-cache: the same-state draw re-uses the previous draw's argument tables (2026-11-26, offline fix against §9.24's RS_TABLES bucket)
+
+§9.24 put "the rest of ExecuteCommandLists is the replay itself" and named
+the buckets the next run will split. One of them needed no split to act on:
+`RS_TABLES`, `mad_air_build_tables_ex` "inside every draw/dispatch" — the
+build takes fresh zeroed ring slots for the constant-buffer and argument
+tables, resolves every shader binding through the root signature
+(`mad_air_resolve`), and copies root constants into a ring slot of their own.
+FH6's draw bursts pay that for byte-identical tables: `draw-dedup` already
+elides 123 of 410 state sets a frame, which only happens when consecutive
+draws really do repeat state — and a repeated state resolves to the same
+table bytes.
+
+**The fix** (`table-cache`, madeira.cfg, default 1): the cache remembers each
+build's ring offsets in `struct mad_exec` (8 entries, so the vertex/fragment/
+tessellation/compute tables of a draw burst do not thrash), and a later build
+with the same key returns those offsets instead of building. The draw then
+re-binds the same table offsets — `draw-dedup` elides those binds too. The
+cache is scoped to one list replay, so the offsets it returns always live in
+this list's ring chunks (pooled, GPU-lifetime aware).
+
+**Correctness is entirely invalidation**, and both halves are exhaustive:
+
+* **Replay state** (the root signature, `root[]`, `consts[]`, the heaps): the
+  only writers on this thread are seven replay commands (`MC_ROOT`,
+  `MC_ROOT_CONST`, `MC_ROOTSIG`, `MC_CROOT`, `MC_CROOT_CONST`, `MC_CROOTSIG`,
+  `MC_HEAPS`), each bumped into `tc_gen`. The cbv-snapshot and static-cbv
+  transformers write only stack copies of the root array — the builds take
+  the arrays themselves, which those never touch.
+* **Descriptor contents** (what a table resolve reads out of the bound heaps,
+  the UAV-counter map, the typed-view registries): every writer is the
+  application thread through `Create*View` / `CopyDescriptors*` — the six
+  functions that already carry the `mad_dg_write` desc-guard marker — each
+  bumps `g_desc_gen`, and a hit is refused whenever anything moved since the
+  build. The generation is sampled *before* the body reads any descriptor, so
+  a write landing mid-build conservatively invalidates.
+
+A build that fails is never cached (the failure diagnostics run again);
+skin-check frames and `dump-tables` builds run the body every time. Nothing
+about a draw's GPU work changes: the tables are the same bytes at the same
+addresses, only built once.
+
+**Verification on device** (queued with the §9.24 replay-split run): the
+`ml1326` line every 3000 lists reports `table-cache N reused, M built`; the
+same run's `replay split` line shows RS_TABLES against the previous run's
+share, and the frame-graph should show the worker busy time falling from
+13.96 ms toward the 1 ms Metal-submission floor. `table-cache = 0` restores
+the old behaviour in one line if anything diverges.
