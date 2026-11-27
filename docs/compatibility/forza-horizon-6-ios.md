@@ -3514,3 +3514,53 @@ apart from the intended edit. `libarm64ecfex.dll` builds again.
 
 Not yet done: the new instrumentation has not run on-device, so the storm is
 still unattributed.
+
+### 9.31 The 0-fps stall: a doubled SMC CRC subtract made the "bytes unchanged" match unreachable (2026-11-27 on-device, fixed)
+
+The 0-fps stalls and the 60 -> 5.6 fps collapse had nothing to do with the GPU.
+Instrumenting `FindBlock` (ml1340) produced this, twice, on a run that presented
+nothing for minutes:
+
+```
+[l1-miss] ml1124 1152385024 L1 misses total, 7968775/s over the last 2^20;
+          top miss_rip[0]=0x71e0b9551c x1 miss_rip[1]=0x71e0b9553 x1 crc=1152383876
+```
+
+`crc=1,152,383,876` of `1,152,385,024` misses -- **99.9999%** arrived with
+`ValidateCRC` set, which is the one path in `FindBlock` that skips both L1 and L2
+and runs a CRC32 over the guest bytes. Two adjacent RIPs held essentially all of
+it at 7.6-8.0M misses/s: one core pinned at 3.2 GHz, GPU idle, 13K real compiles
+in the whole session and no SMC log activity at all.
+
+`ValidateCRC` is set only for the RIP that was just invalidated
+(`LastSMCInvalidateRIP == GuestRIP`), so the invalidation was firing on every
+*entry* to those blocks. The cause is in `ThreadRemoveCodeEntry`'s generated CRC
+comparison, which ended with two `sub` instructions:
+
+```cpp
+if (ThreadState->PoolPatchableCRC) { ...; sub(Dst, TMP1, TMP2); }
+else                              {      sub(Dst, TMP1, CRC32Reg); }
+sub(Dst, TMP1, CRC32Reg);   /* <-- duplicate, from a hunk that landed twice */
+```
+
+The second `sub` is unconditional, so the compare becomes `(crc - patchable) - crc`
+or `crc - 2*crc`. `Dst` is essentially never zero, the MATCH branch that proves the
+bytes are unchanged is never taken, and every entry re-validates a block that has
+not changed. Removing it:
+
+| | before | after |
+|---|---|---|
+| L1 misses/s | 7.6M-9.2M | 47K-91K |
+| `crc=` share of misses | 99.9999% | **0** |
+| link | ticking while the title presented nothing | 60.0 Hz, mean 16.7 ms, longest gap 16.7 ms |
+| presents | none | +79 ... +143 |
+
+That is 100-200x fewer L1 misses and a steady 60 Hz link, on the same title/menu
+state that previously stalled indefinitely. The duplicate line is a hunk that
+landed twice and was *committed* -- the same corruption §9.30 describes in the
+working tree, so `build/fex-patches/apply.sh`'s digest guard also prevents this
+class of defect from being reintroduced.
+
+Reproduce/verify with one log line: `[l1-miss] ... crc=N` must stay at 0 and the
+rate must stay in the tens of thousands per second. A return to millions/s with
+`crc=N` climbing means the guard has been broken again.
