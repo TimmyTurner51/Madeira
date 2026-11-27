@@ -37,6 +37,20 @@ patches=("$R"/build/fex-patches/*.patch)
 # FEX is a submodule, so .git may be a *file* pointing at the real git dir.
 FEX_GITDIR="$(git -C "$F" rev-parse --absolute-git-dir 2>/dev/null || echo "$F/.git")"
 STATE="$FEX_GITDIR/madeira-fex-patches-applied"
+
+# shasum ships with macOS, sha256sum with Linux; either is fine for a change marker.
+sha256_of() {
+    if command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | cut -d' ' -f1
+    elif command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1
+    else cksum "$1" | cut -d' ' -f1-2 | tr ' ' '-'
+    fi
+}
+
+# Digest recorded for a patch (matched by file name), or empty.
+recorded_digest() {
+    [ -f "$STATE" ] || return 0
+    awk -F: -v name="$1" '$1 == name { sub(/^[^:]*:/, ""); print; exit }' "$STATE" 2>/dev/null || true
+}
 if [ "${1:-}" = --revert ]; then
     for ((i = ${#patches[@]} - 1; i >= 0; i--)); do
         p="${patches[$i]}"
@@ -49,18 +63,29 @@ if [ "${1:-}" = --revert ]; then
     exit 0
 fi
 for p in "${patches[@]}"; do
-    digest="$(basename "$p"):$(shasum -a 256 "$p" | cut -d' ' -f1)"
-    if [ -f "$STATE" ] && grep -qxF "$digest" "$STATE" 2>/dev/null; then
-        echo "fex-patches: $(basename "$p") already applied (recorded)"
+    name="$(basename "$p")"
+    sha="$(sha256_of "$p")"
+    recorded="$(recorded_digest "$name")"
+    if [ -n "$recorded" ]; then
+        if [ "$recorded" = "$sha" ]; then
+            echo "fex-patches: $name already applied (recorded)"
+            continue
+        fi
+        # The patch file changed after it was applied. Its new hunk may still
+        # pass --check against the already-patched tree and insert a SECOND copy
+        # -- the exact defect this guard exists to prevent -- so refuse instead
+        # of guessing which version the tree holds.
+        echo "fex-patches: $name changed since it was applied (recorded ${recorded:0:12}, now ${sha:0:12}); run --revert and reset the FEX tree" >&2
+        exit 1
     elif git -C "$F" apply --reverse --check "$p" 2>/dev/null; then
-        echo "fex-patches: $(basename "$p") already applied"
-        printf '%s\n' "$digest" >> "$STATE"
+        echo "fex-patches: $name already applied"
+        printf '%s:%s\n' "$name" "$sha" >> "$STATE"
     elif git -C "$F" apply --check "$p" 2>/dev/null; then
         git -C "$F" apply "$p"
-        printf '%s\n' "$digest" >> "$STATE"
-        echo "fex-patches: applied $(basename "$p")"
+        printf '%s:%s\n' "$name" "$sha" >> "$STATE"
+        echo "fex-patches: applied $name"
     else
-        echo "fex-patches: $(basename "$p") does not apply on FEX $(git -C "$F" rev-parse --short HEAD)" >&2
+        echo "fex-patches: $name does not apply on FEX $(git -C "$F" rev-parse --short HEAD)" >&2
         exit 1
     fi
 done
