@@ -28,7 +28,7 @@ def function(source, signature, closing='\n}'):
 
 
 ec = native[native.index('size_t alloc_size = (*size_ptr + 0x3FFF) & ~0x3FFFUL;'):]
-ec = ec[:ec.index('size_t reserve_offset, tail_added, tail_skipped = 0;')]
+ec = ec[:ec.index('size_t reserve_offset = 0, tail_added = 0, tail_skipped = 0;')]
 assert 'int low_ok = ios_jit_low_size_global && !ios_wow_base();' in ec
 assert ec.count('goto retry_code_carve_reuse;') == 2
 assert ec.count('ios_tail_carve_ready( &ios_tail_carves[') == 2, 'cap lift and reuse share one readiness rule'

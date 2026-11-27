@@ -50,7 +50,7 @@ helpers = ''.join(function(signature) for signature in (
 carve_start = source.index('#define IOS_TAIL_CARVE_MAX ')
 carve_table = source[carve_start:source.index('\n\n', carve_start)]
 ec = source[source.index('size_t alloc_size = (*size_ptr + 0x3FFF) & ~0x3FFFUL;'):]
-ec = ec[:ec.index('size_t reserve_offset, tail_added, tail_skipped = 0;')]
+ec = ec[:ec.index('size_t reserve_offset = 0, tail_added = 0, tail_skipped = 0;')]
 free_start = source.index('    if ((type & MEM_RELEASE) && ios_jit_rx_base_global && ios_jit_pool_size_global &&')
 free_end = source.index('\n    }\n', source.index('/* pool address but not a live tail carve', free_start)) + 7
 release_block = source[free_start:free_end]

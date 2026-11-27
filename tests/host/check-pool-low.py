@@ -63,14 +63,14 @@ assert native.index('const char *big = getenv( "MADEIRA_POOL_BIG_SLOT_MB" );') <
     native.index('pthread_create( &warm, NULL, ios_pool_warmer_thread, NULL )'), 'C is known before the warmer starts'
 
 ec = native[native.index('size_t alloc_size = (*size_ptr + 0x3FFF) & ~0x3FFFUL;'):]
-ec = ec[:ec.index('size_t pool_tail_off = ios_jit_pool_size_global - reserve_offset - alloc_size;')]
+ec = ec[:ec.index('size_t pool_tail_off = 0;')]
 assert 'int low_ok = ios_jit_low_size_global && !ios_wow_base();' in ec, 'WoW64 never gets a C carve'
 assert 'if (alloc_size > cap && !low_fits) {' in ec, 'the tail cap does not refuse what C can take'
 assert ec.count('(low_ok || !ios_tail_carve_in_low( ios_tail_carves[') == 2, \
     'a freed C carve is neither reused by nor counted for a WoW64 process'
 low_carve = ec[ec.index('if (low_ok)\n'):]
 assert ec.index('/* ml438 (#74): serve from the free-list first') < ec.index('if (low_ok)\n') < \
-    ec.index('size_t reserve_offset, tail_added, tail_skipped = 0;'), 'reuse first, then C, then the tail'
+    ec.index('size_t reserve_offset = 0, tail_added = 0, tail_skipped = 0;'), 'reuse first, then C, then the tail'
 assert 'ios_pool_low_take( &ios_jit_low_reserved, ios_jit_low_size_global, alloc_size, &loff )' in low_carve
 assert 'ios_tail_carves[ios_tail_carve_n].off = (size_t)((uintptr_t)jit_rx - (uintptr_t)ios_jit_rx_base_global);' \
     in low_carve, 'a C carve is recorded with its wrapping distance from the pool base'
