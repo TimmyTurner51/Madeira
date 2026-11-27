@@ -121,6 +121,8 @@ enum StikJITHelper {
     /// This app run's pool exists. The debugger detaches right after the pool is
     /// made, by design, so from then on "no debugger attached" is the normal state.
     private(set) static var poolTaken = false
+    /// ml2030: the fp-probe runs at most once per app run (see allocatePool).
+    private static var fpProbed = false
 
     /// madeira-bcd split pool (`pool-split = 1`): the pool offsets [off, end) that
     /// lie between its two debugger regions (the main thread's stack and our
@@ -323,6 +325,13 @@ enum StikJITHelper {
     /// Allocate a JIT memory pool via BRK #0xf00d WITHOUT detaching the debugger.
     /// The debugger stays attached so Wine can use BRK to prepare PE code pages.
     static func allocatePool(poolSize requestedPoolSize: Int = 128 * 1024 * 1024) -> (rx: UnsafeMutableRawPointer, rw: UnsafeMutableRawPointer, size: Int)? {
+        // ml2030: opt-in ownership-ladder probe (env.MADEIRA_FP_PROBE = 1). Runs
+        // here, inside the debugger window, so MADEIRA_FP_PROBE_BLESS = 1 can also
+        // test whether prepare blesses self-mapped pages. Once per app run.
+        if !fpProbed, MadeiraConfig.flag("MADEIRA_FP_PROBE", fallback: false) {
+            fpProbed = true
+            jit_footprint_probe()
+        }
         var poolSize = requestedPoolSize      // ml1036: may shrink to fit, see the hole census below
         poolFailure = nil
         LogStore.shared.log("Allocating \(poolSize / 1024 / 1024)MB JIT pool via debugger...")

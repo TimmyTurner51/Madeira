@@ -42,8 +42,11 @@ extern kern_return_t mach_vm_protect(vm_map_t, mach_vm_address_t, mach_vm_size_t
 // VM_LEDGER_TAG_DEFAULT and VM_LEDGER_FLAG_NO_FOOTPRINT
 // These are private Mach APIs used by MeloNX to make JIT memory
 // not count against the app's Jetsam memory limit.
+// ml2030: the kernel's VM_LEDGER_TAG_DEFAULT is 0x1 (osfmk/mach/vm_statistics.h);
+// 0 is VM_LEDGER_TAG_NONE. The old value of 0 here tagged every ownership call
+// "none", which is not what MeloNX's recipe does.
 #ifndef VM_LEDGER_TAG_DEFAULT
-#define VM_LEDGER_TAG_DEFAULT 0
+#define VM_LEDGER_TAG_DEFAULT 1
 #endif
 #ifndef VM_LEDGER_FLAG_NO_FOOTPRINT
 #define VM_LEDGER_FLAG_NO_FOOTPRINT (1 << 0)
@@ -312,6 +315,296 @@ bool jit_make_region_no_footprint(void *addr, size_t size, const char *label) {
     jit_log("[no-footprint] %s: ALL %zu variants refused — pool stays jetsam-counted rev=ml458",
             label, sizeof(variants) / sizeof(variants[0]));
     return false;
+}
+
+/* ml2030: FPPROBE -- which memory can be made NO_FOOTPRINT at all?
+ *
+ * The ml458 ladder walked (entry-flags, owner) pairs over the pool's EXISTING
+ * mappings and every one came back kr=4. The xnu source (osfmk/vm/
+ * vm_memory_entry.c, mach_memory_entry_ownership) says why, and it is not the
+ * flags or the owner:
+ *
+ *   if (mem_entry->is_sub_map || !mem_entry->is_fully_owned)
+ *       return KERN_INVALID_ARGUMENT;
+ *
+ * An entry is "fully owned" only when its objects are ALREADY owned
+ * (vo_owner != TASK_NULL) or external (file-backed). The debugger's _M pages
+ * are internal and unowned, so no entry over them is ever usable -- kr=4 for
+ * every variant, exactly as protprobe/001-002 logged. The shape of the fix is
+ * therefore decided by which CREATION recipe yields an ownable object:
+ *
+ *   named/create   MAP_MEM_NAMED_CREATE              (jit_region_create today)
+ *   named/tagged   + MAP_MEM_LEDGER_TAGGED           (owned at creation)
+ *   named/purgeable+ MAP_MEM_PURGABLE                (fully_owned at creation)
+ *   file-backed    entry over an unlinked MAP_SHARED (external object)
+ *
+ * and separately whether the entitlement gate (NO_FOOTPRINT needs
+ * com.apple.private.memory.ownership_transfer on macOS xnu) passes here: the
+ * observed kr=4 rather than kr=5 (KERN_NO_ACCESS) says the gate did pass for
+ * the pool entries, but only a fully-owned entry proves it end to end. Every
+ * variant writes 16 MB first, so the phys_footprint delta around the call is
+ * the honest verdict -- a drop of ~16 MB means the exemption took effect,
+ * ~0 means the kernel accepted the call but kept charging us.
+ *
+ * The optional bless test (MADEIRA_FP_PROBE_BLESS=1) answers the second half:
+ * whether the debugger's prepare_region will arm EXECUTION on pages this
+ * process mapped itself (the pool today can only execute from debugger-allocated
+ * _M pages). It runs on a watchdog thread because a TXM rejection may not
+ * signal -- it may just not fetch -- and a stuck thread is survivable at
+ * start-up while a hung launch is not. */
+#define FPPROBE_BYTES (16u << 20)
+#define FPPROBE_TAG_DEFAULT_FIXED 1   /* xnu VM_LEDGER_TAG_DEFAULT = 1 (0 is TAG_NONE) */
+
+static uint64_t fp_probe_footprint(void) {
+    task_vm_info_data_t vmi;
+    mach_msg_type_number_t vmi_cnt = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vmi, &vmi_cnt) != KERN_SUCCESS) return 0;
+    return vmi.phys_footprint;
+}
+
+static void fp_probe_touch(void *p, size_t size) {
+    for (size_t o = 0; o < size; o += JIT_PAGE_SIZE) ((volatile char *)p)[o] = 1;
+}
+
+/* One ownership attempt with the full billing story around it. `expect`:
+ * 1 = must succeed, 0 = must fail, -1 = informational (any kr is fine). */
+static void fp_probe_try(const char *name, mach_port_t entry, void *mapped,
+                         int tag, int flags, int own_self, int expect) {
+    if (entry == MACH_PORT_NULL) {
+        jit_log("[fp-probe] %-28s entry creation FAILED", name);
+        return;
+    }
+    if (mapped) fp_probe_touch(mapped, FPPROBE_BYTES);
+    uint64_t before = fp_probe_footprint();
+    kern_return_t kr = mach_memory_entry_ownership(entry,
+                                                   own_self ? mach_task_self() : TASK_NULL,
+                                                   tag, flags);
+    uint64_t after = fp_probe_footprint();
+    int unexpected = (expect >= 0) && ((kr == KERN_SUCCESS) != (expect == 1));
+    jit_log("[fp-probe] %-28s ownership kr=%d (%s) tag=%d flags=0x%x owner=%s "
+            "fp %llu -> %llu MB (delta %lld MB)%s",
+            name, kr, kr == KERN_SUCCESS ? "OK" : mach_error_string(kr),
+            tag, flags, own_self ? "self" : "TASK_NULL",
+            (unsigned long long)(before >> 20), (unsigned long long)(after >> 20),
+            (long long)((after - before) >> 20),
+            unexpected ? "  [UNEXPECTED]" : "");
+}
+
+static mach_port_t fp_probe_named(vm_prot_t flags, memory_object_size_t *size_io) {
+    mach_port_t entry = MACH_PORT_NULL;
+    kern_return_t kr = mach_make_memory_entry_64(mach_task_self(), size_io, 0, flags,
+                                                 &entry, MACH_PORT_NULL);
+    return kr == KERN_SUCCESS ? entry : MACH_PORT_NULL;
+}
+
+/* Optional second half: can the debugger bless self-mapped pages for EXECUTION?
+ * Strategy 1 of jit_test_execute in miniature, on a watchdog thread.
+ *
+ * Containment is permanent and chain-on-mismatch: the handler below stays
+ * installed (Wine replaces it wholesale when it starts) because a stuck thread
+ * can fault long after the probe returns, and restoring the old action first
+ * would make that a process crash. Faults from any OTHER thread are forwarded
+ * to whatever was installed before the probe. */
+#include <setjmp.h>
+#include <pthread.h>
+struct fp_bless_ctx { void *rx; volatile int done; volatile int gone; volatile int64_t result; pthread_t th; };
+static struct fp_bless_ctx fp_bless_ctx_store;
+static sigjmp_buf fp_bless_jmp;
+static struct sigaction fp_bless_old_segv, fp_bless_old_bus;
+
+static void fp_bless_chain(int sig, siginfo_t *info, void *uap) {
+    struct sigaction *old = (sig == SIGSEGV) ? &fp_bless_old_segv : &fp_bless_old_bus;
+    if (old->sa_flags & SA_SIGINFO) {
+        if (old->sa_sigaction) { old->sa_sigaction(sig, info, uap); return; }
+    } else if (old->sa_handler == SIG_IGN) return;
+    else if (old->sa_handler != SIG_DFL) { old->sa_handler(sig); return; }
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+static void fp_bless_fault(int sig, siginfo_t *info, void *uap) {
+    struct fp_bless_ctx *c = &fp_bless_ctx_store;
+    if (!c->gone && pthread_equal(pthread_self(), c->th)) siglongjmp(fp_bless_jmp, 1);
+    fp_bless_chain(sig, info, uap);
+}
+
+static void *fp_bless_thread(void *arg) {
+    struct fp_bless_ctx *ctx = arg;
+    if (sigsetjmp(fp_bless_jmp, 1)) { ctx->result = -4; ctx->done = 1; ctx->gone = 1; return NULL; }   /* -4: faulted */
+    typedef int64_t (*fn_t)(void);
+    ctx->result = ((fn_t)ctx->rx)();
+    ctx->done = 1;
+    ctx->gone = 1;
+    return NULL;
+}
+
+static void fp_probe_bless(void) {
+    JITRegion *region = jit_region_create(JIT_PAGE_SIZE);
+    if (!region) { jit_log("[fp-probe] bless/named-rwx: region create FAILED"); return; }
+    static const uint32_t code[] = { 0xD2800540 /* mov x0, #42 */, 0xD65F03C0 /* ret */ };
+    void *rx = jit_region_write(region, 0, code, sizeof(code));
+    if (!rx) { jit_log("[fp-probe] bless/named-rwx: write FAILED"); jit_region_destroy(region); return; }
+    void *prepared = jit26_prepare_region(region->rx_ptr, region->size);
+    jit_log("[fp-probe] bless/named-rwx: prepare returned %p (RX=%p)", prepared, region->rx_ptr);
+
+    /* The only proof of execution is executing. Guard the fetch: a TXM
+     * rejection faults (or, worst case, does not signal at all -- hence the
+     * watchdog instead of calling inline). */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = fp_bless_fault;
+    sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGSEGV, &sa, &fp_bless_old_segv);
+    sigaction(SIGBUS, &sa, &fp_bless_old_bus);
+    struct fp_bless_ctx *ctx = &fp_bless_ctx_store;
+    memset((void *)ctx, 0, sizeof(*ctx));
+    ctx->rx = rx;
+    ctx->result = -5;   /* -5: no report */
+    pthread_create(&ctx->th, NULL, fp_bless_thread, ctx);
+    for (int i = 0; i < 200 && !ctx->done; i++) usleep(10 * 1000);
+    jit_log("[fp-probe] bless/named-rwx: execute -> %lld%s (want 42; -4 faulted, -5 no report in 2 s)",
+            (long long)ctx->result, ctx->done ? "" : " [WATCHDOG]");
+    if (ctx->done) {
+        pthread_join(ctx->th, NULL);
+        jit_region_destroy(region);
+    } else {
+        /* Stuck inside the fetch. Detach, keep the region mapped and the
+         * handler installed: the thread may fault again at any time and must
+         * find the containment still there. */
+        pthread_detach(ctx->th);
+        jit_log("[fp-probe] bless/named-rwx: thread abandoned on purpose; region and fault containment stay");
+    }
+}
+
+void jit_footprint_probe(void) {
+    jit_log("[fp-probe] ml2030 BEGIN  fp=%llu MB", (unsigned long long)(fp_probe_footprint() >> 20));
+
+    /* 1-2: jit_region_create's recipe as-is, and with the kernel-correct tag. */
+    {
+        memory_object_size_t size = FPPROBE_BYTES;
+        mach_port_t e = fp_probe_named(MAP_MEM_NAMED_CREATE | VM_PROT_READ | VM_PROT_WRITE, &size);
+        void *p = NULL;
+        if (e != MACH_PORT_NULL) vm_map(mach_task_self(), (vm_address_t *)&p, size, 0, VM_FLAGS_ANYWHERE,
+                                       e, 0, FALSE, VM_PROT_READ | VM_PROT_WRITE,
+                                       VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_NONE);
+        fp_probe_try("named/create tag0", e, p, 0, VM_LEDGER_FLAG_NO_FOOTPRINT, 0, -1);
+        if (p) vm_deallocate(mach_task_self(), (vm_address_t)p, (vm_size_t)size);
+        if (e != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), e);
+    }
+    {
+        memory_object_size_t size = FPPROBE_BYTES;
+        mach_port_t e = fp_probe_named(MAP_MEM_NAMED_CREATE | VM_PROT_READ | VM_PROT_WRITE, &size);
+        void *p = NULL;
+        if (e != MACH_PORT_NULL) vm_map(mach_task_self(), (vm_address_t *)&p, size, 0, VM_FLAGS_ANYWHERE,
+                                       e, 0, FALSE, VM_PROT_READ | VM_PROT_WRITE,
+                                       VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_NONE);
+        fp_probe_try("named/create tag1", e, p, FPPROBE_TAG_DEFAULT_FIXED, VM_LEDGER_FLAG_NO_FOOTPRINT, 0, -1);
+        if (p) vm_deallocate(mach_task_self(), (vm_address_t)p, (vm_size_t)size);
+        if (e != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), e);
+    }
+
+    /* 3-5: the fully-owned entry (MAP_MEM_LEDGER_TAGGED owns at creation):
+     * no-footprint straight away, the no-gate control, then no-footprint on a
+     * now-owned object. 5 is the end-to-end proof the gate passes here. */
+    {
+        memory_object_size_t size = FPPROBE_BYTES;
+        mach_port_t e = fp_probe_named(MAP_MEM_NAMED_CREATE | MAP_MEM_LEDGER_TAGGED | VM_PROT_READ | VM_PROT_WRITE, &size);
+        void *p = NULL;
+        if (e != MACH_PORT_NULL) vm_map(mach_task_self(), (vm_address_t *)&p, size, 0, VM_FLAGS_ANYWHERE,
+                                       e, 0, FALSE, VM_PROT_READ | VM_PROT_WRITE,
+                                       VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_NONE);
+        fp_probe_try("named/tagged nofoot", e, p, FPPROBE_TAG_DEFAULT_FIXED, VM_LEDGER_FLAG_NO_FOOTPRINT, 0, -1);
+        if (p) vm_deallocate(mach_task_self(), (vm_address_t)p, (vm_size_t)size);
+        if (e != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), e);
+    }
+    {
+        memory_object_size_t size = FPPROBE_BYTES;
+        mach_port_t e = fp_probe_named(MAP_MEM_NAMED_CREATE | MAP_MEM_LEDGER_TAGGED | VM_PROT_READ | VM_PROT_WRITE, &size);
+        void *p = NULL;
+        if (e != MACH_PORT_NULL) vm_map(mach_task_self(), (vm_address_t *)&p, size, 0, VM_FLAGS_ANYWHERE,
+                                       e, 0, FALSE, VM_PROT_READ | VM_PROT_WRITE,
+                                       VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_NONE);
+        fp_probe_try("named/tagged owner-only", e, p, FPPROBE_TAG_DEFAULT_FIXED, 0, 1, 1);
+        fp_probe_try("named/tagged owner->nofp", e, p, FPPROBE_TAG_DEFAULT_FIXED, VM_LEDGER_FLAG_NO_FOOTPRINT, 1, -1);
+        if (p) vm_deallocate(mach_task_self(), (vm_address_t)p, (vm_size_t)size);
+        if (e != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), e);
+    }
+
+    /* 6: the purgeable recipe (fully_owned at creation too). */
+    {
+        memory_object_size_t size = FPPROBE_BYTES;
+        mach_port_t e = fp_probe_named(MAP_MEM_NAMED_CREATE | MAP_MEM_PURGABLE | VM_PROT_READ | VM_PROT_WRITE, &size);
+        void *p = NULL;
+        if (e != MACH_PORT_NULL) vm_map(mach_task_self(), (vm_address_t *)&p, size, 0, VM_FLAGS_ANYWHERE,
+                                       e, 0, FALSE, VM_PROT_READ | VM_PROT_WRITE,
+                                       VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_NONE);
+        fp_probe_try("named/purgeable nofoot", e, p, FPPROBE_TAG_DEFAULT_FIXED, VM_LEDGER_FLAG_NO_FOOTPRINT, 0, -1);
+        if (p) vm_deallocate(mach_task_self(), (vm_address_t)p, (vm_size_t)size);
+        if (e != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), e);
+    }
+
+    /* 7-8: the failure baseline -- anonymous (internal, unowned) memory, the
+     * pool's exact shape. Kept in the ladder so the log still says what the
+     * current pool entries do on this kernel. */
+    {
+        vm_address_t a = 0;
+        if (vm_allocate(mach_task_self(), &a, FPPROBE_BYTES, VM_FLAGS_ANYWHERE) == KERN_SUCCESS) {
+            memory_object_size_t size = FPPROBE_BYTES;
+            mach_port_t e = MACH_PORT_NULL;
+            if (mach_make_memory_entry_64(mach_task_self(), &size, (memory_object_offset_t)a,
+                                          VM_PROT_READ | VM_PROT_WRITE, &e, MACH_PORT_NULL) != KERN_SUCCESS)
+                e = MACH_PORT_NULL;
+            fp_probe_try("anon/plain-entry nofoot", e, (void *)a, FPPROBE_TAG_DEFAULT_FIXED,
+                         VM_LEDGER_FLAG_NO_FOOTPRINT, 0, 0);
+            if (e != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), e);
+            vm_deallocate(mach_task_self(), a, FPPROBE_BYTES);
+        }
+    }
+    {
+        vm_address_t a = 0;
+        if (vm_allocate(mach_task_self(), &a, FPPROBE_BYTES, VM_FLAGS_ANYWHERE) == KERN_SUCCESS) {
+            memory_object_size_t size = FPPROBE_BYTES;
+            mach_port_t e = MACH_PORT_NULL;
+            if (mach_make_memory_entry_64(mach_task_self(), &size, (memory_object_offset_t)a,
+                                          MAP_MEM_VM_SHARE | VM_PROT_READ | VM_PROT_WRITE, &e, MACH_PORT_NULL) != KERN_SUCCESS)
+                e = MACH_PORT_NULL;
+            fp_probe_try("anon/share-entry nofoot", e, (void *)a, FPPROBE_TAG_DEFAULT_FIXED,
+                         VM_LEDGER_FLAG_NO_FOOTPRINT, 1, 0);
+            if (e != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), e);
+            vm_deallocate(mach_task_self(), a, FPPROBE_BYTES);
+        }
+    }
+
+    /* 9: external objects (file-backed) are "fully owned" by definition -- the
+     * one shape over existing memory the kernel's walk accepts. Unlinked, so
+     * nothing is left behind. */
+    {
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/fpprobe-%d.tmp", getenv("TMPDIR") ?: "/tmp", (int)getpid());
+        int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+        unlink(path);
+        if (fd >= 0 && ftruncate(fd, FPPROBE_BYTES) == 0) {
+            void *p = mmap(NULL, FPPROBE_BYTES, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+            if (p != MAP_FAILED) {
+                memory_object_size_t size = FPPROBE_BYTES;
+                mach_port_t e = MACH_PORT_NULL;
+                if (mach_make_memory_entry_64(mach_task_self(), &size, (memory_object_offset_t)(uintptr_t)p,
+                                              VM_PROT_READ | VM_PROT_WRITE, &e, MACH_PORT_NULL) != KERN_SUCCESS)
+                    e = MACH_PORT_NULL;
+                fp_probe_try("filebacked nofoot", e, p, FPPROBE_TAG_DEFAULT_FIXED,
+                             VM_LEDGER_FLAG_NO_FOOTPRINT, 0, -1);
+                if (e != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), e);
+                munmap(p, FPPROBE_BYTES);
+            }
+        }
+        if (fd >= 0) close(fd);
+    }
+
+    /* env.MADEIRA_FP_PROBE_BLESS = 1: run the bless half LAST -- does prepare
+     * bless SELF-mapped pages for execution? Watchdogged; see fp_probe_bless. */
+    if (getenv("MADEIRA_FP_PROBE_BLESS") && getenv("MADEIRA_FP_PROBE_BLESS")[0] == '1') fp_probe_bless();
+
+    jit_log("[fp-probe] ml2030 END  fp=%llu MB", (unsigned long long)(fp_probe_footprint() >> 20));
 }
 
 void jit_region_destroy(JITRegion *region) {

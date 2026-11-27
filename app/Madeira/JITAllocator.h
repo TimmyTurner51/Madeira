@@ -28,6 +28,15 @@ void jit_region_destroy(JITRegion *region);
 /// changes nothing if the private ownership API refuses.
 bool jit_make_region_no_footprint(void *addr, size_t size, const char *label);
 
+/// ml2030: FPPROBE (opt-in, env.MADEIRA_FP_PROBE = 1). Runs the ownership
+/// ladder that decides which memory kinds can be made jetsam-exempt at all --
+/// named/tagged, purgeable, file-backed and the anon baseline -- with the
+/// phys_footprint delta around every call as the verdict. Run it where a
+/// debugger is live (the top of allocatePool): MADEIRA_FP_PROBE_BLESS = 1 also
+/// tests whether prepare blesses SELF-mapped pages for execution, on a watchdog
+/// thread. See the ml2030 comment in JITAllocator.c for the kernel model.
+void jit_footprint_probe(void);
+
 // Get the RW (writable) pointer. Write generated code here.
 void *jit_region_rw_ptr(JITRegion *region);
 

@@ -2962,3 +2962,68 @@ The load that follows is still slow — at the title-to-world transition the pro
 `cpu=1072 ms` per `336 ms` sample (~3.2 cores), `rdKB=48-304`, `P=1.31/E=1.70 GHz` thermally
 clamped, presenting 16-19 frames/s. That is the standing load-time/P-core ceiling from §9.18,
 not the stall.
+
+### 9.21 `ml2030` — why no pool entry can be made no-footprint, and the probe that picks the fix (2026-11-26)
+
+**Symptom.** The 6144 MB jetsam ceiling leaves no room for `tex-drop-mip = 1`
+(the garage's texture floor; §9.16 measured +536 MB for one mip). The
+880 MB JIT pool (624 MB RX + 256 MB RW alias, up to 848 MB written at world
+load) is billed to Madeira's `phys_footprint`, and the ml458 ladder that tried
+to exempt it returned `ownership failed kr=4` for every (entry-flags, owner)
+pair — `protprobe/001-002` on device — with the plain variants also reporting
+`entry covers only 16384 of 554762240 bytes (partial)`: a 16 KB entry for a
+529 MB region.
+
+**Root cause, from the xnu source (osfmk/vm/vm_memory_entry.c).** The ladder
+was testing the wrong thing. `mach_memory_entry_ownership` rejects an entry
+before owner or flags matter:
+
+```c
+if (mem_entry->is_sub_map || !mem_entry->is_fully_owned)
+    return KERN_INVALID_ARGUMENT;
+```
+
+An entry is *fully owned* only when its objects are already owned
+(`vo_owner != TASK_NULL`) or external (file-backed). The debugger's `_M` pool
+pages are internal and unowned — `VM_OBJECT_OWNER(...) == TASK_NULL` — so
+**no entry over the existing pool can ever be made no-footprint**, whatever
+flags or owner the call passes. Three further facts from the same reading:
+
+* `TASK_NULL` as owner means *"leave the owner unchanged"* (`owner =
+  VM_OBJECT_OWNER_UNCHANGED`), not "no owner". Memory is un-billed only by
+  `VM_LEDGER_FLAG_NO_FOOTPRINT` or by the owner exiting — the donor-pool
+  mechanism `DonorPool.m` already uses at 14.5 GB scale.
+* The no-footprint path passes through an entitlement gate
+  (`com.apple.private.memory.ownership_transfer`, `KERN_NO_ACCESS` when it
+  refuses). The observed `kr=4` rather than `kr=5` says the gate passed on this
+  device and the failures were purely the entry-shape checks — but only a
+  fully-owned entry proves that end to end.
+* `VM_LEDGER_TAG_DEFAULT` is `0x1` in xnu (`0` is `VM_LEDGER_TAG_NONE`);
+  `JITAllocator.c` defined it as `0`, so every ml458 call also tagged the
+  object "none". Now fixed to `1`, with tag 0 kept measurable in the probe.
+
+**What can be fully owned at all** — the fix's real question, now that the
+pool's own entries are known dead: `MAP_MEM_NAMED_CREATE | MAP_MEM_LEDGER_TAGGED`
+and `MAP_MEM_PURGABLE` named entries are owned at creation
+(`vm_object_ownership_change(..., owner = current_task(), ...)` in
+`mach_make_memory_entry_named_create`), and entries over file-backed objects
+are fully owned by definition (`!object->internal`). Which of those recipes
+*also* survives the no-footprint call on this kernel is what `jit_footprint_probe`
+(live where a debugger is: the top of `allocatePool`) now measures — each
+variant writes 16 MB first, so the `phys_footprint` delta around the call is
+the verdict, not the return code alone.
+
+**The second half is execution.** Un-billing the pool only helps if its RX
+side still fetches when it no longer comes from the debugger's `_M` pages.
+`MADEIRA_FP_PROBE_BLESS = 1` runs strategy 1 of `jit_test_execute` in
+miniature — self-mapped RWX named entry, `prepare`, call a `mov x0, #42; ret` —
+on a watchdog thread, because a TXM rejection is not guaranteed to signal. The
+fault containment stays installed afterwards (chaining to the previous
+handler) so a thread that faults late cannot crash the app.
+
+**What the run decides.** If a recipe both drops 16 MB of footprint and (for
+the bless half) executes, the pool is rebuilt from that recipe and `tex-drop-mip
+= 1` gets its 536 MB back. If no recipe drops the footprint, only the
+donor-exit mechanism remains (extension-owned pool, exit, billed to nobody) and
+the headroom must come from elsewhere — the ~1.5 GB of guest memory still
+billed anonymously (§9.17's census) is the next lever.
