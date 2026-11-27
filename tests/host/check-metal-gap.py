@@ -40,9 +40,9 @@ def block(start, end="\n}\n"):
 res = block("struct mad_resource {", "\n};\n")
 check("struct mad_resource carries metal_bytes", "UINT64 metal_bytes;" in res)
 
-create = block("static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap_type,\n"
+create = block("static HRESULT mad_create_resource_ex(struct mad_device *d, D3D12_HEAP_TYPE heap_type,\n"
                "                                      const D3D12_RESOURCE_DESC *desc, REFIID riid, void **out,\n"
-               "                                      struct mad_memheap *ph, UINT64 poff) {")
+               "                                      struct mad_memheap *ph, UINT64 poff, int is_reserved) {")
 acct = create[create.index("if (!r->placed_heap) {   /* ml1057"):]
 acct = acct[:acct.index("hr = res_QI(")]
 check("standalone textures only: not placed in an application heap, not in a runtime texture heap",
@@ -69,10 +69,10 @@ check("ring chunks counted when a new one is made, after the pool and the failur
       ring.index("if (got) return 1;") < ring.index("InterlockedIncrement(&g_ring_chunks);")
       and ring.index("if (!out->buf || !bi.memory.ptr) return 0;") < ring.index("InterlockedIncrement(&g_ring_chunks);"))
 
-heap = block("static HRESULT STDMETHODCALLTYPE device_CreateHeap(ID3D12Device *This, const D3D12_HEAP_DESC *desc,")
+heap = block("static void mad_memheap_ensure_mtl(struct mad_memheap *h) {")
 mrel = block("static ULONG STDMETHODCALLTYPE memheap_Release(ID3D12Heap *This) {")
 check("placement heaps count while the application holds them",
-      "if (h->mtl) { mad_resident(hd, h->mtl); InterlockedExchangeAdd64(&g_mheap_bytes, (LONG64)desc->SizeInBytes); }" in heap
+      "if (h->mtl) { mad_resident(hd, h->mtl); InterlockedExchangeAdd64(&g_mheap_bytes, (LONG64)h->desc.SizeInBytes); }" in heap
       and "InterlockedExchangeAdd64(&g_mheap_bytes, -(LONG64)h->desc.SizeInBytes);" in mrel
       and mrel.index("if (h->mtl) {") < mrel.index("g_mheap_bytes"))
 

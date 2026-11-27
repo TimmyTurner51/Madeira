@@ -162,7 +162,7 @@ with tempfile.TemporaryDirectory() as tmp:
 # --- textual wiring -----------------------------------------------------------
 call = ntdll[ntdll.index('unsigned int server_call_unlocked( void *req_ptr )'):]
 call = call[:call.index('\n}\n')]
-assert call.index('send_request( req )') < call.index('ios_wineserver_ring( HandleToULong( NtCurrentTeb()->ClientId.UniqueThread ) );') \
+assert call.index('send_request( req )') < call.index('ios_active_wineserver_ring( HandleToULong( NtCurrentTeb()->ClientId.UniqueThread ) );') \
     < call.index('return wait_reply( req );'), 'ring after the write, before the wait'
 loop = src[src.index('void main_loop(void)'):]
 assert loop.index('semaphore_timedwait( ios_srv_wake_sem, wts );') < loop.index('ios_doorbell_service();') \
