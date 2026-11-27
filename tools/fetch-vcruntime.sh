@@ -29,22 +29,46 @@ else
     exit 1
 fi
 
-"$SEVENZIP" x "$TMP/VC_redist.x64.exe" -o"$TMP/ext" -y >/dev/null
+# The installer is a PE whose overlay chains cabinets without .cab names:
+# a metadata cabinet followed by the component cabinets (each a raw MSCF
+# stream, some nested one level deeper). 7-Zip only opens the first cabinet
+# of a blob, so carve every MSCF offset and extract each slice until no new
+# cabinets appear.
+SEVENZIP="$SEVENZIP" python3 - "$TMP" <<'PY'
+import os
+import subprocess
+import sys
+from pathlib import Path
 
-i=0
-while IFS= read -r -d '' cab; do
-    i=$((i + 1))
-    out="$TMP/cab_out/$i"
-    mkdir -p "$out"
-    if ! "$SEVENZIP" x "$cab" -o"$out" -y >"$TMP/7z-$i.log" 2>&1; then
-        echo "warn: could not extract $cab (log: $TMP/7z-$i.log)" >&2
-    fi
-done < <(find "$TMP/ext" -type f -iname '*.cab' -print0)
+tmp = Path(sys.argv[1])
+sevenzip = os.environ['SEVENZIP']
+out = tmp / 'cab_out'
+seen = set()
 
-if [ "$i" -eq 0 ]; then
-    echo "error: no cab files found in installer" >&2
-    exit 1
-fi
+
+def carve(blob, depth):
+    if depth > 3:
+        return
+    data = blob.read_bytes()
+    off = data.find(b'MSCF')
+    while off != -1:
+        if (blob.stat().st_size, off) not in seen:
+            seen.add((blob.stat().st_size, off))
+            slice_file = tmp / 'slice.bin'
+            slice_file.write_bytes(data[off:])
+            subprocess.run([sevenzip, 'x', str(slice_file), f'-o{out}', '-y'],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        off = data.find(b'MSCF', off + 1)
+
+
+carve(tmp / 'VC_redist.x64.exe', 0)
+rounds = 0
+while rounds < 3:
+    rounds += 1
+    for f in sorted(out.rglob('*')):
+        if f.is_file() and f.stat().st_size > 8:
+            carve(f, rounds)
+PY
 
 WANTED=(
     "concrt140.dll"
@@ -83,12 +107,19 @@ sys.exit(1)
 missing=()
 for name in "${WANTED[@]}"; do
     base="${name%.dll}"
+    # the exact amd64 component first, then the plain name, then name
+    # prefixes (F_CENTRAL_...); only an x64 image is ever copied
     matches=()
-    while IFS= read -r -d '' match; do
-        if is_x64 "$match"; then
-            matches+=("$match")
+    for pat in "${name}_amd64" "$name" "${name}*" "F_CENTRAL_${base}_*"; do
+        while IFS= read -r -d '' match; do
+            if is_x64 "$match"; then
+                matches+=("$match")
+            fi
+        done < <(find "$TMP/cab_out" -type f -iname "$pat" -print0)
+        if [ "${#matches[@]}" -gt 0 ]; then
+            break
         fi
-    done < <(find "$TMP/cab_out" -type f \( -iname "$name" -o -iname "${name}_amd64" -o -iname "${name}*" -o -iname "F_CENTRAL_${base}_*" \) -print0)
+    done
 
     if [ "${#matches[@]}" -eq 0 ]; then
         missing+=("$name")
