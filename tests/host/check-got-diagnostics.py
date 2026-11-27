@@ -63,7 +63,9 @@ check("draw hook after the render pass began (clears still run)",
 check("dxil-dump hooks behind their fast path",
       SRC.count("if (g_dxil_dump_state && ") == 2)
 check("the geometry-shader path keeps the plain topology",
-      "ov.topology = (UINT)desc->PrimitiveTopologyType; ov.layout = L->n ? L : NULL;" in SRC)
+      "ov.gs_emulation = 1; ov.topology = (UINT)desc->PrimitiveTopologyType; ov.layout = L;" in SRC)
+check("the tessellation path remaps the topology through mad_dtess_topology",
+      "ov.gs_emulation = 1; ov.topology = mad_dtess_topology((UINT)desc->PrimitiveTopologyType); ov.layout = L;" in SRC)
 check("PE shader cache keys on input_topology", "mad_sc_feed_u64(&h, ((UINT64)a->gs_emulation << 32) | a->input_topology);" in SRC)
 check("unix DXIL cache keys on input_topology", "mad_dxc_hu32(&s, a->input_topology);" in CACHE)
 check("capture-cs keeps its log tag through the shared walker",

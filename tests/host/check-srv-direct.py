@@ -81,8 +81,16 @@ level = func_body(REQ, "static int ios_srv_direct_level( enum request req )")
 run = func_body(REQ, "static int ios_srv_run_direct( struct thread *thread, union generic_reply *reply, void *reply_data )")
 call = func_body(REQ, "int ios_srv_direct_call( unsigned int tid, client_ptr_t teb, const union generic_request *request,")
 try_direct = func_body(NTDLL, "static BOOL ios_srv_try_direct( struct __server_request_info *req, unsigned int *status )")
+# madeira-bcd: the client half reaches the request functions through the
+# dylib-vs-exe dispatchers (ml-migration); the extracted bodies call them.
+td = NTDLL.find("typedef int (*ios_srv_direct_call_fn_t")
+active_typedefs = NTDLL[td:NTDLL.find("static inline int ios_active_srv_direct_call", td)]
+active_call = func_body(NTDLL, "static inline int ios_active_srv_direct_call( unsigned int tid, client_ptr_t teb,")
+active_ring = func_body(NTDLL, "static inline void ios_active_wineserver_ring( unsigned int tid )")
 check(all((enter, leave, exit_, level, run, call, try_direct)), "the loop's lock helpers, the direct-request functions "
       "and the client's ios_srv_try_direct are found")
+check(all((active_typedefs, active_call, active_ring)), "the dylib dispatchers ios_active_srv_direct_call and "
+      "ios_active_wineserver_ring are found")
 g0 = REQ.find("os_unfair_lock ios_srv_lock = OS_UNFAIR_LOCK_INIT;")
 g1 = REQ.find("extern volatile int g_madeira_srv_direct;  /* WineProcessBridge.m */")
 check(0 <= g0 < g1, "the direct-request globals are found")
@@ -94,6 +102,7 @@ names = sorted(set(listed1 + listed2))
 
 harness = r'''
 #define _GNU_SOURCE
+#include <dlfcn.h>
 #include <pthread.h>
 #include <sched.h>
 #include <stdio.h>
@@ -175,6 +184,17 @@ static int ios_srv_loop_locked;
 @EXIT@
 @LEVEL@
 @RUN@
+/* the extracted bodies call the client half's dylib dispatchers, which call
+ * back into the real ios_srv_direct_call below and a stand-in ring */
+int ios_srv_direct_call( unsigned int tid, client_ptr_t teb, const union generic_request *request,
+                        const struct iovec *vec, unsigned int count, union generic_reply *reply, void *reply_data );
+static int madeira_unix_half_is_dylib;
+static volatile int madeira_unix_half_wineserver_active;
+static long ring_n;
+void ios_wineserver_ring( unsigned int tid ) { (void)tid; __atomic_fetch_add( &ring_n, 1, __ATOMIC_SEQ_CST ); }
+@TYPEDS@
+@ACTIVE_CALL@
+@ACTIVE_RING@
 @CALL@
 
 /* ---- the client (build/ntdll-unix/server_ios.c) --------------------------------- */
@@ -479,7 +499,9 @@ int main( int argc, char **argv )
 
 harness = (harness.replace("@NAMES@", ", ".join(n for n in names if n not in ("REQ_new_thread", "REQ_terminate_thread", "REQ_suspend_thread")))
            .replace("@GLOBALS@", globals_block).replace("@ENTER@", enter).replace("@LEAVE@", leave)
-           .replace("@EXIT@", exit_).replace("@LEVEL@", level).replace("@RUN@", run).replace("@CALL@", call).replace("@TRY@", try_direct))
+           .replace("@EXIT@", exit_).replace("@LEVEL@", level).replace("@RUN@", run)
+           .replace("@TYPEDS@", active_typedefs).replace("@ACTIVE_CALL@", active_call).replace("@ACTIVE_RING@", active_ring)
+           .replace("@CALL@", call).replace("@TRY@", try_direct))
 
 cc = os.environ.get("CC") or shutil.which("cc") or shutil.which("gcc") or shutil.which("clang")
 if not cc:
@@ -568,7 +590,7 @@ td = func_body(NTDLL, "static BOOL ios_srv_try_direct( struct __server_request_i
 check("if (ret <= 0) return FALSE;" in td and "*status = req->u.reply.reply_header.error;" in td and
       "(client_ptr_t)(ULONG_PTR)NtCurrentTeb()" in td,
       "anything not taken (or a request that ended the thread) goes on to the pipe; the TEB names the caller")
-check(td.find("int ret, err = errno;") < td.find("ios_srv_direct_call(") < td.find("errno = err;") < td.find("if (ret <= 0) return FALSE;"),
+check(td.find("int ret, err = errno;") < td.find("ios_active_srv_direct_call(") < td.find("errno = err;") < td.find("if (ret <= 0) return FALSE;"),
       "the caller's errno is the same after a direct request as after a pipe round trip")
 
 check("volatile int g_madeira_srv_direct = 0;" in BRIDGE, "the bridge defines g_madeira_srv_direct, off")

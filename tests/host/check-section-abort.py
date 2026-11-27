@@ -61,14 +61,17 @@ leave = function('void server_leave_uninterrupted_section( pthread_mutex_t *mute
 
 # ------------------------------------------------------------------ static
 # ml1183 adds a third: wine_server_receive_fd's dead fd socket, read inside the
-# fd_cache_mutex section of server_get_unix_fd.
-require(src.count('ios_defer_section_abort()') == 3, 'three deferral points: the EPIPE write, the EOF read and the fd read')
+# fd_cache_mutex section of server_get_unix_fd.  ml2122's EBADF write flavor
+# (MADEIRA_SRV_CLOSED_IS_EPIPE) is the fourth.
+require(src.count('ios_defer_section_abort()') == 4, 'four deferral points: the EPIPE write, the EBADF write, the EOF read and the fd read')
 receive_fd = function('int wine_server_receive_fd( obj_handle_t *handle )')
 require('if (ios_defer_section_abort()) return -1;' in receive_fd
         and receive_fd.index('ios_defer_section_abort()') < receive_fd.rindex('abort_thread(0)'),
         'ml1183: a dead fd socket inside a section fails the read before abort_thread')
 require('if (ios_defer_section_abort()) return STATUS_THREAD_IS_TERMINATING;\n#endif\n        abort_thread(0);' in send_request,
         'send_request: EPIPE outside a section still exits at once')
+require('if (w_errno == EBADF && closed_is_epipe)\n        {\n            if (ios_defer_section_abort()) return STATUS_THREAD_IS_TERMINATING;\n            abort_thread( 0 );' in send_request,
+        'send_request: the ml2122 EBADF/closed-fd flavor defers inside a section the same way')
 require('if (ios_defer_section_abort()) return FALSE;\n#endif\n    /* the server closed the connection; time to die... */\n    abort_thread(0);' in read_reply,
         'read_reply_data: EOF outside a section still exits at once')
 require(call_unlocked.index('IOS_SECTION_ABORT') < call_unlocked.index('send_request( req )'),
@@ -102,6 +105,8 @@ harness = r'''
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <dlfcn.h>
+#include <execinfo.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
@@ -137,7 +142,7 @@ struct __server_request_info
 struct thread_data { int request_fd, reply_fd; };
 static __thread struct thread_data tdata;
 static struct thread_data *ntdll_get_thread_data(void) { return &tdata; }
-struct fake_teb { struct { void *UniqueProcess, *UniqueThread; } ClientId; };
+struct fake_teb { struct { void *UniqueProcess, *UniqueThread; } ClientId; void *Peb; };
 static __thread struct fake_teb fteb;
 static struct fake_teb *NtCurrentTeb(void) { return &fteb; }
 #ifndef HandleToULong
@@ -153,6 +158,7 @@ static void ios_bg_qos_check(void) {}   /* [bg-qos]: check-bg-qos.py */
 volatile int ios_srv_req_count;
 void ios_wineserver_wake(void) {}
 void ios_wineserver_ring( unsigned int tid ) { (void)tid; }
+#define ios_active_wineserver_ring ios_wineserver_ring   /* the dylib dispatch is check-srv-direct's */
 volatile int g_madeira_srv_direct;      /* MADEIRA_SRV_DIRECT is off here: check-srv-direct.py */
 static BOOL ios_srv_try_direct( struct __server_request_info *req, unsigned int *status ) { (void)req; (void)status; return FALSE; }
 static DECLSPEC_NORETURN void server_protocol_perror( const char *err ) { perror( err ); abort(); }
