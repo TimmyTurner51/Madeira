@@ -3564,3 +3564,65 @@ class of defect from being reintroduced.
 Reproduce/verify with one log line: `[l1-miss] ... crc=N` must stay at 0 and the
 rate must stay in the tens of thousands per second. A return to millions/s with
 `crc=N` climbing means the guard has been broken again.
+### 9.32 The remaining hitches: a 557 ms gap is synchronous texture-heap growth, and the per-frame census never compiled (2026-11-27 on-device + offline)
+
+With §9.31 active the title/menu sessions hold 60.0 Hz, so the remaining defects
+are now individually visible instead of being buried in a storm. Across 21 ten-second
+windows of the fixed run: sixteen at 60.0 Hz with a 16.7 ms longest gap, four with
+a single 32.9-50.0 ms double-frame, and three real hitches -- 75.2 ms, 113.8 ms,
+and **557.3 ms** (that window managed 31 presents while the link ticked 568 times).
+
+Attribution, by correlating each `[promote]` window with the events inside it:
+
+- **Not** code-buffer generation rollover. `[gen] alloc#` and `[callret-gen] ...
+  resets=128 unique_threads=128` appear in *every* window, including the sixteen
+  clean ones (1-6 gen allocs, 1-6 callret resets each), so a generation change
+  alone costs neither a 75 ms nor a 557 ms gap.
+- **Not** compile volume. The three hitch windows had 57.9K/34.1K/60.9K compiles;
+  two clean windows had 83.9K and 86.0K.
+- **Not** the guard-page tripwire. `Failed to mprotect last page of code buffer`
+  occurs 454 times across the session but 0-56 times per window with no correlation
+  to which windows hitched.
+- **The 557 ms gap is texture-heap growth.** It lands on
+  `texture heap #6 created (64 MB; 384 MB in heaps, 5990 small textures placed so
+  far)` immediately followed by
+  `d3d12-tiled: bound heap48 (65536 KB, type 1) -> reserved r#16 +192 MB` and
+  `texture heap #7 created (64 MB; 448 MB in heaps, 7131 small textures placed so
+  far)`. `mad_hp_alloc` grows the placement heap *inside the allocating thread,
+  under `heap_lock`*, by calling `MTLDevice_newPlacementHeap(64 MB)` and then
+  `mad_resident` over the whole thing. 448 MB across 7 heaps means this path is
+  taken on the render thread mid-frame, which is exactly a several-hundred-ms stall.
+
+  Instrumented rather than guessed: `[ml1342]` now prints
+  `create=<us> resident=<us> total=<us>` on every heap creation, so the next
+  on-device run says which of the three is the cost (the Metal call or the
+  residency registration) before anything is changed. If it is the allocation, the
+  fix is to keep one spare heap created ahead of time on a non-render thread.
+
+- **A second, separate cost worth knowing:** `pso time (periodic)` reports
+  **11,383 graphics pipelines costing 13,329 ms**, of which **11,033 ms** is shader
+  conversion, and `shader libraries created: 22,331, 378 MB of metallib (one per
+  pipeline STAGE, never shared between pipelines)`. That is 378 MB of metallib and
+  ~1.2 ms of CPU per pipeline amortised -- fine if it happens behind a load screen,
+  a 100 ms+ hitch each time it happens mid-frame.
+
+**Why the per-frame telemetry that would settle this was never available:** the
+`ml1140` census (`[perf] ml1140 frames N: p50/p99/worst | >20ms >33ms >50ms |
+worst frame: gpu ms cpu-wait ms`) had **never compiled**. `if (g_fh_n > 0) {` in
+`mad_perf_present` was never closed, so every later function definition was parsed
+as nested and clang emitted 20 `function definition is not allowed here` errors.
+This is why the D3D12-v2 component stayed disabled -- not a choice, a build
+failure that had never been exercised.
+
+Two further defects meant the census would have printed unusable numbers even
+once it built: `g_frame_gpu` and `g_frame_wait` were declared, read and reset but
+**never written**, so every hitch line would have said `gpu 0.0ms, cpu-wait 0.0ms`.
+Both now accumulate in `mad_perf_cb` (the GPU interval of buffers retiring during
+the open frame, and the caller's blocked time) under the same `mad_perf_lock` the
+present path reads and resets them with.
+
+Shipped as `dist/ml1342-d3d12hitch-pe.wcp` + `-dxil-native.wcp` (component
+`Madeira-D3D12-v2`). With it enabled, each >40 ms hitch is one timestamped line
+that splits GPU work from CPU wait and can be aligned against `[xp]`, `[l1-miss]`
+and `[ml1342]` heap timings in the same stream -- which is the measurement needed
+before touching the heap allocator.
