@@ -3387,3 +3387,130 @@ Remaining work after this: the heavy-view GPU budget (12.5 ms at 75 % busy in
 the heaviest scenes — headroom but not much), the 49-53 fps hitch windows, and
 the still-open `ml1317` attribution bisect before anything runtime-side goes
 upstream.
+
+### 9.29 Settings AV reproduced, and §9.25's vtable inference is retired (2026-11-27 on-device)
+
+Reproduced the `fh6.exe+0x3600130` fault a third time (15:21:26, two fault
+records then `[win-name] ... "Forza Horizon 6 has terminated unexpectedly"`),
+with the `FH6-iOS-1.9-builtin` stubs active and the title having just held
+60.0 fps. Same signature: `addr=0x10`, `kr=INVALID_ADDRESS`, `x18=0x0`,
+`rip` = device base `0x7053170000` + `0x3600130`.
+
+**What the fault record adds.** The dump reports the faulting object's first
+qword as a vtable pointer: `vt=0x7059826768` = fh6.exe RVA **`0x66b6768`**.
+Checked offline against the local byte-identical binary (184,268,248 bytes,
+`ImageBase=0x140000000`):
+
+| check | result |
+|---|---|
+| RTTI COL at `vt-8` | valid, `sig=1` (a **primary** vtable), TypeDescriptor name `97036196141102` |
+| code-pointing slots in that vtable | **8** |
+| its slot 209 (`+0x688`) | `0x15efc30` — **not** the crashing getter |
+| documented 234-slot vtable `0x6a982a8` slot 209 | `0x3600130` — the getter, as §9.25 said |
+
+An 8-slot primary vtable cannot legally dispatch slot 209, so this `vptr` is
+not the vptr of an object that reached the getter through `call [reg+0x688]`.
+**§9.25's "the object's vptr pointed at a vtable its caller was not compiled
+against" is therefore retired as a conclusion** — it rests on register values
+that are not trustworthy here. The same record shows why: with `x18=0` there
+is no FEX guest state at fault time, and the record's own two register dumps
+disagree (`[guest-regs] rdx=0x707d25e900 rax=0x2` vs `[x86_live] RDX=0x0
+RAX=0x10`). Treat the object/vtable/type reasoning as void until the state
+question is answered; only the x86 bytes at `rip` (read from the PE mapping)
+are reliable.
+
+**So the crash is a state problem, not an object-type problem.** Guest x64
+code is executing on a thread that has no FEX guest state. The next
+instrumentation is to name the entry path (which native callback starts guest
+code without establishing state), not to keep typing the object.
+
+**Two facts from the same window, for the next run.** Immediately before the
+fault, ~20 threads (tids `118 274 1D4 1D8 284 10C 1AC 15C` ...) each created
+a FEX code buffer and each logged `Failed to mprotect last page of code
+buffer.` — 1,088 times in one session. Those guard pages exist to turn a
+code-buffer overrun into a fault; on iOS they never arm, so an overrun
+silently corrupts whatever follows the buffer instead. Not proven causal for
+this AV, but it removes the tripwire that would have caught it. Also, the
+frame rate collapsed long before the crash: 60 -> 20 -> 9 -> 5.6 fps from
+15:16 to 15:21 with GPU only ~20 ms/frame (frames 50-80 ms => CPU-side), a
+lock convoy measured at 16 waiters (`[lock-orphan] ... 0x7c33d00108`) and 809
+`UNALIGNED-BACKPATCH` Mach exceptions concentrated in exactly those minutes.
+
+### 9.30 The FPS collapse is a translation storm, and the FEX tree would not build (2026-11-27, offline)
+
+Two findings from the 15:13-15:27 session log, both actionable without the
+device.
+
+**(a) The bottleneck is FEX translating, not the game rendering.** The 60 -> 5.6
+fps collapse is not gradual contention: `[CB_SUMMARY]` true compiles go from
+8-13K/min to **477K-543K/min** for 15:16-15:21, i.e. 40-60x, then drop back to
+13K/min once the game is hung. Lookup volume is flat across the same window
+(6.5-13.6M/min, the 65-125K/s the counter's own comment expects), so the 95%
+hit rate is unchanged and the extra work is all *misses*:
+
+| window | real compiles/min | lookups/min |
+|---|---|---|
+| 15:13 (60 fps) | 8,045 | 65,536 |
+| 15:16-15:20 (collapse) | 282K-543K | 6.5M-13.6M |
+| 15:22-15:26 (hung) | 13K-17K | 1.5M |
+
+That matches the frame profile exactly: 50-80 ms frames with only ~20 ms of GPU
+exec, so the frame cost is CPU on the translating threads, not the Metal path.
+It also explains why the GPU-side telemetry looked idempotent — there was never
+a GPU problem in this window.
+
+Two candidate mechanisms, and they need different fixes:
+
+* **thrash** — a small set of blocks invalidated and recompiled repeatedly
+  (SMC, cache reset, buffer eviction). 251 `smc` and 622 `stale` lines in the
+  session, and only 2,788 `[jit-pool]` tail operations (steady 127-501/min
+  across the whole window, *including* the storm) — so the storm is a flood of
+  **small** compiles that fit in existing buffers rather than growth in code
+  volume;
+* **genuinely new code** — the guest running through a large body of code it
+  has not seen before (the menu/UI/script side of the game), which needs a
+  caching or pre-translation answer instead.
+
+`[CB_SUMMARY]` could not tell these apart: its `hottest_rip` comes from a
+bouncing ±1 counter on one RIP guess, and its `repeats` value had already
+overflowed to `18446744073649249575` (negative), so it pointed at
+`0x705858c1f7` for the entire session including the quiet minutes.
+
+So `Core.cpp` now keeps a 16-slot cumulative histogram of the `GuestRIP` passed
+to a true compile and prints
+
+```
+[CB_COMPILE] dcompiles=<since last summary> cumulative=<total> top_rip[0]..[2]=0x..xN
+```
+
+next to the summary. A storm whose top RIPs carry the counts is thrash on those
+blocks; a storm spread across thousands of distinct RIPs is new code. One run
+decides which, and the two counters are taken from the same summary boundary so
+the per-run delta is comparable.
+
+**(b) The FEX working tree did not compile at all.** It was found with several
+patch hunks applied three to five times: `GuestDebugRegisters` declared 3x in
+`InternalThreadState.h`, `GetSharedMap()` 3x in `LookupCache.h`, two stray
+closing braces in `CPUBackend.h` (after which `CodeBuffers` was "undeclared"),
+duplicated `PoolArenaCursor`/`JIT.cpp`/`BranchOps.cpp` hunks, and
+`QueueSMCInvalidate(Thread, GuestRIP)` **5x** in `Core.cpp`'s SMC-full path.
+`cmake --build` failed on the headers, so no FEX-side fix could be built at
+all — this would have silently blocked every FEX change in this thread.
+
+The cause is `build/fex-patches/apply.sh` treating `git apply --reverse --check`
+as proof that a patch is applied. That is not proof for a pure-insertion hunk:
+after one application the hunk's context still matches, so the *forward* check
+succeeds too and the next run inserts a second copy — and reverse-check keeps
+succeeding afterwards, hiding the damage forever. Both patches are in fact
+already committed in FEX `63fe537b7`, so every run after this corruption would
+have stacked another copy of each.
+
+Restored the four files that were pure duplicates to their committed content,
+left the one real call, and made `apply.sh` record `basename:sha256` of each
+patch in the submodule's git dir (resolved via `git rev-parse --absolute-git-dir`,
+because `FEX/.git` is a file) so a recorded patch is skipped outright. Verified
+by running it three consecutive times: no new hunks, `FEX` status unchanged
+apart from the intended edit. `libarm64ecfex.dll` builds again.
+
+Not yet done: the new instrumentation has not run on-device, so the storm is
+still unattributed.
