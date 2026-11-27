@@ -140,6 +140,12 @@ static int ios_avail_phys_chromium( void ) { return 0; }
 /* ml2021: the swap core asks whether a 32-bit program is in the session (none here) */
 static unsigned ios_wow_window_count, ios_wow_placeholder_count;
 static struct { unsigned long base; } ios_wow_windows[1], ios_wow_placeholders[1];
+/* ml1315 attribution hook: called by the core's ios_swap_release_range; the real definition
+ * lives past the compiled "swap-tier core" slice, so the fixture mocks it. */
+static void ios_dc_hist_note( char *base, size_t size, const char *branch, int mmap_errno )
+{
+    (void)base; (void)size; (void)branch; (void)mmap_errno;
+}
 static int ios_jit_low_overlaps( uintptr_t a, size_t size )
 ''' + body_of(virt, 'static int ios_jit_low_overlaps(') + r'''
 /* Wine's rules (unix_private/virtual.c), EXEC mapped to read for the test */
