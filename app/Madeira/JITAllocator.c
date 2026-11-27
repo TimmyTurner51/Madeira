@@ -117,7 +117,7 @@ JITRegion *jit_region_create(size_t size) {
     // Step 1: Create a named memory entry.
     // ml2030: MAP_MEM_LEDGER_TAGGED is the difference between the probe's
     // kr=4 ("named/create") and a working NO_FOOTPRINT exemption
-    // ("named/tagged nofoot": ownership kr=0 and phys_footprint dropped the
+    // (the probe's named/tagged nofoot rung: ownership kr=0 and phys_footprint dropped the
     // full 16 MB). An untagged named entry is not "fully owned", so
     // mach_memory_entry_ownership rejects it with KERN_INVALID_ARGUMENT and
     // every byte of this memory has counted against the Jetsam limit.
@@ -221,7 +221,7 @@ JITRegion *jit_region_create(size_t size) {
 }
 
 /* ml458 round 2: allocate the pool's RX side FROM a MAP_MEM_LEDGER_TAGGED
- * named entry and exempt it at birth — the probe's "named/tagged nofoot"
+ * named entry and exempt it at birth — the probe's named/tagged nofoot
  * recipe, which dropped the full 16 MB of mapped test pages from
  * phys_footprint on device (2026-11-26 21:28). This replaces the debugger's
  * _M allocation (jit26_prepare_region(nil, size)): those pages are internal

@@ -65,8 +65,8 @@ assert 'WATCHDOG' in c
 
 # The header exposes it; the app runs it once, behind the flag, inside the
 # debugger window (allocatePool is where a debugger is guaranteed live).
-assert 'void jit_footprint_probe(void);' in h
-assert 'fpProbed' in swift and 'jit_footprint_probe()' in swift
+assert 'void jit_footprint_probe(int bless);' in h
+assert 'fpProbed' in swift and 'jit_footprint_probe(' in swift
 assert 'MadeiraConfig.flag("MADEIRA_FP_PROBE", fallback: false)' in swift, \
     'the probe must be opt-in via env.MADEIRA_FP_PROBE'
 
