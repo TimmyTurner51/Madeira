@@ -1,0 +1,131 @@
+name: Windows Runtime
+
+# fh6-fex-ios's Windows side, built in CI instead of on a local machine:
+# the FEX ARM64EC/WOW64 Windows modules (xtajit64.dll / libarm64ecfex.dll /
+# libwow64fex.dll) and the aarch64-windows Wine runtime, produced by the same
+# runtime-components contract the IPA build uses. The artifacts are:
+#
+#   runtime-windows        .runtime-cache staging bundle (runtime-components.py
+#                          can stage/verify it into a checkout)
+#   windows-runtime-tree   app/Madeira/aarch64-windows + arm64ec-windows as
+#                          built, ready to commit into this repository
+#   fex-windows-module     the FEX Windows module renamed to libarm64ecfex.dll,
+#                          the exact file fh6-fex-ios/bin/ ships
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-runtime-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  plan:
+    runs-on: xcode-27
+    outputs:
+      sdk: ${{ steps.sdk.outputs.key }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: sdk
+        run: bash tools/build/ci-input-key.sh
+
+  llvm:
+    needs: plan
+    runs-on: xcode-27
+    env:
+      MADEIRA_PLANNED_SDK: ${{ needs.plan.outputs.sdk }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: sdk
+        run: bash tools/build/ci-input-key.sh
+      - id: cache
+        uses: actions/cache@v4
+        with:
+          # Same key as build.yml's llvm job so the shared cache hits.
+          key: plan19-${{ runner.os }}-${{ runner.arch }}-${{ steps.sdk.outputs.key }}-llvm-ios-15.0.7-${{ hashFiles('tools/build/build-llvm-ios.sh') }}
+          path: |
+            toolchains/llvm-ios-build/.madeira-cache.sha256
+            toolchains/llvm-ios-build/lib/*.a
+            toolchains/llvm-ios-build/include
+            toolchains/llvm-project/llvm/include
+      - name: Build LLVM for iOS
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          brew install ninja || true
+          tools/build/build-llvm-ios.sh
+      - name: Retain LLVM outputs for this run
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-llvm-${{ steps.sdk.outputs.key }}
+          path: |
+            toolchains/llvm-ios-build/.madeira-cache.sha256
+            toolchains/llvm-ios-build/lib/*.a
+            toolchains/llvm-ios-build/include
+            toolchains/llvm-project/llvm/include
+          include-hidden-files: true
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 7
+
+  windows:
+    needs: [plan, llvm]
+    runs-on: xcode-27
+    timeout-minutes: 360
+    env:
+      MADEIRA_PLANNED_SDK: ${{ needs.plan.outputs.sdk }}
+      MADEIRA_RUNTIME_SDK: ${{ needs.plan.outputs.sdk }}
+      MADEIRA_RUNTIME_REUSE: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - id: sdk
+        run: bash tools/build/ci-input-key.sh
+      - id: key
+        run: python3 tools/build/runtime-components.py key windows >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          key: ${{ steps.key.outputs.key }}
+          path: .runtime-cache/windows
+      - uses: actions/cache@v4
+        with:
+          key: mingw-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/build/setup-llvm-mingw.sh') }}
+          path: toolchains/llvm-mingw-*
+      - uses: actions/download-artifact@v4
+        with:
+          name: native-llvm-${{ needs.plan.outputs.sdk }}
+          path: toolchains
+      - name: Build the windows runtime component
+        run: python3 tools/build/runtime-components.py build windows
+      - name: Retain the staging bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-windows
+          path: .runtime-cache
+          include-hidden-files: true
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 7
+      - name: Retain the built runtime tree
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-runtime-tree
+          path: |
+            app/Madeira/aarch64-windows
+            app/Madeira/arm64ec-windows
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 7
+      - name: Retain the FEX Windows module
+        run: |
+          mkdir -p fex-module
+          cp app/Madeira/arm64ec-windows/xtajit64.dll fex-module/libarm64ecfex.dll
+          shasum -a 256 fex-module/libarm64ecfex.dll | tee fex-module/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fex-windows-module
+          path: fex-module
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 7
