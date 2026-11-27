@@ -330,7 +330,9 @@ enum StikJITHelper {
         // test whether prepare blesses self-mapped pages. Once per app run.
         if !fpProbed, MadeiraConfig.flag("MADEIRA_FP_PROBE", fallback: false) {
             fpProbed = true
-            jit_footprint_probe()
+            // bless travels as a parameter: cfg env.* exports never reach this
+            // process's environ at pool time, so the C side cannot getenv it.
+            jit_footprint_probe(MadeiraConfig.flag("MADEIRA_FP_PROBE_BLESS", fallback: false) ? 1 : 0)
         }
         var poolSize = requestedPoolSize      // ml1036: may shrink to fit, see the hole census below
         poolFailure = nil
@@ -785,7 +787,7 @@ enum StikJITHelper {
         var rxPtrOpt: UnsafeMutableRawPointer? = nil
         var requestUnanswered = false
         for attempt in 0..<3 {
-            guard let p = jit26_prepare_region(nil, poolSize), p != UnsafeMutableRawPointer(bitPattern: 0) else {
+            guard let p = requestPoolRegion(poolSize), p != UnsafeMutableRawPointer(bitPattern: 0) else {
                 LogStore.shared.log("Debugger failed to allocate RX memory (attempt \(attempt))", level: .error)
                 requestUnanswered = true
                 break
@@ -845,7 +847,7 @@ enum StikJITHelper {
                         rxPtrOpt = nil
                     }
                     var replaced = false
-                    if let q = jit26_prepare_region(nil, pairSingle), q != UnsafeMutableRawPointer(bitPattern: 0) {
+                    if let q = requestPoolRegion(pairSingle), q != UnsafeMutableRawPointer(bitPattern: 0) {
                         let qa = Int(bitPattern: q)
                         let qGuest = qa + pairSingle > guestLo && qa < guestHi
                         if qa >= goodLow && !qGuest && !overlapsExeWindow(vm_address_t(qa), vm_address_t(pairSingle)) {
@@ -1404,6 +1406,34 @@ enum StikJITHelper {
     /// main thread's stack) gets PROT_NONE placeholders in its free gaps, so
     /// nothing else lands inside the pool's span. Returns nil, holding nothing,
     /// when no run qualifies or the region landed anywhere else.
+    /// ml458 round 2: request a prepared pool region of `size` bytes.
+    ///
+    /// Preferred path: the RX pages are allocated HERE from a
+    /// MAP_MEM_LEDGER_TAGGED named entry marked NO_FOOTPRINT — the fp-probe's
+    /// "named/tagged nofoot" recipe, the only one that moved phys_footprint on
+    /// device (−16 MB per 16 MB, 2026-11-26) — and the debugger only prepares
+    /// them (bless half proved self-mapped pages arm for execution). The old
+    /// path (the debugger allocating _M pages) can NEVER be exempted: its
+    /// objects are internal and unowned, so every entry over them is rejected
+    /// kr=4 — the whole ml358/ml458 ladder died on that.
+    ///
+    /// Any failure falls back to the old debugger allocation unchanged: the
+    /// pool must exist even if the exemption cannot.
+    private static func requestPoolRegion(_ size: Int) -> UnsafeMutableRawPointer? {
+        if MadeiraConfig.flag("pool-nofoot", fallback: true) {
+            if let rx = jit_pool_alloc_rx_named(size) {
+                let prepared = jit26_prepare_region(rx, size)
+                if prepared != UnsafeMutableRawPointer(bitPattern: 0) {
+                    return prepared
+                }
+                vm_deallocate(mach_task_self_, vm_address_t(bitPattern: rx), vm_size_t(size))
+                LogStore.shared.log("[pool-named] prepare on the self-mapped pool was not answered — "
+                    + "falling back to the debugger allocator", level: .error)
+            }
+        }
+        return jit26_prepare_region(nil, size)
+    }
+
     private static func takeSecondRegion(above aEnd: vm_address_t, want: Int, pageFit: Bool,
                                          exeWindow: (base: vm_address_t, size: vm_address_t))
         -> (base: vm_address_t, size: vm_address_t)? {
@@ -1433,7 +1463,7 @@ enum StikJITHelper {
                 if a == h.base { plugs.append((a, vm_size_t(h.size))) } else { vm_deallocate(mach_task_self_, a, vm_size_t(h.size)) }
             }
         }
-        let got = jit26_prepare_region(nil, Int(size))
+        let got = requestPoolRegion(Int(size))
         for (a, sz) in plugs { vm_deallocate(mach_task_self_, a, sz) }
         guard let p = got, p != UnsafeMutableRawPointer(bitPattern: 0) else {
             LogStore.shared.log("[pool-split] the debugger did not allocate the second region (\(size >> 20)MB) — the pool "
@@ -1465,7 +1495,7 @@ enum StikJITHelper {
                         if a == h.base { mplugs.append((a, vm_size_t(h.size))) } else { vm_deallocate(mach_task_self_, a, vm_size_t(h.size)) }
                     }
                 }
-                let mgot = jit26_prepare_region(nil, Int(msize))
+                let mgot = requestPoolRegion(Int(msize))
                 for (a, sz) in mplugs { vm_deallocate(mach_task_self_, a, sz) }
                 if let mp = mgot, mp != UnsafeMutableRawPointer(bitPattern: 0) {
                     let m = vm_address_t(bitPattern: mp)
@@ -1560,7 +1590,7 @@ enum StikJITHelper {
                 if a == h.base { plugs.append((a, vm_size_t(h.size))) } else { vm_deallocate(mach_task_self_, a, vm_size_t(h.size)) }
             }
         }
-        let got = jit26_prepare_region(nil, Int(size))
+        let got = requestPoolRegion(Int(size))
         for (a, sz) in plugs { vm_deallocate(mach_task_self_, a, sz) }
         guard let p = got, p != UnsafeMutableRawPointer(bitPattern: 0) else {
             LogStore.shared.log("[pool-low] the debugger did not allocate region C (\(size >> 20)MB) -- code buffers stay "

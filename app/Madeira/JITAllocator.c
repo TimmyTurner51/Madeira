@@ -114,7 +114,13 @@ JITRegion *jit_region_create(size_t size) {
     //    - RW view for writing generated code
     //    - RX view for executing generated code
 
-    // Step 1: Create a named memory entry
+    // Step 1: Create a named memory entry.
+    // ml2030: MAP_MEM_LEDGER_TAGGED is the difference between the probe's
+    // kr=4 ("named/create") and a working NO_FOOTPRINT exemption
+    // ("named/tagged nofoot": ownership kr=0 and phys_footprint dropped the
+    // full 16 MB). An untagged named entry is not "fully owned", so
+    // mach_memory_entry_ownership rejects it with KERN_INVALID_ARGUMENT and
+    // every byte of this memory has counted against the Jetsam limit.
     memory_object_size_t entry_size = (memory_object_size_t)size;
     mach_port_t mem_entry = MACH_PORT_NULL;
 
@@ -122,7 +128,7 @@ JITRegion *jit_region_create(size_t size) {
         task,
         &entry_size,
         0,  // offset
-        MAP_MEM_NAMED_CREATE | VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE,
+        MAP_MEM_NAMED_CREATE | MAP_MEM_LEDGER_TAGGED | VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE,
         &mem_entry,
         MACH_PORT_NULL  // parent entry
     );
@@ -212,6 +218,69 @@ JITRegion *jit_region_create(size_t size) {
     jit_log("Dual-mapped JIT region created: size=%zu, RW=%p, RX=%p", size, region->rw_ptr, region->rx_ptr);
 
     return region;
+}
+
+/* ml458 round 2: allocate the pool's RX side FROM a MAP_MEM_LEDGER_TAGGED
+ * named entry and exempt it at birth — the probe's "named/tagged nofoot"
+ * recipe, which dropped the full 16 MB of mapped test pages from
+ * phys_footprint on device (2026-11-26 21:28). This replaces the debugger's
+ * _M allocation (jit26_prepare_region(nil, size)): those pages are internal
+ * and unowned, so NO entry over them can ever be made no-footprint (the whole
+ * ml358/ml458 ladder died on that). The caller still runs
+ * jit26_prepare_region over the returned range to arm execution — the bless
+ * half proved the debugger accepts self-mapped pages — and the existing
+ * vm_remap RW alias keeps aliasing the same exempt object.
+ *
+ * Returns the RX base or NULL; the caller falls back to the debugger path.
+ * Every failure is logged with its kr because this is private API on a beta
+ * OS and the log is the only record of which step lost. */
+void *jit_pool_alloc_rx_named(size_t size) {
+    mach_port_t task = mach_task_self();
+    kern_return_t kr;
+
+    uint64_t fp_before = 0, fp_after = 0;
+    task_vm_info_data_t vmi;
+    mach_msg_type_number_t vmi_cnt = TASK_VM_INFO_COUNT;
+    if (task_info(task, TASK_VM_INFO, (task_info_t)&vmi, &vmi_cnt) == KERN_SUCCESS) {
+        fp_before = vmi.phys_footprint;
+    }
+
+    memory_object_size_t entry_size = (memory_object_size_t)size;
+    mach_port_t mem_entry = MACH_PORT_NULL;
+    kr = mach_make_memory_entry_64(task, &entry_size, 0,
+        MAP_MEM_NAMED_CREATE | MAP_MEM_LEDGER_TAGGED | VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE,
+        &mem_entry, MACH_PORT_NULL);
+    if (kr != KERN_SUCCESS) {
+        jit_log("[pool-named] mach_make_memory_entry_64 failed: %s (kr=%d)", mach_error_string(kr), kr);
+        return NULL;
+    }
+
+    /* Exempt before anything is mapped: no page of the pool is ever billed. */
+    kr = mach_memory_entry_ownership(mem_entry, TASK_NULL,
+                                     VM_LEDGER_TAG_DEFAULT, VM_LEDGER_FLAG_NO_FOOTPRINT);
+    if (kr != KERN_SUCCESS) {
+        jit_log("[pool-named] ownership(NO_FOOTPRINT) failed: %s (kr=%d) — pool stays billed",
+                mach_error_string(kr), kr);
+    }
+
+    mach_vm_address_t rx_addr = 0;
+    kr = vm_map(task, (vm_address_t *)&rx_addr, size, 0, VM_FLAGS_ANYWHERE, mem_entry, 0, FALSE,
+                VM_PROT_READ | VM_PROT_EXECUTE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE,
+                VM_INHERIT_DEFAULT);
+    mach_port_deallocate(task, mem_entry);
+    if (kr != KERN_SUCCESS) {
+        jit_log("[pool-named] vm_map(RX) failed: %s (kr=%d)", mach_error_string(kr), kr);
+        return NULL;
+    }
+
+    if (task_info(task, TASK_VM_INFO, (task_info_t)&vmi, &vmi_cnt) == KERN_SUCCESS) {
+        fp_after = vmi.phys_footprint;
+    }
+    jit_log("[pool-named] %zuMB tagged entry RX=%p fp %llu -> %llu MB (delta %lld MB)",
+            size >> 20, (void *)rx_addr,
+            (unsigned long long)(fp_before >> 20), (unsigned long long)(fp_after >> 20),
+            (long long)(((int64_t)fp_after - (int64_t)fp_before) >> 20));
+    return (void *)rx_addr;
 }
 
 // ml358: make an ALREADY-MAPPED region jetsam-exempt.
@@ -386,7 +455,7 @@ static void fp_probe_try(const char *name, mach_port_t entry, void *mapped,
             name, kr, kr == KERN_SUCCESS ? "OK" : mach_error_string(kr),
             tag, flags, own_self ? "self" : "TASK_NULL",
             (unsigned long long)(before >> 20), (unsigned long long)(after >> 20),
-            (long long)((after - before) >> 20),
+            (long long)(((int64_t)after - (int64_t)before) >> 20),
             unexpected ? "  [UNEXPECTED]" : "");
 }
 
@@ -444,8 +513,18 @@ static void fp_probe_bless(void) {
     static const uint32_t code[] = { 0xD2800540 /* mov x0, #42 */, 0xD65F03C0 /* ret */ };
     void *rx = jit_region_write(region, 0, code, sizeof(code));
     if (!rx) { jit_log("[fp-probe] bless/named-rwx: write FAILED"); jit_region_destroy(region); return; }
+    /* ml2030 round 2: the first bless run fetched SOMETHING that returned 0
+     * (want 42) without faulting. Read the words back through both views so
+     * the next log says what was actually fetched: aliased code, a debugger
+     * template stamped at prepare, or a stale I-cache line. */
+    jit_log("[fp-probe] bless/named-rwx: after write   rx=[%08x %08x] rw=[%08x %08x]",
+            ((volatile uint32_t *)region->rx_ptr)[0], ((volatile uint32_t *)region->rx_ptr)[1],
+            ((volatile uint32_t *)region->rw_ptr)[0], ((volatile uint32_t *)region->rw_ptr)[1]);
     void *prepared = jit26_prepare_region(region->rx_ptr, region->size);
     jit_log("[fp-probe] bless/named-rwx: prepare returned %p (RX=%p)", prepared, region->rx_ptr);
+    jit_log("[fp-probe] bless/named-rwx: after prepare rx=[%08x %08x] rw=[%08x %08x]",
+            ((volatile uint32_t *)region->rx_ptr)[0], ((volatile uint32_t *)region->rx_ptr)[1],
+            ((volatile uint32_t *)region->rw_ptr)[0], ((volatile uint32_t *)region->rw_ptr)[1]);
 
     /* The only proof of execution is executing. Guard the fetch: a TXM
      * rejection faults (or, worst case, does not signal at all -- hence the
@@ -466,7 +545,25 @@ static void fp_probe_bless(void) {
             (long long)ctx->result, ctx->done ? "" : " [WATCHDOG]");
     if (ctx->done) {
         pthread_join(ctx->th, NULL);
-        jit_region_destroy(region);
+        /* Phase 2: write AFTER prepare — production's shape. The pool is armed
+         * once at session start and code is written into it afterwards; if
+         * prepare stamps a template at offset 0, this overwrite removes it and
+         * the honest expectation is the full 42. */
+        rx = jit_region_write(region, 0, code, sizeof(code));
+        memset((void *)ctx, 0, sizeof(*ctx));
+        ctx->rx = rx;
+        ctx->result = -5;
+        pthread_create(&ctx->th, NULL, fp_bless_thread, ctx);
+        for (int i = 0; i < 200 && !ctx->done; i++) usleep(10 * 1000);
+        jit_log("[fp-probe] bless/named-rwx: execute-after-write -> %lld%s (want 42; -4 faulted, -5 no report in 2 s)",
+                (long long)ctx->result, ctx->done ? "" : " [WATCHDOG]");
+        if (ctx->done) {
+            pthread_join(ctx->th, NULL);
+            jit_region_destroy(region);
+        } else {
+            pthread_detach(ctx->th);
+            jit_log("[fp-probe] bless/named-rwx: phase-2 thread abandoned; region and fault containment stay");
+        }
     } else {
         /* Stuck inside the fetch. Detach, keep the region mapped and the
          * handler installed: the thread may fault again at any time and must
@@ -476,7 +573,7 @@ static void fp_probe_bless(void) {
     }
 }
 
-void jit_footprint_probe(void) {
+void jit_footprint_probe(int bless) {
     jit_log("[fp-probe] ml2030 BEGIN  fp=%llu MB", (unsigned long long)(fp_probe_footprint() >> 20));
 
     /* 1-2: jit_region_create's recipe as-is, and with the kernel-correct tag. */
@@ -600,9 +697,12 @@ void jit_footprint_probe(void) {
         if (fd >= 0) close(fd);
     }
 
-    /* env.MADEIRA_FP_PROBE_BLESS = 1: run the bless half LAST -- does prepare
-     * bless SELF-mapped pages for execution? Watchdogged; see fp_probe_bless. */
-    if (getenv("MADEIRA_FP_PROBE_BLESS") && getenv("MADEIRA_FP_PROBE_BLESS")[0] == '1') fp_probe_bless();
+    /* bless: run the bless half LAST -- does prepare
+     * bless SELF-mapped pages for execution? Watchdogged; see fp_probe_bless.
+     * The flag comes from Swift (MadeiraConfig), not getenv: cfg env.* exports
+     * do not reach this process's environ at allocatePool() time (the ml2030
+     * first run showed the getenv gate silently skipping). */
+    if (bless) fp_probe_bless();
 
     jit_log("[fp-probe] ml2030 END  fp=%llu MB", (unsigned long long)(fp_probe_footprint() >> 20));
 }

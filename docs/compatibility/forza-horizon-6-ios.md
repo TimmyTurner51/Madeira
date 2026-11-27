@@ -3027,3 +3027,77 @@ the bless half) executes, the pool is rebuilt from that recipe and `tex-drop-mip
 donor-exit mechanism remains (extension-owned pool, exit, billed to nobody) and
 the headroom must come from elsewhere — the ~1.5 GB of guest memory still
 billed anonymously (§9.17's census) is the next lever.
+
+**The verdict (2026-11-26 21:01 run, iPhone 17 Pro).** The ladder ran at
+`allocatePool` time (`[fp-probe] ml2030`, `madeira-log.txt`) and three recipes
+dropped the full 16 MB, exactly as the xnu reading predicted:
+
+| recipe | ownership kr | fp delta |
+| --- | --- | --- |
+| `named/create tag0` (`jit_region_create`'s old recipe, tag 0) | 4 EINVAL | 0 |
+| `named/create tag1` (same, tag 1) | 4 EINVAL | 0 |
+| **`named/tagged nofoot`** (`MAP_MEM_LEDGER_TAGGED` at creation, then `ownership(TASK_NULL, 1, NO_FOOTPRINT)`) | **0** | **−16 MB** |
+| **`named/tagged owner->nofp`** (own first, then no-footprint) | **0** | **−16 MB** |
+| **`named/purgeable nofoot`** (`MAP_MEM_PURGABLE`) | **0** | **−16 MB** |
+| `anon/plain-entry nofoot` | 4 EINVAL | 0 |
+| `anon/share-entry nofoot` | 4 EINVAL | 0 |
+| `filebacked nofoot` | 0 | 0 (already un-billed: external) |
+
+So the shape of the fix is settled: **create the pool's entry with
+`MAP_MEM_NAMED_CREATE | MAP_MEM_LEDGER_TAGGED` and apply
+`mach_memory_entry_ownership(entry, TASK_NULL, VM_LEDGER_TAG_DEFAULT=1,
+VM_LEDGER_FLAG_NO_FOOTPRINT)`** — the tagged-at-creation entry is fully owned,
+the call is accepted, and the pages leave `phys_footprint`. `jit_region_create`
+now carries the flag (its own `mach_memory_entry_ownership` call was the
+"named/create" loser all along and only ever logged "non-fatal" failure), and
+the production pool follows once the bless half clears.
+
+The bless half did not run in this session: the gate was `getenv()` on a cfg
+`env.*` export that never reaches the app's environ at pool time. It now
+travels as a parameter from `MadeiraConfig`, so the next run answers whether
+the debugger's `jit26_prepare_region` will arm EXECUTION on self-mapped tagged
+pages — the one remaining question before the 880 MB pool can move to this
+recipe.
+
+**Round 2 (2026-11-26 21:36 run) — the recipe is proven end to end.** The
+bless half ran with word-level read-backs on both views:
+
+```
+after write   rx=[d2800540 d65f03c0] rw=[d2800540 d65f03c0]   (mov x0, #42; ret)
+after prepare rx=[d2800569 d65f03c0] rw=[d2800569 d65f03c0]   ← prepare PATCHED the word
+execute -> 0                                                  ← the patched instruction ran
+execute-after-write -> 42                                     ← write AFTER prepare runs exactly
+```
+
+Three facts, all favorable:
+
+1. **The dual views alias** — the RW write is visible in the RX view bit for
+   bit. The `0` of round 1 was never a fetch failure.
+2. **`jit26_prepare_region` authenticates content at arm time** (TXM): it
+   rewrote the first instruction word (`d2800540` → `d2800569`, a marker
+   patch), so code written *before* prepare does not survive verbatim — and
+   the round-1 `0` was simply the patched instruction leaving `x0` alone.
+   This is the same "prepare patches the page" contract the pool stamps work
+   around (dispatcher marker trampolines, §9.20).
+3. **Code written after prepare executes exactly** (`execute-after-write ->
+   42`) — which is production's own shape: the pool is armed once at session
+   start and written continuously afterwards. Self-mapped tagged pages are
+   therefore a full replacement for the debugger's `_M` pool.
+
+The pool itself now allocates through the recipe (`jit_pool_alloc_rx_named` +
+`requestPoolRegion`, cfg `pool-nofoot`, automatic fallback to the debugger
+allocator on any failure):
+
+```
+[pool-named] 560MB tagged entry RX=0x148000000 fp 18 -> 18 MB (delta 0)
+[pool-named] 320MB tagged entry RX=0x16b600000 fp 18 -> 18 MB (delta 0)
+[no-footprint] pool-RW-alias: [plain/TASK_NULL] ownership OK for 560 MB
+```
+
+`delta 0` at allocation is the honest reading: the mappings are fresh
+zero-fill reserves and `phys_footprint` counts *resident* pages — nothing is
+billed yet either way. The verdict that matters is world load, where the pool
+writes its ~848 MB: if the recipe holds, that 848 MB never appears in
+`phys_footprint`. Note also `pool-RW-alias: ownership OK` — the old ml458
+ladder that returned `kr=4` on the debugger's object now succeeds on the
+tagged entry's alias, a second, independent exemption over the same pages.

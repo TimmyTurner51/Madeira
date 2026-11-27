@@ -35,7 +35,8 @@ bool jit_make_region_no_footprint(void *addr, size_t size, const char *label);
 /// debugger is live (the top of allocatePool): MADEIRA_FP_PROBE_BLESS = 1 also
 /// tests whether prepare blesses SELF-mapped pages for execution, on a watchdog
 /// thread. See the ml2030 comment in JITAllocator.c for the kernel model.
-void jit_footprint_probe(void);
+void jit_footprint_probe(int bless);
+void *jit_pool_alloc_rx_named(size_t size);
 
 // Get the RW (writable) pointer. Write generated code here.
 void *jit_region_rw_ptr(JITRegion *region);
