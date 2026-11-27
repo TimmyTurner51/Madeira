@@ -3101,3 +3101,81 @@ writes its ~848 MB: if the recipe holds, that 848 MB never appears in
 `phys_footprint`. Note also `pool-RW-alias: ownership OK` — the old ml458
 ladder that returned `kr=4` on the debugger's object now succeeds on the
 tagged entry's alias, a second, independent exemption over the same pages.
+
+### 9.22 `ml458` — world-load verdict: the pool is un-billed (~6.0 GB -> 2.3 GB), and the garage headroom it frees (2026-11-26)
+
+The verdict §9.21 deferred, measured on device with the tagged pool live and
+the game writing freely through it:
+
+* **World load: `phys_footprint` ~2342 MB active, peak 2377 MB**, against the
+  ~6000 MB baseline that ran the title at the jetsam ceiling. The ~3.5 GB
+  recovered is the pool's ~848 MB written pages plus the second region and the
+  swap-tier shrink (`ml1299` census: `jit-pool=0 MB` in the swap billing).
+* The RW-alias ladder now reports `ownership OK` on the tagged entry's alias
+  every run — the same call that returned `kr=4` on the debugger's `_M` object
+  (§9.21), confirming the recipe independently of the RX view.
+* The `pool-nofoot` fallback path is exercised on every run that allocates:
+  any failure logs and returns the debugger's allocator unchanged, so the
+  recipe is strictly better than the old pool when it holds and identical
+  when it does not.
+
+**Consequence:** `tex-drop-mip = 1` (and possibly `0`) is now affordable —
+§9.16 measured the garage mip floor at +536 MB for one mip, and the recovered
+headroom is an order of magnitude larger. Garage visual verification is queued
+for the next run.
+
+### 9.23 `ml459` — the lost-wake stall: the waited word moves under parked waiters (2026-11-26)
+
+The stall dumps (`/tmp/mlog9.txt`) showed two convoys parking for 90 s+ while
+the alert ring kept advancing: six waiters on `0x705fb87580` while the word
+moved `0x17 -> 0x6`, and a growing crowd (4 -> 7 -> 9) on `0x70636d5898`
+around a live counter at 500. Both are the **register-after-check race**: the
+compared word changes before the waiter registers, the one wake fires at
+nobody, and no later transition exists to fire again.
+
+**Fix (`wine/dlls/ntdll/unix/sync.c`, alert-wait monitor):** park entry records
+the compared word (`w0_park`); the monitor nudges waiters whose word changed
+since park (age >= 15 s, so a wake already in flight is not raced) and every
+>= 120 s parker regardless (sentinel/unknown-predicate safety valve), capped
+16 per cycle. A delivered alert is always safe — `RtlWaitOnAddress` is a
+compare-loop API and every caller re-checks and re-parks after any return —
+so a nudged thread either proceeds on its lost wake or re-parks. A lost wake
+becomes a bounded hiccup instead of a permanent stall. Verification on device
+is queued: world load should complete with `[waiters] nudge` lines appearing
+where the convoys used to form.
+
+### 9.24 Where the frame time goes (2026-11-26 telemetry), and the instrumentation armed for the next run
+
+From `fh6-ml1319c.txt` (menu state, 60 FPS cap, frame 16.7 ms, GPU 6 ms):
+
+* **`ml1120 async per frame: worker busy 13.96 ms (9.0 jobs)`** — the D3D12
+  submission worker consumes 83 % of the frame wall; `Present` drain 0.00 ms
+  and `list Reset` waits only 1.15 ms, so the cost is the replay itself, not
+  waiting. `ml1119`: the caller thread pays 0.01 ms — everything is in the
+  worker.
+* **`ml1116`: 43 encoders/frame with 43.5 fence waits and 43.0 fence updates**
+  — almost every encoder syncs (42 of 43; the one shared-attachment skip is
+  the only elision firing). `ml1137` census: 49.5 barrier entries/frame
+  (51 into write/common/alias, 38 read->read, 29 UAV, 20.5 rt/depth->read,
+  3.5 copy->read), 30.5 barrier-caused syncs of which **28 "all"**; the
+  census's own state-aware rule would save only 2.5 (subset) and 0.0 (none),
+  so the barrier syncs are close to minimal *by the census's model* — the
+  lever is likely the per-encoder fence chain and the replay bookkeeping
+  around it, not the barrier classification.
+* `encode split`: Metal encode calls 0.3 ms, encoder open+end 0.75 ms,
+  `useResource` 79 (49 deduped) — the Metal submission is ~1 ms; "the rest
+  of ExecuteCommandLists is the replay itself". `draw-dedup`: 123 of 410
+  state sets elided per frame, 64 buffer binds as offsets.
+* `ml1109`: `GetCompletedValue` polls 32/frame; `cpu_blocked_in_retire` ~0.
+
+The four replay buckets named in the earlier 122 ms/frame reading are
+`RS_STATE` (the "rest is state" bucket), `RS_LISTEND`, `RS_FLUSH` (the
+per-list flush/encoder end) and `RS_TABLES` (argument-table building inside
+every draw/dispatch, `mad_air_build_tables_ex`). Which dominates in-world is
+exactly what the run did not capture. **Armed for the next run:** set
+`replay-split = 1` in `madeira.cfg` (zero-cost when off; `[perf] replay
+split per frame` every 5 s) and keep thread sampling on, so the split pins
+the bucket and the sample pins the ARM64 worker instructions inside it. Then
+fix against that split; the thermal finding (§9.18: per-frame CPU work is a
+heat budget — P-core share falls 61.8 % -> 0.7 % over 8 minutes) makes every
+saved CPU cycle a sustained-FPS win.
