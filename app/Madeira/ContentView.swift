@@ -2804,7 +2804,7 @@ struct ContentView: View {
 
         // Suppress os_log from wineserver — hundreds of messages/sec cause os_log buffer
         // contention that blocks the main thread RunLoop, triggering iOS hang detection
-        ws_log_quiet = 1
+        UnixHalf.setWineserverLogQuiet(1)
 
         DispatchQueue.global(qos: .userInitiated).async {
             // A library entry's launch profile (executable, arguments, x87
@@ -3237,7 +3237,8 @@ struct ContentView: View {
                 let val = raw ?? ""
                 if val == "1" {
                     let dir = Bundle.main.bundlePath + "/d3d12"
-                    let dylib = dir + "/libmetalirconverter.dylib"
+                    let dylib = UnixHalf.overrideDylibPath(named: "libmetalirconverter.dylib")
+                        ?? (dir + "/libmetalirconverter.dylib")
                     let haveDylib = FileManager.default.fileExists(atPath: dylib)
                     let transcript = d.appendingPathComponent("madeira-d3d12-canary.log").path
                     logStore.log("madeira-d3d12: running the M1 canary in-app (dylib present: \(haveDylib))", level: .info)
@@ -3519,7 +3520,7 @@ struct ContentView: View {
 
             // Step 5: Resume UI + os_log, give main thread time to recover before detach
             DispatchQueue.main.async {
-                ws_log_quiet = 0
+                UnixHalf.setWineserverLogQuiet(0)
                 logStore.uiPaused = false
             }
             Thread.sleep(forTimeInterval: 2.0)

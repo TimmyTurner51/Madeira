@@ -101,6 +101,62 @@ struct WCPComponent: Identifiable, Codable, Equatable {
         if let versionCode, versionCode > 0 { return "\(versionName) (\(versionCode))" }
         return versionName
     }
+
+    init(
+        id: String,
+        name: String,
+        kind: Kind,
+        type: String,
+        versionName: String,
+        versionCode: Int?,
+        detail: String,
+        enabled: Bool,
+        installedAt: Double,
+        sourceFile: String,
+        fileCount: Int,
+        layout: [LayoutItem],
+        environment: [String: String],
+        notes: [String]
+    ) {
+        self.id = id
+        self.name = name
+        self.kind = kind
+        self.type = type
+        self.versionName = versionName
+        self.versionCode = versionCode
+        self.detail = detail
+        self.enabled = enabled
+        self.installedAt = installedAt
+        self.sourceFile = sourceFile
+        self.fileCount = fileCount
+        self.layout = layout
+        self.environment = environment
+        self.notes = notes
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        name = try c.decode(String.self, forKey: .name)
+        kind = try c.decode(Kind.self, forKey: .kind)
+        type = try c.decode(String.self, forKey: .type)
+        versionName = try c.decode(String.self, forKey: .versionName)
+        versionCode = try c.decodeIfPresent(Int.self, forKey: .versionCode)
+        detail = try c.decodeIfPresent(String.self, forKey: .detail) ?? ""
+        enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+        installedAt = try c.decodeIfPresent(Double.self, forKey: .installedAt) ?? 0
+        sourceFile = try c.decodeIfPresent(String.self, forKey: .sourceFile) ?? ""
+        fileCount = try c.decodeIfPresent(Int.self, forKey: .fileCount) ?? 0
+        layout = try c.decodeIfPresent([LayoutItem].self, forKey: .layout) ?? []
+        environment = try c.decodeIfPresent([String: String].self, forKey: .environment) ?? [:]
+        if let list = try? c.decode([String].self, forKey: .notes) {
+            notes = list
+        } else if let single = try? c.decode(String.self, forKey: .notes), !single.isEmpty {
+            notes = [single]
+        } else {
+            notes = []
+        }
+    }
 }
 
 // MARK: - Tar reading
@@ -657,12 +713,22 @@ final class WCPComponentsModel: ObservableObject {
     private init() { reload() }
 
     func reload() {
-        guard let data = try? Data(contentsOf: Self.stateFile),
-              let state = try? JSONDecoder().decode(State.self, from: data) else {
+        guard let data = try? Data(contentsOf: Self.stateFile) else {
             components = []
             return
         }
-        components = state.components.sorted { $0.installedAt > $1.installedAt }
+        do {
+            let state = try JSONDecoder().decode(State.self, from: data)
+            components = state.components.sorted { $0.installedAt > $1.installedAt }
+        } catch {
+            // Never silently wipe a corrupt state.json on the next save: preserve a backup
+            // and surface the decode error in the log.
+            let backup = Self.root.appendingPathComponent("state.corrupt.json")
+            try? FileManager.default.removeItem(at: backup)
+            try? data.write(to: backup, options: .atomic)
+            LogStore.shared.log("[wcp] state.json decode failed (backed up to state.corrupt.json): \(error.localizedDescription)")
+            components = []
+        }
     }
 
     private func save() {
@@ -1025,6 +1091,9 @@ final class WCPComponentsModel: ObservableObject {
             components.insert(component, at: 0)
         }
         save()
+        if component.kind == .native, component.enabled, !UnixHalf.componentLoaded {
+            UnixHalf.install()
+        }
         busy = false
         error = nil
         status = "Imported \(component.versionLine). It applies the next time a game starts."

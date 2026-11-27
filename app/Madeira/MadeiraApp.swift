@@ -1,8 +1,75 @@
 import Foundation
 import SwiftUI
+import UIKit
+
+/// App-wide interface orientation lock (`Auto`, `Landscape`, `Portrait`).
+/// Lets the user rotate or lock the game window from the in-game Session menu
+/// (or Settings) even when iOS Portrait Orientation Lock is enabled.
+@MainActor
+final class OrientationLock: ObservableObject {
+    enum Mode: String, CaseIterable, Identifiable {
+        case auto = "auto"
+        case landscape = "landscape"
+        case portrait = "portrait"
+
+        var id: String { rawValue }
+        var label: String {
+            switch self {
+            case .auto: return "Auto"
+            case .landscape: return "Landscape"
+            case .portrait: return "Portrait"
+            }
+        }
+        var mask: UIInterfaceOrientationMask {
+            switch self {
+            case .auto: return .allButUpsideDown
+            case .landscape: return .landscape
+            case .portrait: return .portrait
+            }
+        }
+    }
+
+    static let shared = OrientationLock()
+    private static let key = "madeira.orientationLock"
+
+    @Published var mode: Mode {
+        didSet {
+            UserDefaults.standard.set(mode.rawValue, forKey: Self.key)
+            apply()
+        }
+    }
+
+    private init() {
+        let saved = UserDefaults.standard.string(forKey: Self.key) ?? Mode.auto.rawValue
+        self.mode = Mode(rawValue: saved) ?? .auto
+    }
+
+    var mask: UIInterfaceOrientationMask { mode.mask }
+
+    func apply() {
+        let targetMask = mode.mask
+        for scene in UIApplication.shared.connectedScenes {
+            guard let windowScene = scene as? UIWindowScene else { continue }
+            for window in windowScene.windows {
+                window.rootViewController?.setNeedsUpdateOfSupportedInterfaceOrientations()
+            }
+            let prefs = UIWindowScene.GeometryPreferences.iOS(interfaceOrientations: targetMask)
+            windowScene.requestGeometryUpdate(prefs) { _ in }
+        }
+    }
+}
+
+final class MadeiraAppDelegate: NSObject, UIApplicationDelegate {
+    func application(_ application: UIApplication,
+                     supportedInterfaceOrientationsFor window: UIWindow?) -> UIInterfaceOrientationMask {
+        MainActor.assumeIsolated { OrientationLock.shared.mask }
+    }
+}
 
 @main
 struct MadeiraApp: App {
+    @UIApplicationDelegateAdaptor(MadeiraAppDelegate.self) private var appDelegate
+
     init() {
         // A component may ship the Wine unix half as a dylib. When one does, this loads it
         // and the bridge starts Wine from that half instead of the linked archive, so a
@@ -54,6 +121,9 @@ struct MadeiraApp: App {
                     WineGeckoModel.shared.installAutomatically()  // on Wi-Fi, so Wine never asks (WineGecko.swift)
                     AchievementWatcher.shared.start()             // unlock banners from Steam's stats files (SteamAchievements.swift)
                     ClaudeHelp.install()                          // the fixes guide beside madeira-log.txt (ClaudeHelp.swift)
+                    if OrientationLock.shared.mode != .auto {
+                        OrientationLock.shared.apply()
+                    }
                 }
                 // madeira://jit-network/... (the Madeira JIT shortcut returning, JITNetwork.swift),
                 // else a .wcp component package, else a shared game setup (a .madeirasetup file or

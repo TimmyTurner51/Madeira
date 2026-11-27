@@ -135,6 +135,7 @@ struct SettingsPageView: View {
     @State private var refresh = 0
     @ObservedObject private var input = InputSettings.shared
     @ObservedObject private var liquidMetal = LiquidMetalSetting.shared
+    @ObservedObject private var orientation = OrientationLock.shared
     @AppStorage(LibraryGridArm.key) private var zoomableGrid = false
     @AppStorage(GridZoomHapticPlayer.key) private var zoomHaptics = true
     @AppStorage(TouchControlStyle.key) private var controlStyle = "glass"
