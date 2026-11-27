@@ -89,5 +89,5 @@ cat > "$WORK/profile.json" <<EOF
 EOF
 
 DEST="$OUT/$VERSION-native.wcp"
-( cd "$WORK" && tar -cf - profile.json files ) | zstd -q -19 -o "$DEST"
+( cd "$WORK" && COPYFILE_DISABLE=1 tar --disable-copyfile -cf - profile.json files ) | zstd -q -f -19 -o "$DEST"
 printf '%s  (%s, %s, team %s)\n' "$DEST" "$BASE" "$(du -h "$DEST" | cut -f1)" "$TEAM"

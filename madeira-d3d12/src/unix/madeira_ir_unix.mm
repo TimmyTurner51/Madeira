@@ -84,7 +84,8 @@
     X(IRShaderReflectionCopyHullInfo) \
     X(IRShaderReflectionReleaseHullInfo) \
     X(IRShaderReflectionCopyDomainInfo) \
-    X(IRShaderReflectionReleaseDomainInfo)
+    X(IRShaderReflectionReleaseDomainInfo) \
+    X(IRCompilerSetDualSourceBlendingConfiguration)
 
 struct IRFns {
     void *handle;
@@ -121,6 +122,13 @@ static void ir_load_once(void) {
     @autoreleasepool {
         NSString *base = [[NSBundle mainBundle] bundlePath];
         NSString *p = [base stringByAppendingPathComponent:@"d3d12/libmetalirconverter.dylib"];
+        typedef int (*wcp_dylib_fn)(const char *, char *, int);
+        wcp_dylib_fn wcp_fn = (wcp_dylib_fn)dlsym(RTLD_DEFAULT, "madeira_wcp_dylib_path");
+        char wcp_buf[PATH_MAX];
+        if (wcp_fn && wcp_fn("libmetalirconverter.dylib", wcp_buf, (int)sizeof(wcp_buf))) {
+            p = [NSString stringWithUTF8String:wcp_buf];
+            fprintf(stderr, "[madeira-ir] using .wcp converter override: %s\n", wcp_buf);
+        }
         g_ir.handle = dlopen([p UTF8String], RTLD_NOW | RTLD_LOCAL);
         if (!g_ir.handle) {
             /* Also try a plain name: a development build may have it on the
@@ -1903,6 +1911,10 @@ extern "C" int madeira_ir_convert_impl(struct madeira_ir_convert_args *a) {
      * views every such texture as an array to match. The other flags:
      * mad_ir_compat_flags. */
     g_ir.IRCompilerSetCompatibilityFlags(compiler, (IRCompatibilityFlags)mad_ir_compat_flags());
+    if (a->ps_valid && (a->ps_flags & MADEIRA_IR_PS_DUAL_SOURCE_BLEND) &&
+        g_ir.IRCompilerSetDualSourceBlendingConfiguration) {
+        g_ir.IRCompilerSetDualSourceBlendingConfiguration(compiler, IRDualSourceBlendingConfigurationForceEnabled);
+    }
     a->ret_len2 = 0; a->ret_vs_output_size = 0; a->ret_gs_max_prims = 0; a->ret_gs_payload = 0; a->ret_gs_passthrough = 0;
     /* the tessellation reflection too: a conversion that does not fill it must not hand back the caller's bytes */
     a->ret_hs_patches_per_tg = a->ret_hs_threads_per_patch = a->ret_hs_input_cps = a->ret_hs_output_cps = 0;
@@ -1922,6 +1934,18 @@ extern "C" int madeira_ir_convert_impl(struct madeira_ir_convert_args *a) {
 
     output = g_ir.IRCompilerAllocCompileAndLink(compiler, (entry && entry[0]) ? entry : NULL,
                                                 input, &err);
+    if (!output && a->ps_valid && (a->ps_flags & MADEIRA_IR_PS_DUAL_SOURCE_BLEND) && err &&
+        g_ir.IRErrorGetCode(err) == IRErrorCodeShaderIncompatibleWithDualSourceBlending &&
+        g_ir.IRCompilerSetDualSourceBlendingConfiguration) {
+        static int said_ds_fallback;
+        if (said_ds_fallback++ < 8)
+            dprintf(2, "[madeira-ir] DXIL PS incompatible with dual-source blending; retrying with dual-source disabled\n");
+        g_ir.IRErrorDestroy(err);
+        err = NULL;
+        g_ir.IRCompilerSetDualSourceBlendingConfiguration(compiler, IRDualSourceBlendingConfigurationForceDisabled);
+        output = g_ir.IRCompilerAllocCompileAndLink(compiler, (entry && entry[0]) ? entry : NULL,
+                                                    input, &err);
+    }
     if (!output) {
         a->ret_error_code = err ? g_ir.IRErrorGetCode(err) : 0;
         status = MADEIRA_IR_COMPILE_FAILED;

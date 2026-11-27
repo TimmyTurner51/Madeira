@@ -79,10 +79,10 @@ for slot in ("g_device_vtbl.CreateReservedResource             = device_CreateRe
     check("vtable: " + slot.split("=")[0].strip(), slot in SRC)
 mk = cut("static HRESULT mad_create_reserved(struct mad_device *d, const D3D12_RESOURCE_DESC *desc, REFIID riid, void **out, const char *api) {")
 check("reserved resources: refused above the cap with E_OUTOFMEMORY, before anything is allocated",
-      mk.index("if (bytes > g_tiled_cap)") < mk.index("mad_create_resource(d, D3D12_HEAP_TYPE_DEFAULT, desc, riid, out)") and "return E_OUTOFMEMORY;" in mk)
+      mk.index("if (bytes > g_tiled_cap)") < mk.index("mad_create_resource_ex(d, D3D12_HEAP_TYPE_DEFAULT, desc, riid, out") and "return E_OUTOFMEMORY;" in mk)
 check("reserved resources: a NULL out is the documented capability test (S_FALSE)", "if (!out) return S_FALSE;" in mk)
 check("reserved resources: backed as a committed resource in a DEFAULT heap",
-      "hr = mad_create_resource(d, D3D12_HEAP_TYPE_DEFAULT, desc, riid, out);" in mk)
+      "hr = mad_create_resource_ex(d, D3D12_HEAP_TYPE_DEFAULT, desc, riid, out" in mk)
 check("reserved resources: marked as reserved (GetResourceTiling answers only for them)",
       "((struct mad_resource *)*out)->reserved_bytes = bytes;" in mk)
 gt = cut("static void STDMETHODCALLTYPE device_GetResourceTiling(ID3D12Device10 *This, ID3D12Resource *res, UINT *total,")
@@ -136,8 +136,12 @@ int main(void) {
     T(mad_tiling_compute(3, 4096, 4096, 1, 13, 8, 4, 1, &t));
     T(t.tw == 512 && t.th == 256 && t.nstd == 4 && t.npacked == 9 && t.packed_tiles == 1 && t.total == 171);
     T(t.mw[0] == 8 && t.mh[0] == 16 && t.mw[3] == 1 && t.mh[3] == 2);
-    /* a mip is standard only while it fills a whole tile in EVERY dimension: 2048x64 RGBA8 -> all packed */
-    T(mad_tiling_compute(3, 2048, 64, 1, 1, 4, 1, 1, &t) && t.nstd == 0 && t.npacked == 1 && t.packed_tiles == 8 && t.total == 8);
+    /* a mip in a chain is standard only while it fills a whole tile in EVERY dimension: 2048x64 RGBA8 (2 mips) -> all packed */
+    T(mad_tiling_compute(3, 2048, 64, 1, 2, 4, 1, 1, &t) && t.nstd == 0 && t.npacked == 2 && t.packed_tiles == 10 && t.total == 10);
+    /* single-mip reserved textures (MipLevels == 1) have no mip chain to pack -> standard 1+ tile(s), WidthInTiles >= 1 */
+    T(mad_tiling_compute(3, 32, 32, 1, 1, 8, 4, 1, &t) && t.nstd == 1 && t.npacked == 0 && t.mw[0] == 1 && t.mh[0] == 1 && t.total == 1);
+    T(mad_tiling_compute(3, 128, 128, 1, 1, 2, 1, 1, &t) && t.nstd == 1 && t.npacked == 0 && t.mw[0] == 1 && t.mh[0] == 1 && t.total == 1);
+    T(mad_tiling_compute(3, 2048, 64, 1, 1, 4, 1, 1, &t) && t.nstd == 1 && t.npacked == 0 && t.mw[0] == 16 && t.mh[0] == 1 && t.total == 16);
     /* small: 64x64 RGBA8, 7 mips, everything packed into one tile */
     T(mad_tiling_compute(3, 64, 64, 1, 7, 4, 1, 1, &t) && t.nstd == 0 && t.npacked == 7 && t.packed_tiles == 1 && t.total == 1);
     /* partial tiles round up: 1000x700 RGBA8 -> 8 x 6 */

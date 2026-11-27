@@ -174,6 +174,8 @@ static inline void mad_dxc_key(const struct madeira_ir_convert_args *a,
             mad_dxc_hu32(&s, e->per_instance ? 1u : 0u); mad_dxc_hu32(&s, e->step_rate);
         }
     }
+    if (a->ps_valid && (a->ps_flags & MADEIRA_IR_PS_DUAL_SOURCE_BLEND))
+        mad_dxc_hu32(&s, 0x44534231u);   /* DSB1: DXIL dual-source blend variant */
     *key = s.h1;
     *check = s.h2;
 }

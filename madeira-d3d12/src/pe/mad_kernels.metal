@@ -101,4 +101,35 @@ fragment mad_clear_depth_out mad_clear_fs_depth(constant float4 &v [[buffer(0)]]
     o.depth = v.x;
     return o;
 }
+
+// Present blit when the swapchain format (e.g. DXGI_FORMAT_R10G10B10A2_UNORM ->
+// MTLPixelFormatRGB10A2Unorm) is not a valid CAMetalLayer pixelFormat on iOS
+// and the drawable uses a compatible format (e.g. BGR10A2Unorm).
+struct mad_present_out {
+    float4 position [[position]];
+    float2 uv;
+};
+
+vertex mad_present_out mad_present_vs(ushort id [[vertex_id]])
+{
+    mad_present_out o;
+    float2 uv = float2((id << 1) & 2, id & 2);
+    o.position = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+    o.uv = uv;
+    return o;
+}
+
+fragment float4 mad_present_fs_arr(mad_present_out in [[stage_in]],
+                                   texture2d_array<float> src [[texture(0)]])
+{
+    constexpr sampler s(filter::nearest, address::clamp_to_edge);
+    return src.sample(s, in.uv, 0);
+}
+
+fragment float4 mad_present_fs_2d(mad_present_out in [[stage_in]],
+                                  texture2d<float> src [[texture(0)]])
+{
+    constexpr sampler s(filter::nearest, address::clamp_to_edge);
+    return src.sample(s, in.uv);
+}
 #endif

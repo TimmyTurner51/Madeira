@@ -41,7 +41,7 @@ cat > "$WORK/profile.json" <<EOF
 EOF
 
 DEST="$OUT/$VERSION-fex.wcp"
-( cd "$WORK" && tar -cf - profile.json files ) | zstd -q -19 -o "$DEST"
+( cd "$WORK" && COPYFILE_DISABLE=1 tar --disable-copyfile -cf - profile.json files ) | zstd -q -f -19 -o "$DEST"
 
 echo "dll  $(shasum -a 256 "$DLL" | cut -c1-64)"
 echo "wcp  $DEST ($(stat -f%z "$DEST") bytes)"

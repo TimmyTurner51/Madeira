@@ -76,6 +76,7 @@ else:
 #include <stdint.h>
 #include <stdarg.h>
 #include <pthread.h>
+#include <errno.h>
 #include <sys/mman.h>
 typedef uintptr_t UINT_PTR;
 typedef size_t SIZE_T;
@@ -122,9 +123,31 @@ static int ios_swap_punch_resv( char *lo, size_t len )
     return 1;
 }
 static void ios_swap_release_range( void *base, size_t size, int copy_back ) { n_swap_release++; }
+
+/* ml1313: the split's plain part now checks its remap. These stubs let the harness
+ * drive both outcomes: fail_mmap makes anon_mmap_fixed fail and ios_host_page_is_mapped
+ * say the page is gone, and ios_restore_committed_hole is the code under test's repair
+ * (it "succeeds" by clearing fail_mmap, exactly as a real zero map would). */
+static int fail_mmap, n_heal;
+static const char *last_hist_branch;
+static int ios_host_page_is_mapped( const void *p ) { (void)p; return !fail_mmap; }
+static int ios_restore_committed_hole( char *page )
+{
+    (void)page;
+    n_heal++;
+    if (!fail_mmap) return 0;
+    fail_mmap = 0;   /* the zero map put a mapping back */
+    return 1;
+}
+static void ios_dc_hist_note( char *base, size_t size, const char *branch, int e )
+{
+    (void)base; (void)size; (void)e;
+    last_hist_branch = branch;
+}
 static void *anon_mmap_fixed( void *start, size_t size, int prot, int flags )
 {
     n_mmap++;
+    if (fail_mmap) return MAP_FAILED;
     if (((uintptr_t)start | size) & host_page_mask) { printf( "mmap-over not on 16 KB pages: %p+%#zx\n", start, size ); exit( 2 ); }
     return mmap( start, size, prot, MAP_PRIVATE | MAP_ANON | MAP_FIXED | flags, -1, 0 );
 }
@@ -160,6 +183,8 @@ static void reset( void )
     swap_lo = swap_hi = NULL;
     n_punch = n_swap_release = n_mmap = n_logs = n_locks = n_retired = 0;
     range_cleared_first = 1;
+    fail_mmap = n_heal = 0;
+    last_hist_branch = NULL;
 }
 
 /* an alias at guest+g, size n, in its own ledgered pool slot at pool+p */
@@ -279,6 +304,27 @@ static void test_split( void )
         for (i = 0; i < 2100; i++) ios_decommit_alias_split( (char *)guest + 0x10000, PAGE, &verify, &vsize );
         if (n_logs != 27 + 2) { printf( "  %d lines\n", n_logs ); fail( "split: at most 32 lines, then every 1024th" ); }
     }
+
+    /* ml1313: the remap over a plain part can FAIL. The range would then be unmapped
+     * behind a live view (the 011 Settings crash), so the split must repair it and
+     * record what happened instead of ignoring the result. */
+    reset();
+    fail_mmap = 1;
+    verify = NULL;
+    ios_decommit_alias_split( (char *)guest + 0x10000, PAGE, &verify, &vsize );
+    if (n_mmap != 1) fail( "failed remap: the split tried the explicit remap" );
+    if (n_heal != 1) fail( "failed remap: the hole repair ran for the released range" );
+    if (last_hist_branch != NULL && strcmp( last_hist_branch, "decommit-mmap-over-FAILED" ))
+        fail( "failed remap: recorded as decommit-mmap-over-FAILED" );
+    if (!last_hist_branch) fail( "failed remap: recorded in the decommit history" );
+    if (!strstr( last_log, "hole avoided" ) && !strstr( last_log, "NOTHING" ))
+        fail( "failed remap: the log names what was put back" );
+
+    /* and with the mapping restored, the plain part is still zeroed from the edge fixups */
+    reset();
+    alias( 0x20000, PAGE, 0x0000 );
+    ios_decommit_alias_split( (char *)guest + 0x10000, PAGE, &verify, &vsize );
+    if (strcmp( last_hist_branch, "decommit-mmap-over" )) fail( "successful remap: recorded as decommit-mmap-over" );
 }
 
 static void test_release( void )
@@ -375,13 +421,37 @@ check("the old branches are unchanged: the [alias-tomb] refusal, the alias memse
       'if (ios_pool_live_overlap( rw_alias, size, &l_off, &l_peb ))' in decommit and
       'dc_branch = "alias-REFUSED(NOT zeroed)";' in decommit and
       'memset( (void *)rw_alias, 0, size );\n                dc_branch = "alias-memset";' in decommit and
-      'anon_mmap_fixed( host_start, host_end - host_start, PROT_READ | PROT_WRITE, 0 );\n'
-      '                dc_branch = "mmap-over";' in decommit and
+      'if (anon_mmap_fixed( host_start, host_end - host_start, PROT_READ | PROT_WRITE, 0 ) == MAP_FAILED)'
+      in decommit and
+      'dc_branch = "mmap-over";' in decommit and
       'dc_branch = "subpage-memset";' in decommit)
 check("split's plain part does what the plain branch does",
       'if (ios_swap_punch_resv( hs, he - hs )) n_hole++;' in split and
       'ios_swap_release_range( hs, he - hs, 0 );' in split and
-      'anon_mmap_fixed( hs, he - hs, PROT_READ | PROT_WRITE, 0 );' in split)
+      'anon_mmap_fixed( hs, he - hs, PROT_READ | PROT_WRITE, 0 ) == MAP_FAILED' in split)
+# ml1313: both mmap-over sites must CHECK the remap. Ignoring it left an unmapped range
+# behind a live, committed view; the guest's next touch was an AV it could not handle
+# (Settings died at 0x709a521000 one page into a released 0x709a520000+0x110000).
+check("both mmap-over sites check the remap and record it in the decommit history",
+      decommit.count('ios_restore_committed_hole(') == 1 and
+      split.count('ios_restore_committed_hole(') == 1 and
+      decommit.count('ios_dc_hist_note(') == 1 and
+      split.count('ios_dc_hist_note(') == 2 and
+      '"decommit-mmap-over-FAILED"' in decommit and
+      '"decommit-mmap-over-FAILED"' in split)
+hole = function(src, 'static int ios_restore_committed_hole( char *page )\n{')
+check("hole repair is limited to a committed page inside a wine view with no host mapping",
+      'if (!(get_host_page_vprot( page ) & VPROT_COMMITTED)) return 0;' in hole and
+      'if (ios_host_page_is_mapped( page )) return 0;' in hole and
+      'view = find_view( page, 1 );' in hole and
+      'if (!view) return 0;' in hole and
+      'anon_mmap_fixed( run, len, PROT_READ | PROT_WRITE, 0 ) == MAP_FAILED' in hole)
+fault = function(src, 'NTSTATUS virtual_handle_fault( EXCEPTION_RECORD *rec, void *stack )')
+check("the fault handler heals a committed hole last, and only for read/write faults",
+      'err != EXCEPTION_EXECUTE_FAULT' in fault and
+      '(vprot & VPROT_COMMITTED)' in fault and
+      'ios_restore_committed_hole( page )' in fault and
+      fault.index('ios_restore_committed_hole( page )') < fault.index('mutex_unlock( &virtual_mutex );'))
 check("it logs [alias-release] at most 32 times per kind, then every 1024th",
       'if (++n_calls <= 32 || (n_calls % 1024) == 0)' in split and
       'if (n_logged < 32 || (n_dropped % 1024) == 0)' in release)

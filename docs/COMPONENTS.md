@@ -35,10 +35,11 @@ next launch. A session already running keeps the files it started with.
 
 ## Supported packages
 
-| `profile.json` type | Treated as | Files linked |
+| `profile.json` type | Treated as | Files linked / loaded |
 |---|---|---|
-| contains `FEXCore` | FEX | `libarm64ecfex.dll` → `${sysarm64ec}/xtajit64.dll`, `libwow64fex.dll` → `${aarch64}/xtajit.dll` |
+| contains `FEXCore` | FEX | `libarm64ecfex.dll` → `${sysarm64ec}/xtajit64.dll` (also mirrored into `system32/` for non-colliding ARM64EC loads), `libwow64fex.dll` → `${aarch64}/xtajit.dll` |
 | contains `Builtin` | Wine builtins (PE override) | staged in the component, ahead of the bundle on `WINEDLLPATH` — see below |
+| contains `UnixHalf` or `Native` | Native Mach-O (`.dylib`) | `libntdll_unix.dylib` (bundles `ntdll_unix`, `win32u_unix`, and `wineserver` in one image, exporting `winios_drv_*` and `madeira_unix_half_wineserver_*`), plus optional loose dylib overrides (`libmadeira_ir_unix.dylib`, `libMoltenVK.dylib`, `libvulkan_kosmickrisp.dylib`, `libOSMesa.dylib`, `libmetalirconverter.dylib`) resolved through `madeira_wcp_dylib_path` |
 | contains `Wine` or `Proton` | Wine | `.dll`, `.drv` and `.cpl` files, by their architecture folder |
 | anything else with a `libarm64ecfex.dll` | FEX | as above |
 | anything else with DLLs | Wine | as above |
@@ -83,23 +84,24 @@ enabled builtin package contributes, so a replacement release needs no manual re
 previous one. A DLL outside `arm64ec-windows`, `aarch64-windows` or `i386-windows` is refused:
 landing a module in an architecture it was not built for is worse than not installing it.
 
-## What a package cannot replace
+## What a package can and cannot replace
 
-A package can replace a PE file in the prefix, a builtin on `WINEDLLPATH`, or the
-unix half (a native `.dylib` loaded by `UnixHalf.swift`). It cannot replace an
-archive the app has already linked. `tools/build/package-ipa.sh` requires these
-as build inputs:
+A package can replace:
+
+- **FEX** (`FEXCore` `.wcp`): `libarm64ecfex.dll` (`xtajit64.dll`) and `libwow64fex.dll` (`xtajit.dll`). Because FEXCore is statically linked into the PE `libarm64ecfex.dll` binary itself, a FEX `.wcp` replaces FEXCore completely without rebuilding the app.
+- **Wine PE builtins** (`Wine-Builtin` `.wcp`): `ntdll.dll` and any other builtin resolved from `WINEDLLPATH`.
+- **Wine / D3D12 / Win32 PE DLLs** (`Wine` `.wcp`): `kernel32.dll`, `comctl32.dll`, `d3d12.dll`, `d3d12core.dll`, `madeira_d3d12.dll`, and any other prefix DLL under `arm64ec-windows`, `aarch64-windows`, `i386-windows`, or `system32`.
+- **Wine unix half, wineserver & loose native dylibs** (`UnixHalf` `.wcp`): `libntdll_unix.dylib` (which bundles `ntdll_unix`, `win32u_unix`, and `wineserver` into one image so `madsync`, `madeira_sync_cells`, and direct server calls never split-brain; loaded by `UnixHalf.swift`), `libmadeira_ir_unix.dylib` (`madeira-d3d12`'s DXIL/SM5 shader converter, built via `build/dxmt-ios/build-ir-dylib.sh` and resolved on first shader compile by `winemetal_unix.c`), as well as `libMoltenVK.dylib`, `libvulkan_kosmickrisp.dylib`, `libOSMesa.dylib`, and `libmetalirconverter.dylib` (resolved from enabled native components via `madeira_wcp_dylib_path` before falling back to the app bundle). Note that Mach-O dylibs loaded at runtime on iOS must be signed with the same Apple Development team as the installed app.
+
+A package **cannot** replace the remaining static archives already linked into the `Madeira` app binary itself (`tools/build/package-ipa.sh` build inputs):
 
 | Archive | What it is |
 |---|---|
-| `app/Madeira/libdxmt_combined.a` | DXMT, linked into the app |
-| `app/Madeira/libntdll_unix.a` | fallback unix half, used when no native package is enabled |
-| `app/Madeira/libwineserver.a`, `libwin32u_unix.a`, `libmadeira_rppairing.a` | linked into the app |
-| `FEX/build-ios/.../libFEXCore.a` and the other FEX archives | linked into the FEX module at build time |
+| `app/Madeira/libdxmt_combined.a` | DXMT core (`winemetal_unix`, D3D9/D3D10/D3D11 Metal backend, static LLVM; tightly coupled to hidden `ntdll_unix` counters such as `ios_wow_base()`). Note: `madeira_ir_unix` (D3D12 shader conversion) **is** overridable via `libmadeira_ir_unix.dylib` |
+| `app/Madeira/libmadeira_rppairing.a` | Remote Pairing helper, statically linked into the app |
+| `app/Madeira/libntdll_unix.a`, `libwin32u_unix.a`, `libwineserver.a` | fallback unix half + wineserver when no `UnixHalf` `.wcp` is enabled (overridden at runtime once a `UnixHalf` `.wcp` is enabled) |
 
-`madeira_d3d12.dll` and `d3d12.dll` are PE files under `arm64ec-windows`, so a
-Wine package can link over them. Replacing DXMT or the FEX core archives still
-requires an app rebuild.
+Replacing DXMT's core (`winemetal_unix` / D3D9–D3D11) or Swift/ObjC app shell code still requires an app rebuild.
 
 ## Environment variables
 
@@ -144,6 +146,15 @@ tools/wcp/make-fex-wcp.sh MyFEX-1.0 path/to/libarm64ecfex.dll
 `tools/wcp/make-fex-wcp.sh` writes a `FEXCore` profile and a
 `libarm64ecfex.dll` payload, which is all Madeira needs. The module is the same
 file the build script installs as `xtajit64.dll`.
+
+To package D3D12 PE (`d3d12.dll` + `d3d12core.dll`) and the DXIL/Metal IR
+converter (`libmadeira_ir_unix.dylib`) as independently selectable packages:
+
+```sh
+tools/wcp/make-d3d12-wcp.sh Madeira-D3D12-v1
+# -> dist/Madeira-D3D12-v1-pe.wcp
+# -> dist/Madeira-D3D12-v1-dxil-native.wcp
+```
 
 ## Limits and safety
 

@@ -88,7 +88,7 @@ EOF
 DEST="$OUT/$VERSION-fex.wcp"
 # -f: a rebuilt package must replace the previous one, or the script silently ships
 # yesterday's module under today's name.
-( cd "$WORK" && tar -cf - profile.json files ) | zstd -q -f -19 -o "$DEST"
+( cd "$WORK" && COPYFILE_DISABLE=1 tar --disable-copyfile -cf - profile.json files ) | zstd -q -f -19 -o "$DEST"
 printf '%s  (%s)\n' "$DEST" "$(du -h "$DEST" | cut -f1)"
 python3 - "$DEST" <<'PY'
 import json, subprocess, sys, tarfile, tempfile, os

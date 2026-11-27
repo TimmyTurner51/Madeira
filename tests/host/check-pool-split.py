@@ -95,17 +95,18 @@ assert 'ios_pool_freelist[ios_pool_free_count].off = poff[k];' in bump
 warmer = function(native, 'static void *ios_pool_warmer_thread(')
 assert warmer.count('if (IOS_POOL_IN_HOLE(o)) continue;') == 4, 'all four warmer loops skip the hole'
 
-tail = native[native.index('size_t reserve_offset, tail_added, tail_skipped = 0;'):][:16000]
+tail = native[native.index('size_t reserve_offset = 0, tail_added = 0, tail_skipped = 0;'):][:24000]
 assert 'ios_pool_holes_tail_start( ios_jit_pool_size_global, cur, alloc_size,' in tail
-# two rollbacks of a refused tail, plus the tail-carve exec check's refusal (MADEIRA_TAIL_CARVE_EXEC_CHECK=0 skips it)
-assert tail.count('ios_pool_tail_unreserve( &ios_jit_tail_reserved, reserve_offset + alloc_size, tail_added,') == 3
+# ml296b checks the two refusal bounds before CAS-committing ios_jit_tail_reserved;
+# the tail-carve exec check's refusal (MADEIRA_TAIL_CARVE_EXEC_CHECK=0 skips it) rolls back via unreserve
+assert tail.count('ios_pool_tail_unreserve( &ios_jit_tail_reserved, reserve_offset + alloc_size, tail_added,') == 1
 carve_check = tail[tail.index('if (carve_check &&'):][:1800]
 assert 'ios_pool_tail_unreserve( &ios_jit_tail_reserved, reserve_offset + alloc_size, tail_added,' in carve_check \
     and 'return STATUS_NO_MEMORY;' in carve_check, 'the exec-check refusal rolls the tail back the same way'
 assert '__sync_fetch_and_sub(&ios_jit_tail_reserved' not in tail, 'every rollback goes through ios_pool_tail_unreserve'
 assert 'ios_tail_carves[ios_tail_carve_n].off = skip_off[k];' in tail
 assert ('ios_jit_hole_off_eff, ios_jit_hole_end_eff,\n'
-        '                                                   ios_jit_hole2_off, ios_jit_hole2_end );') in tail, \
+        '                                                 ios_jit_hole2_off, ios_jit_hole2_end )') in tail, \
     'the tail jumps either slot placement with the hole, and the second hole'
 assert ('ios_pool_skip_pieces( ios_jit_pool_size_global - start, ios_jit_pool_size_global - cur,') in tail
 assert 'if (skip_size[k] < 0x100000 || ios_tail_carve_n >= IOS_TAIL_CARVE_MAX) continue;' in tail
