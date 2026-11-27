@@ -1,10 +1,10 @@
-diff --git a/FEXCore/include/FEXCore/Debug/InternalThreadState.h b/FEXCore/include/FEXCore/Debug/InternalThreadState.h
-index edad382e2..bd5f46cfa 100644
---- a/FEXCore/include/FEXCore/Debug/InternalThreadState.h
-+++ b/FEXCore/include/FEXCore/Debug/InternalThreadState.h
-@@ -158,6 +158,16 @@ struct alignas(FEXCore::Utils::FEX_PAGE_SIZE) InternalThreadState : public FEXCo
-   uint64_t JITGuardOverflowArgument {};
-   FEXCore::UncheckedLongJump::JumpBuf RestartJump;
+diff --git b/FEXCore/include/FEXCore/Debug/InternalThreadState.h a/FEXCore/include/FEXCore/Debug/InternalThreadState.h
+index 654bcac6e..55e36a2bf 100644
+--- b/FEXCore/include/FEXCore/Debug/InternalThreadState.h
++++ a/FEXCore/include/FEXCore/Debug/InternalThreadState.h
+@@ -167,6 +167,16 @@ struct alignas(FEXCore::Utils::FEX_PAGE_SIZE) InternalThreadState : public FEXCo
+   uint32_t PoolCopySize {};
+   alignas(16) uint8_t PoolCopy[4096] {};
  
 +  /* MADEIRA: the guest's x64 debug registers. The host has no copy of Dr0-Dr7, so this thread
 +   * state is the store of record; ntdll publishes them through BTCpu64GetContext/SetContext, and
@@ -19,10 +19,10 @@ index edad382e2..bd5f46cfa 100644
    // BaseFrameState should always be at the end, directly before the interrupt fault page
    FEXCore::Core::CpuStateFrame BaseFrameState {};
  
-diff --git a/Source/Windows/ARM64EC/BTInterface.h b/Source/Windows/ARM64EC/BTInterface.h
+diff --git b/Source/Windows/ARM64EC/BTInterface.h a/Source/Windows/ARM64EC/BTInterface.h
 index d57603079..f9c24feb2 100644
---- a/Source/Windows/ARM64EC/BTInterface.h
-+++ b/Source/Windows/ARM64EC/BTInterface.h
+--- b/Source/Windows/ARM64EC/BTInterface.h
++++ a/Source/Windows/ARM64EC/BTInterface.h
 @@ -18,6 +18,9 @@ NTSTATUS STDMETHODCALLTYPE NotifyMapViewOfSection(void* Unk1, void* Address, voi
  void STDMETHODCALLTYPE NotifyUnmapViewOfSection(void* Address, BOOL After, NTSTATUS Status);
  void STDMETHODCALLTYPE FlushInstructionCacheHeavy(const void* Address, SIZE_T Size);
@@ -33,11 +33,11 @@ index d57603079..f9c24feb2 100644
  void STDMETHODCALLTYPE BTCpu64NotifyMemoryDirty(void* Address, SIZE_T Size);
  void STDMETHODCALLTYPE BTCpu64NotifyReadFile(HANDLE Handle, void* Address, SIZE_T Size, BOOL After, NTSTATUS Status);
  BOOLEAN STDMETHODCALLTYPE BTCpu64IsProcessorFeaturePresent(UINT Feature);
-diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
-index 7190ed04e..fb6c5df81 100644
---- a/Source/Windows/ARM64EC/Module.cpp
-+++ b/Source/Windows/ARM64EC/Module.cpp
-@@ -1829,6 +1829,89 @@ void BTCpu64FlushInstructionCache(const void* Address, SIZE_T Size) {
+diff --git b/Source/Windows/ARM64EC/Module.cpp a/Source/Windows/ARM64EC/Module.cpp
+index 8f55c683b..c984ef08a 100644
+--- b/Source/Windows/ARM64EC/Module.cpp
++++ a/Source/Windows/ARM64EC/Module.cpp
+@@ -2025,6 +2025,89 @@ void BTCpu64FlushInstructionCache(const void* Address, SIZE_T Size) {
    InvalidationTracker->InvalidateAlignedInterval(reinterpret_cast<uint64_t>(Address), static_cast<uint64_t>(Size), false);
  }
  
@@ -127,10 +127,10 @@ index 7190ed04e..fb6c5df81 100644
  void BTCpu64NotifyMemoryDirty(void* Address, SIZE_T Size) {
    if (!InvalidationTracker || ProcessTerminating.load(std::memory_order_relaxed) || !GetCPUArea().ThreadState()) {
      return;
-diff --git a/Source/Windows/ARM64EC/libarm64ecfex.def b/Source/Windows/ARM64EC/libarm64ecfex.def
+diff --git b/Source/Windows/ARM64EC/libarm64ecfex.def a/Source/Windows/ARM64EC/libarm64ecfex.def
 index 05650ac9e..1afd6ea9d 100644
---- a/Source/Windows/ARM64EC/libarm64ecfex.def
-+++ b/Source/Windows/ARM64EC/libarm64ecfex.def
+--- b/Source/Windows/ARM64EC/libarm64ecfex.def
++++ a/Source/Windows/ARM64EC/libarm64ecfex.def
 @@ -2,6 +2,8 @@ LIBRARY libarm64ecfex.dll
  
  EXPORTS
@@ -140,10 +140,10 @@ index 05650ac9e..1afd6ea9d 100644
    BTCpu64IosReleaseThreadHolds
    BTCpu64IsProcessorFeaturePresent
    BTCpu64NotifyMemoryDirty
-diff --git a/Source/Windows/ARM64EC/libarm64ecfex_ios.def b/Source/Windows/ARM64EC/libarm64ecfex_ios.def
+diff --git b/Source/Windows/ARM64EC/libarm64ecfex_ios.def a/Source/Windows/ARM64EC/libarm64ecfex_ios.def
 index af71a6841..661455b1f 100644
---- a/Source/Windows/ARM64EC/libarm64ecfex_ios.def
-+++ b/Source/Windows/ARM64EC/libarm64ecfex_ios.def
+--- b/Source/Windows/ARM64EC/libarm64ecfex_ios.def
++++ a/Source/Windows/ARM64EC/libarm64ecfex_ios.def
 @@ -5,6 +5,8 @@ LIBRARY libarm64ecfex.dll
  
  EXPORTS
