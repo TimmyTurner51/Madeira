@@ -109,7 +109,7 @@ for attempt in 1 2 3 4 5 6 7 8; do
         exit 2
     fi
 
-    sub=$(printf '%s\n' "$see" | grep -F "$TARGET_ID" | head -1)
+    sub=$(printf '%s\n' "$see" | grep -F -e "$TARGET_ID" -e 'EDAFB512-' | head -1)
     if [ -n "$sub" ]; then
         sub_y=$(printf '%s\n' "$sub" | awk '{print $2}' | tr -d ',')
         name=$(printf '%s\n' "$see" | grep -E '  Madeira$' | head -1)
@@ -130,7 +130,14 @@ for attempt in 1 2 3 4 5 6 7 8; do
         fi
     fi
 
-    iosdev swipe 600 2100 600 1000 >/dev/null 2>&1
+    # Gentle scroll, and on the later attempts come back up: eight one-way
+    # swipes walk straight past the Madeira row and the scan then never sees it
+    # again (the list is about ten rows; one swipe covers most of it).
+    if [ "$attempt" -le 4 ]; then
+        iosdev swipe 600 2100 600 1500 >/dev/null 2>&1
+    else
+        iosdev swipe 600 1200 600 2100 >/dev/null 2>&1
+    fi
     sleep 1
 done
 
