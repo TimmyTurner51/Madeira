@@ -3179,3 +3179,58 @@ the bucket and the sample pins the ARM64 worker instructions inside it. Then
 fix against that split; the thermal finding (§9.18: per-frame CPU work is a
 heat budget — P-core share falls 61.8 % -> 0.7 % over 8 minutes) makes every
 saved CPU cycle a sustained-FPS win.
+
+### 9.25 `ml1312+` — Settings AV: the object behind it, its vtable, and the corruption signature (2026-11-26, offline from the shipped binary)
+
+The fault (`[fault_rip] rip=...b0130 (fh6.exe+0x3600130) addr=0x10`, `x86 @rip:
+48 83 ec 18 33 c0 48 89 02 ... 48 8b 81 98 15 00 00 lock inc [rax+8]`) is now
+fully characterized against the game binary (the local CrossOver copy is
+byte-identical to the device's — same 184,268,248-byte build).
+
+**The faulting block is an inlined `shared_ptr` copy into an sret return:**
+`rcx` = object, `rdx` = return buffer; it copies `this+0x1590` (ptr) and
+`this+0x1598` (control block) and does `lock inc [ctrl+8]` (`_Uses`). The
+crash state is `ctrl == 8` — a pointer-sized field holding a small integer —
+so the increment writes to address `0x10`. The two stores to `*rdx` complete
+first, so the caller's return buffer is valid.
+
+**Reachability is exhaustively bounded** (whole-binary scans):
+* The getter (`0x3600130`) is referenced by exactly one vtable slot in the
+  image: `+0x688` (slot 209) of the 234-slot vtable at RVA `0x6a982a8`
+  (preceding `.rdata` names: `AsyncCompute::Delegator`, `CommandListRecorder`).
+* No direct calls or jumps reach it, no rip-indirect slot holds its address,
+  and exactly two `call [reg+0x688]` sites exist: `0x36008c7` and `0x41c2f27`.
+* **Neither site's slot-209 signature matches the getter.** Site `0x36008c7`
+  dispatches `(this)` and consumes the result as a `uint16`; site `0x41c2f27`
+  dispatches `(this, uint32 f7b0, bool 1)` on a sub-object. For the getter to
+  run, `rcx`'s vptr at fault time pointed at a vtable its caller was not
+  compiled against.
+
+**Writers of `+0x1598` found in `.text`** (complete): the getter's two reads,
+one qword store in a constructor-like region (`0x49a0182`, storing `r14`,
+followed by `memcmp(&f15a0, &f1598, 8)` — a self-check, not an init), two
+**32-bit** stores (`0x49a07bb`, `0x49a07ee`, `mov [rbp+0x1598], r14d`) in a
+region that reads the same field back as an `int` and scales it into a double
+(a ticks/duration-style member), and one read. The 32-bit int use of the same
+offset by a same-sized sibling class is exactly what a **recycled heap block**
+leaves behind: a stale `8` in the shared_ptr control slot.
+
+**Hypothesis set for the next run** (all fit the static evidence; the fault
+record discriminates):
+1. **Use-after-free:** the object was destroyed and its block reused by the
+   int-at-`+0x1598` class; a stale pointer dispatched through the stale vptr
+   region — but the vptr survived or was re-written.
+2. **Constructor race:** another thread dispatched slot 209 before the
+   `shared_ptr` member was initialized (the ctor zeroes/sets the pair late).
+   Our FEX scheduling can make this race deterministic where Windows rarely
+   loses it.
+3. **vptr corruption:** a write went to the wrong place (dropped/misrouted
+   store in our stack) and the object's first qword or the member pair got
+   clobbered.
+
+**On-device discriminator:** the fault record's `rcx`/`rdx`/`rax` and which
+site's frame is on the stack (the `uint16` consumer vs the `Update` caller)
+name the dispatch path; a watchpoint/log at `+0x1598` writes (`0x49a0182`,
+`0x49a07bb`, `0x49a07ee`) names the writer. `signal_arm64_ios.c` `ml1312`
+already prints the object's vtable slot count and first slots at fault time —
+extend it with the caller-frame RVA to settle 1 vs 2 vs 3.
