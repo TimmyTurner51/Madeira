@@ -3283,3 +3283,107 @@ same run's `replay split` line shows RS_TABLES against the previous run's
 share, and the frame-graph should show the worker busy time falling from
 13.96 ms toward the 1 ms Metal-submission floor. `table-cache = 0` restores
 the old behaviour in one line if anything diverges.
+
+### 9.27 `ml1327` — the world at 0.2 FPS: a GPU runaway in the runtime line, not the swap config (2026-11-27)
+
+The frame graph's next wall after §9.26's CPU work was the worst number the
+campaign has measured in-world: **0.2 FPS, GPU 4,045–5,415 ms per frame,
+gpu_busy 100 % of wall** (`ml1108`, night city street behind the pause menu;
+cbs 6–12, sum == union, so each command buffer spanned ~700–900 ms of GPU
+time). The same build's title screen had been 46 FPS at 5.2 ms GPU (§9.15)
+and the historical world runs 5–8 FPS at GPU 29–35 ms with `SWAP 0`
+(§9.16's ml345), so this was a regression class of its own, not the scene.
+
+**What it was not.** The prime suspect was the swap tier: the run showed
+`3,703 MB` file-backed in 11,583 extents (2,640 MB of the guest code region
+alone) where the healthy historical runs had `SWAP 0`, and §9.23's history
+names the mechanism (`IOKit iokit_user_client_trap -> IOGPU` wiring pages of
+the `newBufferWithBytesNoCopy` Metal buffers on `ios_swap_fd`). An A/B that
+made every GPU-read resource resident (`upload-swap = 0`, `readback-swap =
+0`, `default-buffer-swap = 0`, `swap-images = 0`) produced **21.6 / 12.6 FPS
+at GPU 3.5 / 2.2 ms** — a 1,500× GPU collapse — but the control run put the
+*broken* switches back and the world still ran **15–22 FPS at GPU 7.2–7.7
+ms**, and the pause-menu state (where the broken run burned 5,415 ms/frame)
+settled at **0.8 FPS with 70 ms of GPU work across 5 s** — a correctly
+throttled paused game. The switches are therefore not the fix. They do carry
+their own weight: the resident posture halves the swap churn (file traffic
+7,805 MB -> 2,610 MB; extents 11,583 -> 4,536) and stays in the recommended
+config for that reason.
+
+**What it was.** The only remaining delta between the broken and healthy runs
+was the runtime line. The broken runs ran the CI-built `windows-runtime-tree`
+(`dee27b25`, staged into `a9f303e`) — stock `ios-build` plus the ml459 sync
+nudge. The healthy runs ran the same tree with the working state of
+`TimmyTurner51/wine` `fh6-ios` (`201f3eff`): the **ml1317 import-thunk
+hotpatch reverted (2d262c2's undo)** plus the five in-tree changes (loop-guard
+/ scribble-slot, exec-jump-table, cdecl-data, shadow-stack / FS[0x28] canary,
+pool-slots) — the same tree that also cleared the §9.25 settings AV. Same
+device, same game, same scene class, same pause state; the cfg was held at the
+broken values on the healthy run and the numbers stayed healthy.
+
+**What is proven and what is not.** Proven: the GPU runaway (and with it the
+0.2 FPS world) lives in the delta between `ios-build` and `fh6-ios`, and both
+the settings AV and the GPU runaway clear together — consistent with one
+corrupting mechanism (the §9.25 heap signature is the natural candidate)
+manifesting twice. Not proven: which of the six changed files carries the fix;
+that needs one bisect build (revert-only vs WIP-only) and is the next step
+before any of it is proposed upstream. The durable state: `wine@201f3eff` and
+`FEX@63fe537b` are pushed to `TimmyTurner51/{wine,FEX}` `fh6-ios`, both
+fetchable by their pins.
+
+**Measured on-device after the fix** (iPhone 17 Pro, the game's own 1280x648
+window, `ml1108`/`promote`, the A/B and confirm runs): world 15.1–22.6 FPS at
+GPU 7.2–7.7 ms per frame with the broken cfg, 18.7–33 FPS at GPU 2.3–7.2 ms
+with the resident cfg; the final free-roam windows presented +218/+302/+471
+per 10 s (22–47 FPS). The HUD read 33 FPS / 29.4 ms / GPU 7.2 ms (24 %),
+`MB 2419`, thermal `Hot` after ~25 min of runs. The frame budget that remains
+is the game's own CPU: D3D12 replay 2–7 ms and argument tables ~0.01 ms
+(§9.26) leave ~22 ms of guest/FEX work at 30 FPS — the next wall, and the one
+the thread sampler in `replay-split = 1` runs is armed for.
+
+Also in this session: upstream PR
+[willfaust/Madeira#636](https://github.com/willfaust/Madeira/pull/636) opened
+(platform-only: `.wcp` import and per-install linking, orientation lock,
+session-menu swipe; no Wine/FEX/dxmt pin changes, 291/291 host checks), and
+`tools/local/dev-run-madeira.sh`'s app-list scan fixed (it swiped past the
+Madeira row in one direction and never saw it again; it now anchors on the
+install UUID and reverses the scroll on later attempts).
+
+### 9.28 `ml1328` — the dynamic L1 dispatch cache: 15-33 fps to the game's 60 fps cap (2026-11-27)
+
+The §9.27 wall was ~22 ms of guest/FEX CPU per frame. Mining the `ml876`
+thread sampler's bursts (956 samples across the confirm runs) put the split at
+guest-exec 1454 %-samples vs a large host-side bucket: the wineserver RPC path
+(`read_reply_data`/`read_request`, up to 72 % on single threads) and the
+game's spin-yield loops (`cthread_yield` -> `swtch_pri` with the game's
+`+0xa8e3e60` on the stack). The guest execution itself was the story though:
+every hot stack ran through the FEX dispatch L1 — and the config had
+`env.FEX_DYNAMICL1CACHE = 0`, the dynamic dispatch cache **off**.
+
+The runtime already carries the LookupCache recommit fix (FEX
+`824e96797`-line, in `wine@201f3eff`/`FEX@63fe537b`) whose entire purpose is
+making dynamic L1 growth safe (it recomits the whole grown range after a
+shrink). Flipping the knob (`env.FEX_DYNAMICL1CACHE = 1`) on-device, one
+config line, no rebuild:
+
+| window (ml1108, 5 s) | before (9.27) | after (9.28) |
+| --- | --- | --- |
+| in-world fps | 15.1-22.6 | **53.0-60.2** (the game's 60 fps cap) |
+| gpu per frame | 7.2-7.7 ms | 2.4-12.5 ms (heavy scenes 75 % busy) |
+| cpu_blocked_in_retire | 0 % | 0 % |
+| steady state | 15-22 fps | **59.6-60.2 fps** for whole 5 s windows |
+
+Live-world verified (car driving the highway, full HUD, resume from pause and
+re-measure), 4,800+ presents stable, no FHE crash, thermal heat soaked from
+the earlier runs and still at cap. The fps timeline: loading 25-31 -> 39.9 ->
+59.8 -> 60.0 sustained with occasional 49-53 fps dips in the heaviest views.
+
+This validates the whole `LookupCache` fix line: the dispatch L1 growth was
+the guest-CPU wall all along. `env.FEX_DYNAMICL1CACHE = 1` is now the default
+in `dist/fh6-madeira.cfg` on `fh6-fex-ios`, with the runtime pin requirement
+(the recommit fix) documented in the file.
+
+Remaining work after this: the heavy-view GPU budget (12.5 ms at 75 % busy in
+the heaviest scenes — headroom but not much), the 49-53 fps hitch windows, and
+the still-open `ml1317` attribution bisect before anything runtime-side goes
+upstream.
