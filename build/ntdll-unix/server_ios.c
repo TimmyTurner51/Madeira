@@ -3809,6 +3809,59 @@ extern volatile int g_madeira_srv_direct;
 extern int ios_srv_direct_call( unsigned int tid, client_ptr_t teb, const union generic_request *request,
                                 const struct iovec *vec, unsigned int count,
                                 union generic_reply *reply, void *reply_data );
+extern void ios_wineserver_ring( unsigned int tid );
+
+/* Defined in unixhalf_entry.c (1) when linked into libntdll_unix.dylib; weak 0 in the
+ * static archive. When an older app binary loads a newer libntdll_unix.dylib without
+ * calling madeira_unix_half_wineserver_main, madeira_unix_half_wineserver_active stays 0
+ * and we forward direct server calls / doorbell rings to the host app's running server
+ * via dlsym(RTLD_DEFAULT, ...). When the app starts wineserver inside this dylib (or in
+ * the static archive), we call the local symbol directly with zero indirection. */
+__attribute__((weak)) int madeira_unix_half_is_dylib = 0;
+__attribute__((weak)) volatile int madeira_unix_half_wineserver_active = 0;
+
+typedef int (*ios_srv_direct_call_fn_t)( unsigned int, client_ptr_t, const union generic_request *,
+                                         const struct iovec *, unsigned int,
+                                         union generic_reply *, void * );
+typedef void (*ios_wineserver_ring_fn_t)( unsigned int );
+
+static inline int ios_active_srv_direct_call( unsigned int tid, client_ptr_t teb,
+                                              const union generic_request *request,
+                                              const struct iovec *vec, unsigned int count,
+                                              union generic_reply *reply, void *reply_data )
+{
+    if (!madeira_unix_half_is_dylib ||
+        __atomic_load_n( &madeira_unix_half_wineserver_active, __ATOMIC_ACQUIRE ))
+        return ios_srv_direct_call( tid, teb, request, vec, count, reply, reply_data );
+    static ios_srv_direct_call_fn_t host_fn;
+    static int resolved;
+    if (!__atomic_load_n( &resolved, __ATOMIC_ACQUIRE ))
+    {
+        ios_srv_direct_call_fn_t p = (ios_srv_direct_call_fn_t)dlsym( RTLD_DEFAULT, "ios_srv_direct_call" );
+        host_fn = p ? p : ios_srv_direct_call;
+        __atomic_store_n( &resolved, 1, __ATOMIC_RELEASE );
+    }
+    return host_fn( tid, teb, request, vec, count, reply, reply_data );
+}
+
+static inline void ios_active_wineserver_ring( unsigned int tid )
+{
+    if (!madeira_unix_half_is_dylib ||
+        __atomic_load_n( &madeira_unix_half_wineserver_active, __ATOMIC_ACQUIRE ))
+    {
+        ios_wineserver_ring( tid );
+        return;
+    }
+    static ios_wineserver_ring_fn_t host_fn;
+    static int resolved;
+    if (!__atomic_load_n( &resolved, __ATOMIC_ACQUIRE ))
+    {
+        ios_wineserver_ring_fn_t p = (ios_wineserver_ring_fn_t)dlsym( RTLD_DEFAULT, "ios_wineserver_ring" );
+        host_fn = p ? p : ios_wineserver_ring;
+        __atomic_store_n( &resolved, 1, __ATOMIC_RELEASE );
+    }
+    host_fn( tid );
+}
 
 static BOOL ios_srv_try_direct( struct __server_request_info *req, unsigned int *status )
 {
@@ -3821,9 +3874,9 @@ static BOOL ios_srv_try_direct( struct __server_request_info *req, unsigned int 
         vec[i].iov_base = (void *)req->data[i].ptr;
         vec[i].iov_len = req->data[i].size;
     }
-    ret = ios_srv_direct_call( HandleToULong( NtCurrentTeb()->ClientId.UniqueThread ),
-                               (client_ptr_t)(ULONG_PTR)NtCurrentTeb(), &req->u.req, vec, req->data_count,
-                               &req->u.reply, req->reply_data );
+    ret = ios_active_srv_direct_call( HandleToULong( NtCurrentTeb()->ClientId.UniqueThread ),
+                                      (client_ptr_t)(ULONG_PTR)NtCurrentTeb(), &req->u.req, vec, req->data_count,
+                                      &req->u.reply, req->reply_data );
     errno = err;
     if (ret <= 0) return FALSE;
     *status = req->u.reply.reply_header.error;
@@ -3854,8 +3907,7 @@ unsigned int server_call_unlocked( void *req_ptr )
     {
         /* madeira-bcd doorbell: name the thread, so the loop reads only its
          * request fd (fd_ios.c ios_srv_bell); a ring also wakes the loop */
-        extern void ios_wineserver_ring( unsigned int tid );
-        ios_wineserver_ring( HandleToULong( NtCurrentTeb()->ClientId.UniqueThread ) );
+        ios_active_wineserver_ring( HandleToULong( NtCurrentTeb()->ClientId.UniqueThread ) );
     }
     return wait_reply( req );
 }

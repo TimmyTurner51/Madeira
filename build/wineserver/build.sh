@@ -251,7 +251,14 @@ COLLISIONS=(
     # forever, which is why the shared clock could never be published and why
     # every process hung in server_init_process() the moment a client
     # connected -- guest ntdll init is exactly when the pointer was stolen.
+    # server_start_time / supported_machines_count / native_machine: defined
+    # in BOTH wineserver and ntdll-unix (server_ios.c). Renaming wineserver's
+    # copies lets libwineserver.a link cleanly into libntdll_unix.dylib and
+    # prevents single-process common-symbol aliasing with ntdll-unix.
     user_shared_data
+    server_start_time
+    supported_machines_count
+    native_machine
 )
 RENAME_ARGS=()
 for s in "${COLLISIONS[@]}"; do

@@ -14486,6 +14486,9 @@ static inline UINT64 maskbits( size_t idx )
  */
 static BOOL set_vprot( struct file_view *view, void *base, size_t size, BYTE vprot );  /* fwd-decl */
 static void ios_swap_release_range( void *base, size_t size, int copy_back );   /* ml1077 fwd-decls */
+/* ml1315: every path that can leave a range unmapped records it here, so a fault in a
+ * hole behind a live view names its maker instead of leaving it to guesswork (ml1313). */
+static void ios_dc_hist_note( char *base, size_t size, const char *branch, int mmap_errno );
 static void ios_swap_init( void );
 static int ios_swap_eligible( const void *base, size_t size, unsigned int vprot, struct file_view *view );
 static void ios_swap_back( void *base, size_t size, unsigned int vprot );
@@ -15656,6 +15659,7 @@ static void unmap_area( void *start, size_t size )
         if (area_start > start)
         {
             ios_pool_va_warn( "munmap", start, (char *)area_start - (char *)start );
+            ios_dc_hist_note( start, (char *)area_start - (char *)start, "unmap_area-munmap", 0 );   /* ml1315 */
             munmap( start, (char *)area_start - (char *)start );
             start = area_start;
         }
@@ -15668,6 +15672,7 @@ static void unmap_area( void *start, size_t size )
         start = area_end;
     }
     ios_pool_va_warn( "munmap", start, (char *)end - (char *)start );
+    ios_dc_hist_note( start, (char *)end - (char *)start, "unmap_area-munmap", 0 );   /* ml1315 */
     munmap( start, (char *)end - (char *)start );
 }
 
@@ -25355,6 +25360,12 @@ static void ios_swap_release_range( void *base, size_t size, int copy_back )
     if (ios_swap_releases != releases_before && (ios_swap_releases <= 16 || (ios_swap_releases % 64) == 0))
         dprintf( 2, "[swap] ml1077 released %p+0x%zx%s: %llu MB in %u extents, %llu releases, %llu unbacks\n",
                  base, size, copy_back ? " (copied back to anonymous)" : "", ios_swap_bytes >> 20, ios_swap_n, ios_swap_releases, ios_swap_unbacks );
+    /* ml1315: this is the event 0.7 s before the Settings AV at 0x709a521000
+     * ("released 0x709a520000+0x110000 (1 unbacks)", then the guest read one page in
+     * and found nothing mapped). Whatever ELSE unmapped it, this names the release. */
+    if (ios_swap_releases != releases_before)
+        ios_dc_hist_note( (char *)lo, (size_t)(hi - lo),
+                          copy_back ? "swap-release-copyback" : "swap-release", 0 );
 }
 /* ml1257 / ml323: decommit inside a reservation extent.
  * When deferred punches are enabled (default), NEVER call F_PUNCHHOLE
@@ -26126,6 +26137,11 @@ static int ios_pool_foreign_overlap( uintptr_t rw_start, size_t size )
  * only the range's own ends can be partial pages. If an alias's slot was handed out
  * again, its part is left alone, as [alias-tomb] did, and the branch says so.
  * *verify / *vsize get the first part zeroed through an alias, for the read-back. */
+/* ml1313: the hole repair below is used by the decommit paths above it. */
+static int ios_host_page_is_mapped( const void *p );
+static int ios_restore_committed_hole( char *page );
+static void ios_dc_hist_note( char *base, size_t size, const char *branch, int mmap_errno );
+
 static const char *ios_decommit_alias_split( char *base, size_t size,
                                              const void **verify, size_t *vsize )
 {
@@ -26184,8 +26200,30 @@ static const char *ios_decommit_alias_split( char *base, size_t size,
                 if (ios_swap_punch_resv( hs, he - hs )) n_hole++;   /* ml1257 */
                 else
                 {
+                    int e_map;
+
                     ios_swap_release_range( hs, he - hs, 0 );   /* ml1077 */
-                    anon_mmap_fixed( hs, he - hs, PROT_READ | PROT_WRITE, 0 );
+                    /* ml1313: this remap OVERWRITES the range. If it fails the range is left
+                     * unmapped while the view above it stays live and committed, so the guest's
+                     * next touch takes an AV it cannot handle (the 011 Settings crash). Check it
+                     * and put back something committed rather than leaving the hole. */
+                    if (anon_mmap_fixed( hs, he - hs, PROT_READ | PROT_WRITE, 0 ) == MAP_FAILED)
+                    {
+                        e_map = errno;
+                        ios_restore_committed_hole( hs );
+                        dprintf( 2, "[decommit] %p+0x%lx: swap released the range and the zero remap "
+                                 "FAILED errno=%d -- put back %s\n",
+                                 hs, (unsigned long)(he - hs), e_map,
+                                 ios_host_page_is_mapped( hs ) ? "a mapping, hole avoided" : "NOTHING" );
+                        ios_dc_hist_note( hs, he - hs, "decommit-mmap-over-FAILED", e_map );
+                        if (ios_host_page_is_mapped( hs )) e_map = 0;
+                    }
+                    else
+                    {
+                        e_map = 0;
+                        ios_dc_hist_note( hs, he - hs, "decommit-mmap-over", 0 );
+                    }
+                    (void)e_map;
                 }
                 if (p < hs) memset( p, 0, hs - p );
                 if (he < part_end) memset( he, 0, part_end - he );
@@ -26202,6 +26240,123 @@ static const char *ios_decommit_alias_split( char *base, size_t size,
                     "again (#%lu)\n",
                  base, (unsigned long)size, n_alias, n_plain, n_hole, n_kept, n_calls );
     return n_kept ? "alias-split(PART KEPT, not zeroed)" : "alias-split";
+}
+
+/* ml1313: DECOMMIT HISTORY.
+ *
+ * A decommit that remaps a range (mmap-over) can leave an unmapped hole behind a
+ * LIVE wine view if the remap fails: 17:02:00.272 released 0x709a520000+0x110000,
+ * and the guest's very next read of +0x1000 -- inside view 0x709a520000+0x160000,
+ * protect 3, still live -- took INVALID_ADDRESS ([fault-rgn] region=unknown/foreign).
+ * The Settings menu died there. The old code ignored anon_mmap_fixed()'s result, so
+ * the failure was invisible; it is fixed below. This ring keeps the last decommits
+ * so that a fault which still lands in a hole can NAME the call that made it. */
+#define IOS_DC_HIST_N 64
+struct ios_dc_hist_rec
+{
+    char *base;
+    size_t size;
+    const char *branch;
+    unsigned int tid, ms;
+    int mmap_errno;
+};
+static struct ios_dc_hist_rec ios_dc_hist[IOS_DC_HIST_N];
+static unsigned long ios_dc_hist_pos;
+
+static void ios_dc_hist_note( char *base, size_t size, const char *branch, int mmap_errno )
+{
+    struct ios_dc_hist_rec *r;
+
+    if (!branch) return;
+    r = &ios_dc_hist[__atomic_fetch_add( &ios_dc_hist_pos, 1, __ATOMIC_RELAXED ) % IOS_DC_HIST_N];
+    r->base = base;
+    r->size = size;
+    r->branch = branch;
+    r->mmap_errno = mmap_errno;
+    r->tid = NtCurrentTeb() ? (unsigned int)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread : 0;
+    r->ms = ios_vh_ms();
+}
+
+static void ios_dc_hist_dump( const void *addr )
+{
+    unsigned long end = __atomic_load_n( &ios_dc_hist_pos, __ATOMIC_RELAXED ), i, n = 0;
+    unsigned int now = ios_vh_ms();
+
+    for (i = end; i-- > 0 && end - i <= IOS_DC_HIST_N && n < 8; )
+    {
+        const struct ios_dc_hist_rec *r = &ios_dc_hist[i % IOS_DC_HIST_N];
+        if ((const char *)addr < r->base || (const char *)addr >= r->base + r->size) continue;
+        dprintf( 2, "[fault-rgn]   decommit: %p+0x%lx branch=%s mmap_errno=%d by tid %04x %u ms ago\n",
+                 r->base, (unsigned long)r->size, r->branch, r->mmap_errno, r->tid, now - r->ms );
+        n++;
+    }
+    if (!n)
+        dprintf( 2, "[fault-rgn]   decommit: no decommit covered this address in the last %u records\n", IOS_DC_HIST_N );
+}
+
+/* ml1313: is this host page actually mapped? mincore(2) is the cheap answer that
+ * works in signal context (no virtual_mutex re-entry); ENOMEM means no mapping. */
+static int ios_host_page_is_mapped( const void *p )
+{
+    char vec;
+    return mincore( (void *)p, host_page_size, &vec ) == 0;
+}
+
+/* ml1313: A COMMITTED PAGE WITH NO HOST MAPPING IS A HOLE BEHIND A LIVE VIEW.
+ *
+ * Windows' contract for a committed page is that it is accessible; a guest read or
+ * write there must not raise an access violation the guest has no handler for. When
+ * the kernel has nothing at a committed page inside a view Wine owns, the range was
+ * unmapped behind both their backs -- by us (the decommit path above) or by a host
+ * stripper. Restore it as a zero page and let the guest continue, naming the range
+ * and the decommits that covered it so the maker is not left to guesswork.
+ *
+ * Runs with virtual_mutex held (virtual_handle_fault). Returns 1 if it healed. */
+static int ios_restore_committed_hole( char *page )
+{
+    extern void *anon_mmap_fixed( void *start, size_t size, int prot, int flags );
+    struct file_view *view;
+    char *run = page, *end = page + host_page_size, *stop;
+    size_t len;
+    int i;
+
+    if (!(get_host_page_vprot( page ) & VPROT_COMMITTED)) return 0;
+    if (ios_host_page_is_mapped( page )) return 0;              /* not a hole */
+    view = find_view( page, 1 );
+    if (!view) return 0;                                        /* foreign mmap: not ours */
+    stop = (char *)view->base + view->size;
+    /* the contiguous run of committed-but-unmapped pages around the fault */
+    for (i = 0; i < 64 && run > (char *)view->base; i++)
+    {
+        char *prev = run - host_page_size;
+        if (!(get_host_page_vprot( prev ) & VPROT_COMMITTED) || ios_host_page_is_mapped( prev )) break;
+        run = prev;
+    }
+    for (i = 0; i < 1024 && end < stop; i++)                    /* up to 4 MB forward */
+    {
+        if (!(get_host_page_vprot( end ) & VPROT_COMMITTED) || ios_host_page_is_mapped( end )) break;
+        end += host_page_size;
+    }
+    len = (size_t)(end - run);
+    if (anon_mmap_fixed( run, len, PROT_READ | PROT_WRITE, 0 ) == MAP_FAILED)
+    {
+        static unsigned long heal_map_fail;
+        if (heal_map_fail++ < 8)
+            dprintf( 2, "[hole-heal] %p+0x%lx: committed page has NO host mapping (view %p+0x%lx) but the "
+                     "zero map failed errno=%d -- the access violation stands\n",
+                     run, (unsigned long)len, view->base, (unsigned long)view->size, errno );
+        return 0;
+    }
+    {
+        static unsigned long heal_n;
+        if (heal_n++ < 16 || (heal_n % 256) == 0)
+            dprintf( 2, "[hole-heal] #%lu %p+0x%lx (%lu page(s)): committed page had NO host mapping -- "
+                     "restored as zeros in view %p+0x%lx (fault %p)\n",
+                     heal_n, run, (unsigned long)len, (unsigned long)(len / host_page_size),
+                     view->base, (unsigned long)view->size, page );
+    }
+    ios_dc_hist_dump( page );
+    return 1;
 }
 
 static NTSTATUS decommit_pages( struct file_view *view, char *base, size_t size )
@@ -26303,11 +26458,41 @@ static NTSTATUS decommit_pages( struct file_view *view, char *base, size_t size 
                 dc_branch = "swap-hole";   /* no read-back: no file-page touches under the lock (ml1081) */
             else
             {
+                int e_map;
+
                 ios_swap_release_range( host_start, host_end - host_start, 0 );   /* ml1077 */
-                anon_mmap_fixed( host_start, host_end - host_start, PROT_READ | PROT_WRITE, 0 );
-                dc_branch = "mmap-over";
-                dc_verify = host_start;
-                dc_vsize  = host_end - host_start;
+                /* ml1313: the remap OVERWRITES the range, so a failure leaves the range
+                 * UNMAPPED while the view stays live and committed -- the guest's next touch
+                 * (0x709a521000, one page into a released 0x709a520000+0x110000) is an AV it
+                 * has no handler for, which is how the 011 Settings crash died. Check the
+                 * result; if the range is not mapped afterwards, put a committed zero mapping
+                 * back instead of leaving a hole behind a live view. */
+                if (anon_mmap_fixed( host_start, host_end - host_start, PROT_READ | PROT_WRITE, 0 ) == MAP_FAILED)
+                {
+                    e_map = errno;
+                    ios_restore_committed_hole( host_start );
+                    dprintf( 2, "[decommit] %p+0x%lx: swap released the range and the zero remap FAILED "
+                             "errno=%d -- put back %s\n", host_start,
+                             (unsigned long)(host_end - host_start), e_map,
+                             ios_host_page_is_mapped( host_start ) ? "a mapping, hole avoided" : "NOTHING" );
+                    dc_branch = ios_host_page_is_mapped( host_start ) ? "mmap-over-FAILED-then-restored"
+                                                                     : "mmap-over-FAILED(NOT mapped)";
+                    if (ios_host_page_is_mapped( host_start ))
+                    {
+                        e_map = 0;
+                        dc_verify = host_start;
+                        dc_vsize  = host_end - host_start;
+                    }
+                }
+                else
+                {
+                    e_map = 0;
+                    dc_branch = "mmap-over";
+                    dc_verify = host_start;
+                    dc_vsize  = host_end - host_start;
+                }
+                ios_dc_hist_note( host_start, host_end - host_start,
+                                  e_map ? "decommit-mmap-over-FAILED" : "decommit-mmap-over", e_map );
             }
             /* Zero the guest sub-ranges on partial host pages the mmap-over
              * couldn't cover — FEX relies on decommit-as-bzero, and stale
@@ -31216,6 +31401,20 @@ NTSTATUS virtual_handle_fault( EXCEPTION_RECORD *rec, void *stack )
         if (!mprotect_range( page, host_page_size, 0, 0 )) ret = STATUS_SUCCESS;
         else set_page_vprot_bits( page, host_page_size, 0, VPROT_EXEC );
     }
+
+    /* ml1313: A COMMITTED PAGE THAT THE KERNEL DOES NOT MAP.
+     *
+     * The 011 Settings crash: 17:02:00.272 released 0x709a520000+0x110000 from the swap
+     * tier, and 17:02:00.973 the guest read 0x709a521000 -- one page in, inside view
+     * 0x709a520000+0x160000 which was STILL LIVE and committed (host protect 3) -- and
+     * took INVALID_ADDRESS. Wine believed the page was committed; the kernel had nothing
+     * there. A committed page is accessible by Windows contract, so the fault is ours to
+     * repair, not the guest's to die on: remap it as zeros and record that it happened.
+     * Checked last, so every legitimate reason above keeps its result. */
+    if (ret != STATUS_SUCCESS && err != EXCEPTION_EXECUTE_FAULT && (vprot & VPROT_COMMITTED) &&
+        ios_restore_committed_hole( page ))
+        ret = STATUS_SUCCESS;
+
     mutex_unlock( &virtual_mutex );
     rec->ExceptionCode = ret;
     return ret;
@@ -31330,10 +31529,19 @@ void ios_dump_fault_region( void *addr )
     dprintf( 2, "[fault-rgn] addr=%p page=%p vprot prev/this/next=%02x/%02x/%02x region=%s\n",
              addr, page, vp_prev, vp, vp_next, region );
     if (view)
+    {
         dprintf( 2, "[fault-rgn]   IN WINE VIEW base=%p size=0x%lx protect=0x%x off=0x%lx end=%p\n",
                  view->base, (unsigned long)view->size, view->protect,
                  (unsigned long)((char *)addr - (char *)view->base),
                  (char *)view->base + view->size );
+        /* ml1313: a fault inside a live view is a claim about OUR bookkeeping, so name
+         * the decommits that covered the address and whether the page is actually mapped
+         * at all -- that pair is what turns "AV at 0x709a521000" into a diagnosis. */
+        dprintf( 2, "[fault-rgn]   host mapping %s (vprot says %s)\n",
+                 ios_host_page_is_mapped( page ) ? "PRESENT" : "ABSENT",
+                 (vp & VPROT_COMMITTED) ? "committed" : "not committed" );
+        ios_dc_hist_dump( addr );
+    }
     else
     {
         dprintf( 2, "[fault-rgn]   NO wine view — Wine doesn't own this addr (FEX/foreign mmap)\n" );

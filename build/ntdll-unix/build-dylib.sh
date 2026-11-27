@@ -40,6 +40,25 @@ _madeira_unix_half_main
 _madeira_unix_half_log_set_file
 _madeira_unix_half_main_i386_addr
 _madeira_unix_half_live_game_children
+_madeira_unix_half_winios_drv_census_owner
+_madeira_unix_half_winios_drv_process_image
+_madeira_unix_half_winios_drv_post_restore
+_madeira_unix_half_winios_drv_foreground_if_owner
+_madeira_unix_half_winios_drv_close_desktop_if_owner
+_madeira_unix_half_winios_drv_post_mouse
+_madeira_unix_half_winios_drv_post_key
+_madeira_unix_half_winios_drv_post_text
+_madeira_unix_half_winios_drv_size_game_window
+_madeira_unix_half_winios_dump_window_tree
+_madeira_unix_half_ios_dump_all_thread_stacks
+_madeira_unix_half_wineserver_main
+_madeira_unix_half_wineserver_log_set_file
+_madeira_unix_half_wineserver_set_nls_dir
+_madeira_unix_half_wineserver_inject_client_fd
+_madeira_unix_half_wineserver_foreground_addr
+_madeira_unix_half_wineserver_ready_addr
+_madeira_unix_half_wineserver_log_quiet_addr
+_madeira_unix_half_wineserver_set_ui_log_callback
 LIST
 
 # The archive's object list, in the same order build.sh passes it.
@@ -93,13 +112,16 @@ echo "=== Linking $OUT from ${#ARGS[@]} objects ==="
 #
 #   libav*/libswresample  winegstreamer and the AV parsers, which live in this object list
 #   libwin32u_unix        win32u's unixlib init, which the ntdll loader brings up
+#   libwineserver         in-process wineserver (shares madsync, madeira_sync_cells,
+#                         ios_srv_direct_call, ios_wineserver_ring, ios_eco_gen, etc.)
 #
-# Linking them here makes the image self-contained for both. The app keeps its own copies
-# for the archive fallback; only one half runs, so neither is initialised twice.
+# Linking them here makes the image self-contained for all three. The app keeps its own
+# copies for the archive fallback; only one half runs, so none is initialised twice.
 EXTRA_LIBS=(
     "$ROOT_APP/libavformat.a" "$ROOT_APP/libavcodec.a"
     "$ROOT_APP/libavutil.a" "$ROOT_APP/libswresample.a"
     "$ROOT_APP/libwin32u_unix.a"
+    "$ROOT_APP/libwineserver.a"
     "$ROOT_APP/libgnutls.a" "$ROOT_APP/libhogweed.a"
     "$ROOT_APP/libnettle.a" "$ROOT_APP/libgmp.a"
 )
@@ -119,7 +141,7 @@ chmod 755 "$OUT"
 
 echo "=== Verifying the entry points are exported and nothing else is ==="
 EXPORTED=$(nm -gU "$OUT" | awk '{print $3}' | sort)
-for want in _madeira_unix_half_main _madeira_unix_half_log_set_file _madeira_unix_half_main_i386_addr; do
+for want in _madeira_unix_half_main _madeira_unix_half_log_set_file _madeira_unix_half_main_i386_addr _madeira_unix_half_wineserver_main; do
     if ! printf '%s\n' "$EXPORTED" | grep -qx "$want"; then
         echo "ERROR: $want is not exported from the dylib" >&2
         echo "exported symbols:" >&2

@@ -658,7 +658,8 @@ static struct window *create_window( struct window *parent, struct window *owner
                 if (desktop->winstation)
                 {
                     desktop->winstation->flags |= 1 /* WSF_VISIBLE */;
-                    desktop->winstation->input_desktop = desktop;
+                    if (!desktop->winstation->input_desktop)
+                        desktop->winstation->input_desktop = desktop;
                 }
                 /* iOS: monitors_get_union_rect returns (0,0,0,0) since we
                  * never report a monitor. That makes cursor.clip degenerate
@@ -2374,7 +2375,8 @@ DECL_HANDLER(get_desktop_window)
             if (desktop->winstation)
             {
                 desktop->winstation->flags |= 1 /* WSF_VISIBLE */;
-                desktop->winstation->input_desktop = desktop;
+                if (!desktop->winstation->input_desktop)
+                    desktop->winstation->input_desktop = desktop;
             }
             /* Initialize cursor.clip to screen size — monitors_get_union_rect
              * returns (0,0,0,0) on iOS so update_desktop_cursor_pos clips

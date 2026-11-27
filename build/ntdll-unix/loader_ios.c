@@ -2438,6 +2438,20 @@ static void load_ntdll_functions( HMODULE module )
         }
         else dprintf( 2, "XLATE-HOOK p_ios_jit_translate_addr export NOT FOUND\n" );
 
+        {
+            extern void ios_jit_retarget_blr( void *pe_slot );
+            void **p_retarget = (void **)find_named_export( module, exports,
+                                                            "p_ios_jit_retarget" );
+            if (p_retarget)
+            {
+                *p_retarget = (void *)ios_jit_retarget_blr;
+                dprintf( 2, "XLATE-HOOK installed p_ios_jit_retarget=%p at %p\n",
+                         ios_jit_retarget_blr, p_retarget );
+                ios_jit_sync_write( p_retarget, sizeof(void *) );
+            }
+            else dprintf( 2, "XLATE-HOOK p_ios_jit_retarget export NOT FOUND\n" );
+        }
+
         /* Reverse hook: pool alias → PE VA, used by PE ntdll's
          * virtual_unwind so exception walks over pool-executing frames
          * find their function tables (registered at PE VAs). */
@@ -2881,6 +2895,18 @@ static int ios_load_child_ec_ntdll( PEB *child_peb )
             void **p_xlate_rev = (void **)find_named_export( module, exports, "p_ios_jit_reverse_translate_addr" );
             if (p_xlate)     { *p_xlate = (void *)ios_jit_translate_addr;              ios_jit_sync_write( p_xlate, sizeof(void*) ); }
             else dprintf(2, "[ec-child-ntdll] p_ios_jit_translate_addr NOT FOUND\n");
+            {
+                extern void ios_jit_retarget_blr( void *pe_slot );
+                void **p_retarget = (void **)find_named_export( module, exports, "p_ios_jit_retarget" );
+                if (p_retarget)
+                {
+                    *p_retarget = (void *)ios_jit_retarget_blr;
+                    ios_jit_sync_write( p_retarget, sizeof(void *) );
+                    dprintf( 2, "[ec-child-ntdll] retarget installed at %p = %p\n",
+                             p_retarget, (void *)ios_jit_retarget_blr );
+                }
+                else dprintf( 2, "[ec-child-ntdll] p_ios_jit_retarget NOT FOUND\n" );
+            }
             /* ml221: this used to install the reverse hook with NO log on either
              * outcome, so whether a CHILD ntdll copy got it was invisible. That matters:
              * each pseudo-process has its own cloned .data, hence its own

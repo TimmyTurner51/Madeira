@@ -3200,6 +3200,96 @@ static uint8_t exc_peek8( uint64_t addr )
 
 static struct ios_fault_progress ios_fault_progress_last;
 
+/* iOS-Madeira ml1312: name the object behind a fatal guest fault.
+ *
+ * The Settings wedge faults inside an inlined std::shared_ptr copy at
+ * forzahorizon6.exe+0x360130 -- the only entry point for it is vtable slot 209
+ * of the 234-slot vtable at RVA 0x6a982a8 (verified against the PE pulled from
+ * the device; there are no direct calls in .text). That block reads the raw
+ * pointer at this+0x1590 and the control block at this+0x1598 and then does
+ * `lock inc dword [rep+8]`, so a faulting data address of 0x10 means the
+ * control-block pointer held 8.
+ *
+ * The [guest-regs] dump cannot say which register is `this`: in the first
+ * Settings run rax was 2, a value that block can never produce, so the dump is
+ * not the state of the faulting instruction. Probe every register that could
+ * plausibly hold a heap object and print, per register, its vtable pointer and
+ * the two shared_ptr words the faulting block would have read. A stale vtable
+ * pointer (object already destroyed) and a garbage control block are different
+ * bugs and this separates them. */
+static void fault_probe_objects( const uint64_t *gr )
+{
+    static const char *names[16] = { "rax","rcx","rdx","rbx","rsp","rbp","rsi","rdi",
+                                     "r8","r9","r10","r11","r12","r13","r14","r15" };
+    int i;
+    /* Unconditional: ml1312's first cut printed nothing, so the first question
+     * is whether this runs at all and what the reads actually return. */
+    dprintf( STDERR_FILENO, "[guest-obj] probe entered gr=%p\n", (const void*)gr );
+    for (i = 0; i < 16; i++)
+    {
+        uint64_t v = gr[i], vt = 0, p1590 = 0, r1598 = 0;
+        mach_vm_size_t g1 = 0, g2 = 0, g3 = 0;
+        kern_return_t k1, k2, k3;
+        if (v < 0x10000) {
+            dprintf( STDERR_FILENO, "[guest-obj] %s=%#llx (not a pointer)\n",
+                     names[i], (unsigned long long)v );
+            continue;
+        }
+        k1 = mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)v,
+                                     sizeof(vt), (mach_vm_address_t)&vt, &g1 );
+        k2 = mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(v + 0x1590),
+                                     sizeof(p1590), (mach_vm_address_t)&p1590, &g2 );
+        k3 = mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(v + 0x1598),
+                                     sizeof(r1598), (mach_vm_address_t)&r1598, &g3 );
+        dprintf( STDERR_FILENO,
+                 "[guest-obj] %s=%#llx vt=%#llx k1=%d/%llu k2=%d/%llu k3=%d/%llu"
+                 " sp.ptr=%#llx sp.rep=%#llx%s\n",
+                 names[i], (unsigned long long)v, (unsigned long long)vt,
+                 (int)k1, (unsigned long long)g1, (int)k2, (unsigned long long)g2,
+                 (int)k3, (unsigned long long)g3,
+                 (unsigned long long)p1590, (unsigned long long)r1598,
+                 (k3 == KERN_SUCCESS && r1598 && r1598 < 0x10000)
+                     ? "  <== CONTROL BLOCK IS NOT A POINTER" : "" );
+    }
+
+    /* The fault is `lock inc [rep+8]` with rep == 8, i.e. some object's
+     * +0x1598 holds 8. Whichever register is `this`, that object is findable
+     * by value: scan the stack for a pointer whose +0x1598 is 8. That names the
+     * object even if the register guess above is wrong. */
+    {
+        uint64_t rsp = gr[4];
+        if (rsp > 0x10000) {
+            uint64_t slots[96];
+            mach_vm_size_t got = 0;
+            if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)rsp,
+                                        sizeof(slots), (mach_vm_address_t)slots, &got ) == KERN_SUCCESS) {
+                unsigned n = (unsigned)(got / 8), s;
+                for (s = 0; s < n; s++) {
+                    uint64_t p = slots[s], rep = 0;
+                    mach_vm_size_t g = 0;
+                    if (p < 0x10000 || (p & 7)) continue;
+                    if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(p + 0x1598),
+                                                sizeof(rep), (mach_vm_address_t)&rep, &g ) != KERN_SUCCESS
+                        || g != sizeof(rep))
+                        continue;
+                    if (rep == 8) {
+                        uint64_t vt2 = 0, raw2 = 0;
+                        (void)mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)p,
+                                                      sizeof(vt2), (mach_vm_address_t)&vt2, &g );
+                        (void)mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(p + 0x1590),
+                                                      sizeof(raw2), (mach_vm_address_t)&raw2, &g );
+                        dprintf( STDERR_FILENO,
+                                 "[guest-obj] STACK[%u] this=%#llx vt=%#llx sp.ptr=%#llx"
+                                 " sp.rep=0x8  <== THE OBJECT\n",
+                                 s, (unsigned long long)p, (unsigned long long)vt2,
+                                 (unsigned long long)raw2 );
+                    }
+                }
+            }
+        }
+    }
+}
+
 static void *ios_mach_exception_thread( void *arg )
 {
     mach_port_t port = (mach_port_t)(uintptr_t)arg;
@@ -7336,6 +7426,132 @@ dispatch_guest_fault:
                             else
                                 dprintf( STDERR_FILENO, "[rsp-trunc]   x86 @rip UNREADABLE\n" );
 
+                            {
+                                uint64_t gr[16];
+                                unsigned char pre[96], post[32];
+                                uint32_t rcx_mem[8], r14_mem[8];
+                                uint64_t stk[16];
+                                mach_vm_size_t gg = 0;
+                                if (mach_vm_read_overwrite( mach_task_self(),
+                                        (mach_vm_address_t)(st28 + 0x20), sizeof(gr),
+                                        (mach_vm_address_t)gr, &gg ) == KERN_SUCCESS && gg == sizeof(gr))
+                                {
+                                    dprintf( STDERR_FILENO,
+                                             "[guest-regs] rax=%#llx rcx=%#llx rdx=%#llx rbx=%#llx rsp=%#llx rbp=%#llx rsi=%#llx rdi=%#llx\n"
+                                             "[guest-regs] r8=%#llx r9=%#llx r10=%#llx r11=%#llx r12=%#llx r13=%#llx r14=%#llx r15=%#llx\n",
+                                             (unsigned long long)gr[0], (unsigned long long)gr[1], (unsigned long long)gr[2], (unsigned long long)gr[3],
+                                             (unsigned long long)gr[4], (unsigned long long)gr[5], (unsigned long long)gr[6], (unsigned long long)gr[7],
+                                             (unsigned long long)gr[8], (unsigned long long)gr[9], (unsigned long long)gr[10], (unsigned long long)gr[11],
+                                             (unsigned long long)gr[12], (unsigned long long)gr[13], (unsigned long long)gr[14], (unsigned long long)gr[15] );
+                                    if (gr[1] > 0x10000 && mach_vm_read_overwrite( mach_task_self(),
+                                            (mach_vm_address_t)gr[1], sizeof(rcx_mem),
+                                            (mach_vm_address_t)rcx_mem, &gg ) == KERN_SUCCESS && gg == sizeof(rcx_mem))
+                                        dprintf( STDERR_FILENO,
+                                                 "[guest-mem] [rcx+0..28]: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                                                 rcx_mem[0], rcx_mem[1], rcx_mem[2], rcx_mem[3],
+                                                 rcx_mem[4], rcx_mem[5], rcx_mem[6], rcx_mem[7] );
+                                    if (gr[14] > 0x10000 && mach_vm_read_overwrite( mach_task_self(),
+                                            (mach_vm_address_t)gr[14], sizeof(r14_mem),
+                                            (mach_vm_address_t)r14_mem, &gg ) == KERN_SUCCESS && gg == sizeof(r14_mem))
+                                        dprintf( STDERR_FILENO,
+                                                 "[guest-mem] [r14+0..28]: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                                                 r14_mem[0], r14_mem[1], r14_mem[2], r14_mem[3],
+                                                 r14_mem[4], r14_mem[5], r14_mem[6], r14_mem[7] );
+                                    if (gr[4] > 0x10000 && mach_vm_read_overwrite( mach_task_self(),
+                                            (mach_vm_address_t)gr[4], sizeof(stk),
+                                            (mach_vm_address_t)stk, &gg ) == KERN_SUCCESS && gg == sizeof(stk))
+                                        dprintf( STDERR_FILENO,
+                                                 "[guest-stk] %#llx %#llx %#llx %#llx %#llx %#llx %#llx %#llx\n"
+                                                 "[guest-stk] %#llx %#llx %#llx %#llx %#llx %#llx %#llx %#llx\n",
+                                                 (unsigned long long)stk[0], (unsigned long long)stk[1], (unsigned long long)stk[2], (unsigned long long)stk[3],
+                                                 (unsigned long long)stk[4], (unsigned long long)stk[5], (unsigned long long)stk[6], (unsigned long long)stk[7],
+                                                 (unsigned long long)stk[8], (unsigned long long)stk[9], (unsigned long long)stk[10], (unsigned long long)stk[11],
+                                                 (unsigned long long)stk[12], (unsigned long long)stk[13], (unsigned long long)stk[14], (unsigned long long)stk[15] );
+                                    fault_probe_objects( gr );
+                                }
+                                if (cs[0] > 0x10000 && mach_vm_read_overwrite( mach_task_self(),
+                                        (mach_vm_address_t)(cs[0] - sizeof(pre)), sizeof(pre),
+                                        (mach_vm_address_t)pre, &gg ) == KERN_SUCCESS && gg == sizeof(pre) &&
+                                    mach_vm_read_overwrite( mach_task_self(),
+                                        (mach_vm_address_t)cs[0], sizeof(post),
+                                        (mach_vm_address_t)post, &gg ) == KERN_SUCCESS && gg == sizeof(post))
+                                {
+                                    int bi;
+                                    char hexbuf[400];
+                                    int hp = 0;
+                                    for (bi = 0; bi < (int)sizeof(pre); bi++)
+                                        hp += snprintf( hexbuf + hp, sizeof(hexbuf) - hp, "%02x", pre[bi] );
+                                    dprintf( STDERR_FILENO, "[guest-x86-pre96] %s\n", hexbuf );
+                                    hp = 0;
+                                    for (bi = 0; bi < (int)sizeof(post); bi++)
+                                        hp += snprintf( hexbuf + hp, sizeof(hexbuf) - hp, "%02x", post[bi] );
+                                    dprintf( STDERR_FILENO, "[guest-x86-post32] %s\n", hexbuf );
+                                }
+                            }
+
+                            {
+                                uint64_t gr[16];
+                                unsigned char pre[96], post[32];
+                                uint32_t rcx_mem[8], r14_mem[8];
+                                uint64_t stk[16];
+                                mach_vm_size_t gg = 0;
+                                if (mach_vm_read_overwrite( mach_task_self(),
+                                        (mach_vm_address_t)(st28 + 0x20), sizeof(gr),
+                                        (mach_vm_address_t)gr, &gg ) == KERN_SUCCESS && gg == sizeof(gr))
+                                {
+                                    dprintf( STDERR_FILENO,
+                                             "[guest-regs] rax=%#llx rcx=%#llx rdx=%#llx rbx=%#llx rsp=%#llx rbp=%#llx rsi=%#llx rdi=%#llx\n"
+                                             "[guest-regs] r8=%#llx r9=%#llx r10=%#llx r11=%#llx r12=%#llx r13=%#llx r14=%#llx r15=%#llx\n",
+                                             (unsigned long long)gr[0], (unsigned long long)gr[1], (unsigned long long)gr[2], (unsigned long long)gr[3],
+                                             (unsigned long long)gr[4], (unsigned long long)gr[5], (unsigned long long)gr[6], (unsigned long long)gr[7],
+                                             (unsigned long long)gr[8], (unsigned long long)gr[9], (unsigned long long)gr[10], (unsigned long long)gr[11],
+                                             (unsigned long long)gr[12], (unsigned long long)gr[13], (unsigned long long)gr[14], (unsigned long long)gr[15] );
+                                    if (gr[1] > 0x10000 && mach_vm_read_overwrite( mach_task_self(),
+                                            (mach_vm_address_t)gr[1], sizeof(rcx_mem),
+                                            (mach_vm_address_t)rcx_mem, &gg ) == KERN_SUCCESS && gg == sizeof(rcx_mem))
+                                        dprintf( STDERR_FILENO,
+                                                 "[guest-mem] [rcx+0..28]: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                                                 rcx_mem[0], rcx_mem[1], rcx_mem[2], rcx_mem[3],
+                                                 rcx_mem[4], rcx_mem[5], rcx_mem[6], rcx_mem[7] );
+                                    if (gr[14] > 0x10000 && mach_vm_read_overwrite( mach_task_self(),
+                                            (mach_vm_address_t)gr[14], sizeof(r14_mem),
+                                            (mach_vm_address_t)r14_mem, &gg ) == KERN_SUCCESS && gg == sizeof(r14_mem))
+                                        dprintf( STDERR_FILENO,
+                                                 "[guest-mem] [r14+0..28]: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                                                 r14_mem[0], r14_mem[1], r14_mem[2], r14_mem[3],
+                                                 r14_mem[4], r14_mem[5], r14_mem[6], r14_mem[7] );
+                                    if (gr[4] > 0x10000 && mach_vm_read_overwrite( mach_task_self(),
+                                            (mach_vm_address_t)gr[4], sizeof(stk),
+                                            (mach_vm_address_t)stk, &gg ) == KERN_SUCCESS && gg == sizeof(stk))
+                                        dprintf( STDERR_FILENO,
+                                                 "[guest-stk] %#llx %#llx %#llx %#llx %#llx %#llx %#llx %#llx\n"
+                                                 "[guest-stk] %#llx %#llx %#llx %#llx %#llx %#llx %#llx %#llx\n",
+                                                 (unsigned long long)stk[0], (unsigned long long)stk[1], (unsigned long long)stk[2], (unsigned long long)stk[3],
+                                                 (unsigned long long)stk[4], (unsigned long long)stk[5], (unsigned long long)stk[6], (unsigned long long)stk[7],
+                                                 (unsigned long long)stk[8], (unsigned long long)stk[9], (unsigned long long)stk[10], (unsigned long long)stk[11],
+                                                 (unsigned long long)stk[12], (unsigned long long)stk[13], (unsigned long long)stk[14], (unsigned long long)stk[15] );
+                                    fault_probe_objects( gr );
+                                }
+                                if (cs[0] > 0x10000 && mach_vm_read_overwrite( mach_task_self(),
+                                        (mach_vm_address_t)(cs[0] - sizeof(pre)), sizeof(pre),
+                                        (mach_vm_address_t)pre, &gg ) == KERN_SUCCESS && gg == sizeof(pre) &&
+                                    mach_vm_read_overwrite( mach_task_self(),
+                                        (mach_vm_address_t)cs[0], sizeof(post),
+                                        (mach_vm_address_t)post, &gg ) == KERN_SUCCESS && gg == sizeof(post))
+                                {
+                                    int bi;
+                                    char hexbuf[400];
+                                    int hp = 0;
+                                    for (bi = 0; bi < (int)sizeof(pre); bi++)
+                                        hp += snprintf( hexbuf + hp, sizeof(hexbuf) - hp, "%02x", pre[bi] );
+                                    dprintf( STDERR_FILENO, "[guest-x86-pre96] %s\n", hexbuf );
+                                    hp = 0;
+                                    for (bi = 0; bi < (int)sizeof(post); bi++)
+                                        hp += snprintf( hexbuf + hp, sizeof(hexbuf) - hp, "%02x", post[bi] );
+                                    dprintf( STDERR_FILENO, "[guest-x86-post32] %s\n", hexbuf );
+                                }
+                            }
+
                             /* iOS-Madeira ml333: is the guest code we EXECUTE the guest code that was
                              * LOADED?
                              *
@@ -8783,6 +8999,56 @@ static void restore_context( const CONTEXT *context, ucontext_t *sigcontext )
 }
 
 
+struct fh6_jit_regs
+{
+    ULONG64 pc, x13, x14, x23, x24, x28;
+};
+
+static void fh6_save_jit_regs( struct fh6_jit_regs *r, ULONG64 pc, const ULONG64 *x )
+{
+    r->pc = pc;
+    r->x13 = x[13];
+    r->x14 = x[14];
+    r->x23 = x[23];
+    r->x24 = x[24];
+    r->x28 = x[28];
+}
+
+/* ARM64EC CONTEXT <-> x64 CONTEXT translation drops x13, x14, x23, x24, and x28
+ * (FEX's STATE/JIT regs). Restore them after wait_suspend() when the context
+ * still points to the same instruction. */
+static void fh6_keep_jit_regs( const struct fh6_jit_regs *r, CONTEXT *ctx )
+{
+    extern int ios_is_arm64ec_cur(void);
+    if (!ios_is_arm64ec_cur() || ctx->Pc != r->pc || !r->x28 || ctx->X[28]) return;
+    ctx->X[13] = r->x13;
+    ctx->X[14] = r->x14;
+    ctx->X[23] = r->x23;
+    ctx->X[24] = r->x24;
+    ctx->X[28] = r->x28;
+}
+
+static void fh6_keep_frame_regs( CONTEXT *ctx, const struct syscall_frame *frame )
+{
+    extern int ios_is_arm64ec_cur(void);
+    extern void *ios_jit_rx_base_global;
+    extern size_t ios_jit_pool_size_global;
+    uintptr_t rx = (uintptr_t)ios_jit_rx_base_global;
+    size_t psz = ios_jit_pool_size_global;
+    BOOL in_native_or_jit;
+
+    if (!ios_is_arm64ec_cur() || (ctx->ContextFlags & CONTEXT_INTEGER) != CONTEXT_INTEGER) return;
+    if (ctx->X[28] || !frame->x[28]) return;
+    in_native_or_jit = is_ec_code( ctx->Pc ) ||
+                       (rx && psz && ctx->Pc >= rx && ctx->Pc < rx + psz) ||
+                       ios_jit_low_contains( (uintptr_t)ctx->Pc );
+    if (!in_native_or_jit) return;
+    ctx->X[23] = frame->x[23];
+    ctx->X[24] = frame->x[24];
+    ctx->X[28] = frame->x[28];
+}
+
+
 /***********************************************************************
  *           signal_set_full_context
  */
@@ -8792,7 +9058,10 @@ NTSTATUS signal_set_full_context( CONTEXT *context )
     struct syscall_frame *frame = get_syscall_frame();
     ULONG_PTR ml944_req_pc = context->Pc, ml944_req_sp = context->Sp;
     DWORD ml944_req_flags = context->ContextFlags;
-    NTSTATUS status = NtSetContextThread( GetCurrentThread(), context );
+    NTSTATUS status;
+
+    fh6_keep_frame_regs( context, frame );
+    status = NtSetContextThread( GetCurrentThread(), context );
 
     if (!status && (context->ContextFlags & CONTEXT_INTEGER) == CONTEXT_INTEGER)
         frame->restore_flags |= CONTEXT_INTEGER;
@@ -8977,7 +9246,12 @@ NTSTATUS signal_set_full_context( CONTEXT *context )
                 }
             }
             frame->sp = (ULONG_PTR)user_context;
-            frame->pc = (ULONG_PTR)IOS_PFUNC(KiUserEmulationDispatcher);
+            {
+                extern void *ios_jit_translate_addr(void *addr);
+                void *emu = (void *)IOS_PFUNC(KiUserEmulationDispatcher);
+                void *jit_emu = emu ? ios_jit_translate_addr( emu ) : NULL;
+                frame->pc = (ULONG_PTR)(jit_emu ? jit_emu : emu);
+            }
         }
     }
     return status;
@@ -9527,7 +9801,12 @@ static void setup_raise_exception( ucontext_t *sigcontext, EXCEPTION_RECORD *rec
     context_init_empty_xstate( &stack->context, stack->redzone );
 
     SP_sig(sigcontext) = (ULONG_PTR)stack;
-    PC_sig(sigcontext) = (ULONG_PTR)IOS_PFUNC(KiUserExceptionDispatcher);
+    {
+        extern void *ios_jit_translate_addr(void *addr);
+        void *disp = (void *)IOS_PFUNC(KiUserExceptionDispatcher);
+        void *jit_disp = disp ? ios_jit_translate_addr( disp ) : NULL;
+        PC_sig(sigcontext) = (ULONG_PTR)(jit_disp ? jit_disp : disp);
+    }
     REGn_sig(18, sigcontext) = (ULONG_PTR)NtCurrentTeb();
 #ifdef WINE_IOS
     /* iOS sigreturn zeroes x18 — route through trampoline */
@@ -10274,9 +10553,15 @@ dispatch:
      * has no pseudo-process identity, so IOS_PFUNC would always fall back
      * to the session ntdll) */
     {
+        extern void *ios_jit_translate_addr_for_owner(void *addr, void *owner_peb);
         void *peb_id = *(void **)(thread_teb + 0x60);
         const struct ios_ntdll_funcs *f = ios_ntdll_funcs_for_peb( peb_id );
         dispatcher = f ? f->KiUserExceptionDispatcher : (void *)pKiUserExceptionDispatcher;
+        if (dispatcher)
+        {
+            void *jit_disp = ios_jit_translate_addr_for_owner( dispatcher, peb_id );
+            if (jit_disp) dispatcher = jit_disp;
+        }
     }
     if (!dispatcher) return 0;
 
@@ -10669,7 +10954,12 @@ NTSTATUS call_user_exception_dispatcher( EXCEPTION_RECORD *rec, CONTEXT *context
     memmove( &stack->rec, rec, sizeof(*rec) );
     context_init_empty_xstate( &stack->context, stack->redzone );
 
-    frame->pc = (ULONG64)IOS_PFUNC(KiUserExceptionDispatcher);
+    {
+        extern void *ios_jit_translate_addr(void *addr);
+        void *disp = (void *)IOS_PFUNC(KiUserExceptionDispatcher);
+        void *jit_disp = disp ? ios_jit_translate_addr( disp ) : NULL;
+        frame->pc = (ULONG64)(jit_disp ? jit_disp : disp);
+    }
     frame->sp = (ULONG64)stack;
     frame->restore_flags |= CONTEXT_CONTROL;
     syscall_frame_fixup_for_fastpath( frame );
@@ -14161,10 +14451,11 @@ int ios_subfloor_enum( int idx, unsigned long long *low, unsigned long long *rea
 
 /* ml1205: the window `peb` sees at addr. Exact owner or a shared (NULL-owner)
  * window wins; with no known peb, the last matching window answers. */
-static uintptr_t ios_subfloor_translate( uint64_t addr, void *peb )
+static uintptr_t ios_subfloor_translate_win( uint64_t addr, void *peb, uint64_t *out_lo, uint64_t *out_sz )
 {
     int i, n = ios_subfloor_count;
     uintptr_t any = 0;
+    uint64_t any_lo = 0, any_sz = 0;
 
     if (addr >= __atomic_load_n( &ios_subfloor_ceiling, __ATOMIC_ACQUIRE )) return 0;   /* fast reject: the common case */
     for (i = 0; i < n; i++)
@@ -14178,10 +14469,26 @@ static uintptr_t ios_subfloor_translate( uint64_t addr, void *peb )
         re = ios_subfloor[i].real_base;
         own = ios_subfloor[i].owner_peb;
         if (addr < lo || addr >= lo + sz) continue;
-        if (!own || own == peb) return (uintptr_t)(re + (addr - lo));
-        if (!peb) any = (uintptr_t)(re + (addr - lo));
+        if (!own || own == peb)
+        {
+            if (out_lo) *out_lo = lo;
+            if (out_sz) *out_sz = sz;
+            return (uintptr_t)(re + (addr - lo));
+        }
+        if (!peb) { any = (uintptr_t)(re + (addr - lo)); any_lo = lo; any_sz = sz; }
+    }
+    if (any)
+    {
+        if (out_lo) *out_lo = any_lo;
+        if (out_sz) *out_sz = any_sz;
     }
     return any;
+}
+
+static uintptr_t ios_subfloor_translate( uint64_t addr, void *peb )
+{
+    if (addr >= __atomic_load_n( &ios_subfloor_ceiling, __ATOMIC_ACQUIRE )) return 0;   /* fast reject: the common case */
+    return ios_subfloor_translate_win( addr, peb, NULL, NULL );
 }
 
 /* Two address probes for server_ios.c's check before an async I/O completion stores an IO_STATUS_BLOCK32
@@ -14807,7 +15114,8 @@ static int ios_subfloor_backing_probe( uintptr_t real, unsigned bytes, int need_
 static int ios_subfloor_service( ucontext_t *ctx, void *fault_addr, const char *via, void *peb )
 {
     uint64_t addr = (uint64_t)(uintptr_t)fault_addr;
-    uintptr_t real = ios_subfloor_translate( addr, peb );
+    uint64_t win_lo = 0, win_sz = 0;
+    uintptr_t real = ios_subfloor_translate_win( addr, peb, &win_lo, &win_sz );
     uint32_t insn = 0;
     unsigned bytes = 0, span = 8;
     int is_write = 0, ok, cls = 0;
@@ -15031,7 +15339,7 @@ static int ios_subfloor_service( ucontext_t *ctx, void *fault_addr, const char *
      * for blocks that live in the window, vs backpatching arbitrary sites), so
      * attribute each hit to the page of the guest RIP in the FEX frame. */
     {
-        static struct { uint64_t page; unsigned long long n; } hist[48];
+        static struct { uint64_t page; unsigned long long n; } hist[128];
         static unsigned long long no_frame;
         uint64_t x28 = REGn_sig( 28, ctx ), grip = 0;
         mach_vm_size_t got = 0;
@@ -15041,9 +15349,19 @@ static int ios_subfloor_service( ucontext_t *ctx, void *fault_addr, const char *
                                     (mach_vm_address_t)&grip, &got ) == KERN_SUCCESS && got == 8 && grip)
         {
             uint64_t page = grip >> 12;
-            for (h = 0; h < 48; h++)
+            for (h = 0; h < 128; h++)
             {
-                if (hist[h].page == page) { hist[h].n++; break; }
+                if (hist[h].page == page)
+                {
+                    hist[h].n++;
+                    if (hist[h].n == 8 && win_sz)
+                    {
+                        extern void ios_push_hot_subfloor_page( unsigned long long, unsigned long long,
+                                                                unsigned long long, void * );
+                        ios_push_hot_subfloor_page( page << 12, win_lo, win_sz, peb );
+                    }
+                    break;
+                }
                 if (!hist[h].page) { hist[h].page = page; hist[h].n = 1; break; }
             }
         }
@@ -15051,7 +15369,7 @@ static int ios_subfloor_service( ucontext_t *ctx, void *fault_addr, const char *
         if ((ios_subfloor_hits & 0xFFFFF) == 0xFFFFF)
         {
             char line[1500]; int n = 0;
-            for (h = 0; h < 48 && hist[h].page; h++)
+            for (h = 0; h < 128 && hist[h].page; h++)
                 if (hist[h].n > 2000)
                     n += snprintf( line + n, sizeof(line) - n, " %llx:%llu", (unsigned long long)hist[h].page << 12, hist[h].n );
             dprintf( 2, "[subfloor] ml1055 accessor guest-RIP pages after %llu hits (no FEX frame: %llu):%s\n",
@@ -16549,16 +16867,24 @@ static void usr1_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 #endif
     if (is_inside_syscall( SP_sig(ucontext) ))
     {
+        struct fh6_jit_regs jit;
+
         context.ContextFlags = CONTEXT_FULL | CONTEXT_EXCEPTION_REQUEST;
         NtGetContextThread( GetCurrentThread(), &context );
+        fh6_save_jit_regs( &jit, context.Pc, context.X );
         wait_suspend( &context );
+        fh6_keep_jit_regs( &jit, &context );
         NtSetContextThread( GetCurrentThread(), &context );
     }
     else
     {
+        struct fh6_jit_regs jit;
+
         save_context( &context, ucontext );
         context.ContextFlags |= CONTEXT_EXCEPTION_REPORTING;
+        fh6_save_jit_regs( &jit, context.Pc, context.X );
         wait_suspend( &context );
+        fh6_keep_jit_regs( &jit, &context );
         restore_context( &context, ucontext );
 #ifdef WINE_IOS
         ios_fixup_x18_for_return( ucontext );
@@ -18068,6 +18394,14 @@ void ios_wait_chain_snapshot( const char *why )
 
 void ios_dump_all_thread_stacks(void)
 {
+    static int s_lean = -1;
+    if (s_lean < 0)
+    {
+        const char *e = getenv( "MADEIRA_LEAN_DIAG" );
+        s_lean = (e && e[0] == '1') ? 1 : 0;
+    }
+    if (s_lean) return;
+
     thread_act_array_t threads;
     mach_msg_type_number_t count = 0, i;
     thread_t self = mach_thread_self();

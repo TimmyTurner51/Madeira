@@ -26,6 +26,7 @@
 #endif
 
 #include <assert.h>
+#include <dlfcn.h>
 #include <pthread.h>
 
 #include "ntstatus.h"
@@ -1108,14 +1109,18 @@ static BOOL winios_surface_flush( struct window_surface *surface, const RECT *re
 
     if (winios_surface_present && color_bits)
     {
+        extern HWND winios_suppressed_backdrop_get(void);
+        HWND target_hwnd = surface->hwnd;
         int surf_w = color_info->bmiHeader.biWidth;
         int surf_h = color_info->bmiHeader.biHeight;
         if (surf_h < 0) surf_h = -surf_h;
+        if (winios_desktop_mode() && target_hwnd && target_hwnd == winios_suppressed_backdrop_get())
+            target_hwnd = get_desktop_window();
         /* ml1028: propagate the snapshot allocation result. dce.c only calls
          * reset_bounds() when we return TRUE, so returning FALSE keeps the
          * dirty region and the frame is repainted on a later flush instead of
          * the copy throwing an uncaught ObjC exception and killing us. */
-        if (!winios_surface_present( surface->hwnd,
+        if (!winios_surface_present( target_hwnd,
                                      dirty->left, dirty->top,
                                      dirty->right - dirty->left, dirty->bottom - dirty->top,
                                      surf_w, surf_h, surf_w * 4, color_bits, surface->alpha_mask ))
@@ -1427,6 +1432,12 @@ static void winios_drv_refresh_children( HWND hwnd, BOOL geometry )
 /* pWindowPosChanged wrapper: dereference window_rects HERE (Winios.m
  * cannot include wine headers) and forward plain ints for the layer
  * frame; chain to the Winios.m hook afterwards. */
+static HWND winios_suppressed_backdrop_hwnd;
+HWND winios_suppressed_backdrop_get(void)
+{
+    return __atomic_load_n( &winios_suppressed_backdrop_hwnd, __ATOMIC_RELAXED );
+}
+
 static void winios_drv_window_pos_changed( HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
                                            const struct window_rects *new_rects, struct window_surface *surface )
 {
@@ -1448,9 +1459,43 @@ static void winios_drv_window_pos_changed( HWND hwnd, HWND insert_after, HWND ow
          * Wine has already updated WS_VISIBLE before this callback; include
          * its parent chain so a hidden browser's child Metal layer stays hidden. */
         int visible = is_window_visible( hwnd ) && !IsRectEmpty( v ) && !(swp_flags & SWP_HIDEWINDOW);
+        typedef void (*winios_zorder_fn_t)(HWND, HWND);
+        static winios_zorder_fn_t zorder_fn;
+        static int zorder_probed;
+        if (!zorder_probed)
+        {
+            zorder_fn = (winios_zorder_fn_t)dlsym( RTLD_DEFAULT, "winios_window_zorder" );
+            zorder_probed = 1;
+        }
+        if (desktop && !zorder_fn && visible && (intptr_t)insert_after > 2
+            && NtUserGetAncestor( hwnd, GA_PARENT ) == get_desktop_window())
+        {
+            /* Host app binary predates winios_window_zorder: a WS_DISABLED
+             * toolwindow backdrop created after a game window and placed
+             * behind it (insert_after = game hwnd) would sit on top in
+             * Core Animation sublayer order and hide the Metal game layer. */
+            ULONG st = get_window_long( hwnd, GWL_STYLE );
+            ULONG ex = get_window_long( hwnd, GWL_EXSTYLE );
+            if ((st & (WS_POPUP | WS_DISABLED)) == (WS_POPUP | WS_DISABLED) && (ex & WS_EX_TOOLWINDOW))
+            {
+                static HWND logged_backdrop;
+                if (logged_backdrop != hwnd)
+                {
+                    logged_backdrop = hwnd;
+                    dprintf( 2, "[winios-zorder] suppressing disabled toolwindow backdrop hwnd=%p behind %p "
+                             "(host lacks winios_window_zorder; routing paint to desktop layer)\n", hwnd, insert_after );
+                }
+                __atomic_store_n( &winios_suppressed_backdrop_hwnd, hwnd, __ATOMIC_RELAXED );
+                visible = 0;
+            }
+        }
         if (frame_valid)
+        {
             winios_window_frame( hwnd, v->left, v->top, v->right - v->left, v->bottom - v->top, visible,
                                  c->left, c->top, c->right - c->left, c->bottom - c->top );
+            if (desktop && zorder_fn && NtUserGetAncestor( hwnd, GA_PARENT ) == get_desktop_window())
+                zorder_fn( hwnd, insert_after );
+        }
         if (desktop)
         {
             BOOL geometry = !(swp_flags & SWP_NOMOVE) || !(swp_flags & SWP_NOSIZE) ||

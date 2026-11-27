@@ -1225,6 +1225,8 @@ static BOOL zink_init(void)
      * VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR is ignored by Mesa's
      * Vulkan runtime, and VK_KHR_portability_enumeration is not requested (the
      * extension list is generated on the Linux build host). */
+    typedef int (*wcp_dylib_fn_t)( const char *, char *, int );
+    wcp_dylib_fn_t wcp_dylib_path = (wcp_dylib_fn_t)dlsym( RTLD_DEFAULT, "madeira_wcp_dylib_path" );
     {
         char want[1024] = "";
         const char *env;
@@ -1233,17 +1235,24 @@ static BOOL zink_init(void)
             (env = getenv( "MADEIRA_GL_VULKAN" )) && *env)   /* Vulkan driver for Zink when madeira.cfg gl-vulkan is unset: moltenvk (default), kosmickrisp, or a .dylib name/path */
             snprintf( want, sizeof(want), "%s", env );
         if (!want[0] || !strcasecmp( want, "moltenvk" ))
-            snprintf( path, sizeof(path), "%s/libMoltenVK.dylib", dir );
+        {
+            if (!wcp_dylib_path || !wcp_dylib_path( "libMoltenVK.dylib", path, (int)sizeof(path) ))
+                snprintf( path, sizeof(path), "%s/libMoltenVK.dylib", dir );
+        }
         else if (!strcasecmp( want, "kosmickrisp" ))
-            snprintf( path, sizeof(path), "%s/libvulkan_kosmickrisp.dylib", dir );
+        {
+            if (!wcp_dylib_path || !wcp_dylib_path( "libvulkan_kosmickrisp.dylib", path, (int)sizeof(path) ))
+                snprintf( path, sizeof(path), "%s/libvulkan_kosmickrisp.dylib", dir );
+        }
         else if (want[0] == '/')
             snprintf( path, sizeof(path), "%s", want );
-        else
+        else if (!wcp_dylib_path || !wcp_dylib_path( want, path, (int)sizeof(path) ))
             snprintf( path, sizeof(path), "%s/%s", dir, want );
         if (access( path, R_OK ))
         {
             ERR( "[winios-gl] ml1344 zink Vulkan library %s not found (gl-vulkan = %s), using MoltenVK\n", path, want );
-            snprintf( path, sizeof(path), "%s/libMoltenVK.dylib", dir );
+            if (!wcp_dylib_path || !wcp_dylib_path( "libMoltenVK.dylib", path, (int)sizeof(path) ))
+                snprintf( path, sizeof(path), "%s/libMoltenVK.dylib", dir );
         }
         ERR( "[winios-gl] ml1344 zink Vulkan library: %s\n", strrchr( path, '/' ) ? strrchr( path, '/' ) + 1 : path );
     }
@@ -1289,7 +1298,8 @@ static BOOL zink_init(void)
     setenv( "MESA_GL_VERSION_OVERRIDE", "4.1", 0 );
     setenv( "MESA_GLSL_VERSION_OVERRIDE", "410", 0 );
 
-    snprintf( path, sizeof(path), "%s/libOSMesa.dylib", dir );
+    if (!wcp_dylib_path || !wcp_dylib_path( "libOSMesa.dylib", path, (int)sizeof(path) ))
+        snprintf( path, sizeof(path), "%s/libOSMesa.dylib", dir );
     shader_cache_init( path );
     if (!(osmesa_handle = dlopen( path, RTLD_NOW | RTLD_LOCAL )))
     {

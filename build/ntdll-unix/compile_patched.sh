@@ -21,7 +21,7 @@ compile_one() {
         -Wno-implicit-function-declaration -Wno-int-conversion \
         -include "$WINE_BUILD/include/config.h" \
         -include "$BUILD_DIR/shims/wine_ios_exit.h" \
-        -I"$BUILD_DIR/shims" \
+        -I"$BUILD_DIR/shims" -I"$BUILD_DIR/../madsync" -DHAVE_LINUX_NTSYNC_H=1 \
         -I"$WINE_BUILD/dlls/ntdll" -I"$WINE_SRC/dlls/ntdll" -I"$WINE_SRC/dlls/ntdll/unix" \
         -I"$WINE_BUILD/include" -I"$WINE_SRC/include" \
         -D__WINESRC__ -DLTC_NO_PROTOTYPES -DLTC_SOURCE -D_NTSYSTEM_ \
@@ -46,12 +46,13 @@ compile_one "$BUILD_DIR/process_ios.c" "process.o"
 compile_one "$BUILD_DIR/server_ios.c" "server.o"
 compile_one "$BUILD_DIR/virtual_ios.c" "virtual.o"
 compile_one "$BUILD_DIR/signal_arm64_ios.c" "signal_arm64.o"
+compile_one "$WINE_SRC/dlls/ntdll/unix/sync.c" "sync.o"
 
 echo ""
 echo "=== Rebuilding libntdll_unix.a ==="
 # Update existing archive with recompiled objects
 if [ -f "$OBJ_DIR/libntdll_unix.a" ]; then
-    for obj in loader.o process.o server.o virtual.o signal_arm64.o; do
+    for obj in loader.o process.o server.o virtual.o signal_arm64.o sync.o; do
         ar d "$OBJ_DIR/libntdll_unix.a" "$obj" 2>/dev/null || true
         ar r "$OBJ_DIR/libntdll_unix.a" "$OBJ_DIR/$obj"
     done
