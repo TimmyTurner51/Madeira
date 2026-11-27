@@ -1,0 +1,178 @@
+diff --git a/dlls/win32u/gdiobj.c b/dlls/win32u/gdiobj.c
+index d9f28086..abd7c40a 100644
+--- a/dlls/win32u/gdiobj.c
++++ b/dlls/win32u/gdiobj.c
+@@ -49,6 +49,28 @@ static GDI_HANDLE_ENTRY *next_free;
+ static GDI_HANDLE_ENTRY *next_unused;
+ static LONG debug_count;
+ 
++/* ml1319: ONE initialiser, callable from anywhere, that runs Wine's OWN sequence.
++ *
++ * The table used to be published only by init_user() -> gdi_init(), i.e. from
++ * NtUserInitializeClientPfnArrays. A load-time GDI call can beat that: set6.log has a
++ * comctl32 attach reaching alloc_gdi_handle at 0x1091c6700 with gdi_shared == NULL,
++ * which took the "there is room" branch with entry == NULL and stored through it
++ * (fault_rip cnt=1..4: addr 0x0, then 0x30, 0x48, 0x78 as next_unused crept up 0x18
++ * per retry) and killed the load.
++ *
++ * ml1314 built only the TABLE from the handle path and left the stock objects to
++ * gdi_init(). That is wrong on its own terms: init_stock_objects() asserts that the
++ * stock bitmap lands on FIRST_GDI_HANDLE + DEFAULT_BITMAP, so one handle taken before
++ * it shifts every stock object and the assertion kills the session at load
++ * ("Assertion failed: ... init_stock_objects, file gdiobj.c, line 1006"). The early
++ * caller has to be served AFTER the stock objects exist, which is exactly the order
++ * Wine's own gdi_init() uses -- so the whole sequence runs here, under one state
++ * machine, and gdi_init() is just a call into it. */
++static pthread_mutex_t gdi_init_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
++static int gdi_init_state;   /* 0 = not started, 1 = running on the caller's thread, 2 = done */
++static void init_gdi_shared_once( void );
++static void gdi_ensure_init( void );
++
+ #ifdef WINE_IOS
+ extern int dprintf( int fd, const char *fmt, ... );
+ 
+@@ -195,7 +217,10 @@ static HANDLE open_gdi_shared_section(void)
+ 
+ static inline HGDIOBJ entry_to_handle( GDI_HANDLE_ENTRY *entry )
+ {
+-    unsigned int idx = entry - gdi_shared->Handles;
++    unsigned int idx;
++
++    if (!entry) return 0;   /* ml1314: no shared table, or an invalid slot */
++    idx = entry - gdi_shared->Handles;
+     return ULongToHandle( idx | (entry->Unique << NTGDI_HANDLE_TYPE_SHIFT) );
+ }
+ 
+@@ -203,6 +228,7 @@ static inline GDI_HANDLE_ENTRY *handle_entry( HGDIOBJ handle )
+ {
+     unsigned int idx = LOWORD(handle);
+ 
++    if (!gdi_shared) return NULL;   /* ml1314: no table yet; never dereference NULL */
+     if (idx < GDI_MAX_HANDLE_COUNT && gdi_shared->Handles[idx].Type)
+     {
+         if (!HIWORD( handle ) || HIWORD( handle ) == gdi_shared->Handles[idx].Unique)
+@@ -796,7 +822,7 @@ void win32u_gdi_publish_shared(void)
+ }
+ #endif  /* WINE_IOS */
+ 
+-static void init_gdi_shared(void)
++static void init_gdi_shared_once(void)
+ {
+     SIZE_T size = sizeof(*gdi_shared);
+ 
+@@ -903,6 +929,10 @@ static void init_gdi_shared(void)
+     NtCurrentTeb()->Peb->GdiSharedHandleTable = gdi_shared;
+ }
+ 
++/* ml1319: the body of Wine's gdi_init(), reachable from any handle path. See the note
++ * at gdi_init_lock above for why the whole sequence runs here rather than the table
++ * alone; gdi_ensure_init itself is defined after init_stock_objects(). */
++
+ /***********************************************************************
+  *           GetStockObject    (win32u.so)
+  */
+@@ -990,6 +1020,56 @@ static void init_stock_objects( unsigned int dpi )
+ }
+ 
+ 
++/* ml1319: WHICH ORDER, AND WHY IT IS WINE'S OWN.
++ *
++ * Order matters: the recursive object lock, then the shared table, then font_init()
++ * and the stock objects. A thread that finds state 1 is one of our own stock-object
++ * allocations (gdi_init_lock is recursive, so it holds the lock): the table exists and
++ * the stock objects are being created in order right now, so its request must not
++ * re-enter the body -- it just allocates its handle. A thread that finds state 2 after
++ * waiting is behind a finished initialisation and does the same.
++ *
++ * A failed table allocation goes back to state 0 instead: the next caller retries,
++ * because the failure actually seen (ml1300, load-time) was transient memory pressure,
++ * not a permanent state. */
++static void gdi_ensure_init( void )
++{
++    if (__atomic_load_n( &gdi_init_state, __ATOMIC_ACQUIRE ) == 2) return;
++    pthread_mutex_lock( &gdi_init_lock );
++    if (gdi_init_state)
++    {
++        pthread_mutex_unlock( &gdi_init_lock );
++        return;
++    }
++    gdi_init_state = 1;
++    {
++        pthread_mutexattr_t attr;
++        pthread_mutexattr_init( &attr );
++        pthread_mutexattr_settype( &attr, PTHREAD_MUTEX_RECURSIVE );
++        pthread_mutex_init( &gdi_lock, &attr );
++        pthread_mutexattr_destroy( &attr );
++    }
++    /* ml1319: the body is init_gdi_shared_once(); calling a name that is only
++     * declared left gdiobj.o with an undefined `_init_gdi_shared`, so every
++     * unix-half component was refused by dyld ("symbol not found in flat
++     * namespace") and the linked copy returned with gdi_shared still NULL. */
++    init_gdi_shared_once();
++    if (gdi_shared)
++    {
++        unsigned int dpi = font_init();
++        init_stock_objects( dpi );
++        __atomic_store_n( &gdi_init_state, 2, __ATOMIC_RELEASE );
++    }
++    else
++    {
++        static int said;
++        if (!said++) ERR( "[gdi-null] ml1319: the shared handle table could not be allocated; "
++                          "the next GDI call retries\n" );
++        __atomic_store_n( &gdi_init_state, 0, __ATOMIC_RELEASE );
++    }
++    pthread_mutex_unlock( &gdi_init_lock );
++}
++
+ static const char *gdi_obj_type( unsigned type )
+ {
+     switch ( type )
+@@ -1043,10 +1123,26 @@ HGDIOBJ alloc_gdi_handle( struct gdi_obj_header *obj, DWORD type, const struct g
+ 
+     assert( type );  /* type 0 is reserved to mark free entries */
+ 
++    /* ml1319: run Wine's own gdi_init() sequence on first use instead of trusting that
++     * init_user() ran. With gdi_shared NULL this function used to fall into the branch
++     * below with entry == NULL (0 < NULL + 0x180000) and store through it -- the
++     * load-time crash in set6.log. ml1314 built only the table here, which shifted the
++     * stock objects and tripped init_stock_objects()'s first-handle assertion; the
++     * stock objects are created first now, so this caller takes a handle after them. */
++    if (!gdi_shared) gdi_ensure_init();
++    if (!gdi_shared)
++    {
++        ERR( "[gdi-null] ml1319: no shared handle table (allocation failed) -- cannot "
++             "allocate type %#x for %p\n", (unsigned)type, obj );
++        return 0;
++    }
++
+     win32u_gdi_check_publish();
+ 
+     pthread_mutex_lock( &gdi_lock );
+ 
++    if (!next_unused) next_unused = gdi_shared->Handles + FIRST_GDI_HANDLE;   /* ml1314 */
++
+     entry = next_free;
+     if (entry)
+         next_free = (GDI_HANDLE_ENTRY *)(UINT_PTR)entry->Object;
+@@ -1363,17 +1459,7 @@ BOOL WINAPI NtGdiSetColorAdjustment( HDC hdc, const COLORADJUSTMENT *ca )
+ 
+ void gdi_init(void)
+ {
+-    pthread_mutexattr_t attr;
+-    unsigned int dpi;
+-
+-    pthread_mutexattr_init( &attr );
+-    pthread_mutexattr_settype( &attr, PTHREAD_MUTEX_RECURSIVE );
+-    pthread_mutex_init( &gdi_lock, &attr );
+-    pthread_mutexattr_destroy( &attr );
+-
+-    init_gdi_shared();
+-    if (!gdi_shared) return;
+-
+-    dpi = font_init();
+-    init_stock_objects( dpi );
++    /* ml1319: the same sequence a load-time handle allocation runs, so whichever
++     * comes first does the work once and the other finds it done. */
++    gdi_ensure_init();
+ }
